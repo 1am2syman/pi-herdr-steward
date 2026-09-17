@@ -24,7 +24,7 @@ function worktreeEnvelope() {
 	});
 }
 
-function agentEnvelope(type: "agent_started" | "agent_prompted", name = "steward-b-abcdef12-01-01") {
+function agentEnvelope(type: "agent_started" | "agent_prompted", name = "steward-b-abcdef12-01-01", overrides: Record<string, unknown> = {}) {
 	return JSON.stringify({
 		id: `cli:agent:${type === "agent_started" ? "start" : "prompt"}`,
 		result: {
@@ -39,6 +39,7 @@ function agentEnvelope(type: "agent_started" | "agent_prompted", name = "steward
 				pane_id: "pane-1",
 				terminal_id: "terminal-1",
 				argv: ["pi", "--model", model.model, "--thinking", model.thinkingLevel],
+				...overrides,
 			},
 		},
 	});
@@ -78,22 +79,57 @@ it.sequential("maps only exact agent_name_taken to a collision", async () => {
 });
 
 it.sequential("rejects malformed, wrong-type, killed, and contradictory Herdr envelopes", async () => {
-	const cases: Array<{ stdout: string; stderr?: string; code?: number; killed?: boolean; expected: string }> = [
-		{ stdout: JSON.stringify({ result: { type: "worktree_opened" } }), expected: "malformed-response" },
-		{ stdout: JSON.stringify({ result: { type: "worktree_created", worktree: { branch: "wrong" } } }), expected: "malformed-response" },
-		{ stdout: "not-json", expected: "malformed-response" },
-		{ stdout: JSON.stringify({ result: { type: "agent_started", agent: { name: "x", agent: "pi" } } }), expected: "malformed-response" },
-		{ stdout: JSON.stringify({ result: { type: "agent_prompted", agent: { name: "x" } } }), expected: "malformed-response" },
-		{ stdout: JSON.stringify({ result: { type: "agent_started" } }), killed: true, expected: "killed" },
+	const worktreeInput = { repositoryRoot: "/repo", branch: "steward/run/task/attempt-01", baseRevision: "0123456789abcdef0123456789abcdef01234567", label: "steward-b-abcdef12-01-01" };
+	const worktreeCases: Array<{ name: string; stdout?: string; stderr?: string; code?: number; killed?: boolean; thrown?: string; expected: string }> = [
+		{ name: "wrong result type", stdout: JSON.stringify({ result: { type: "worktree_opened" } }), expected: "malformed-response" },
+		{ name: "wrong branch", stdout: JSON.stringify({ result: { type: "worktree_created", worktree: { branch: "wrong" } } }), expected: "malformed-response" },
+		{ name: "malformed JSON", stdout: "not-json", expected: "malformed-response" },
+		{ name: "killed result", stdout: JSON.stringify({ result: { type: "worktree_created" } }), killed: true, expected: "killed" },
+		{ name: "exit-2 syntax failure", stdout: "", stderr: "syntax error", code: 2, expected: "malformed-response" },
+		{ name: "thrown command runner", thrown: "runner exploded", expected: "runner-error" },
+		{ name: "contradictory workspace identity", stdout: worktreeEnvelope().replace('"open_workspace_id":"workspace-1"', '"open_workspace_id":"workspace-2"'), expected: "malformed-response" },
 	];
-	for (const item of cases.slice(0, 2)) {
-		const adapter = createHerdrAdapter(async () => result(item.stdout, item.stderr ?? "", item.code ?? 0, item.killed ?? false));
-		const value = await adapter.createBuilderWorktree!({ repositoryRoot: "/repo", branch: "steward/run/task/attempt-01", baseRevision: "0123456789abcdef0123456789abcdef01234567", label: "steward-b-abcdef12-01-01" });
+	for (const item of worktreeCases) {
+		const adapter = createHerdrAdapter(async () => {
+			if (item.thrown) throw new Error(item.thrown);
+			return result(item.stdout ?? "", item.stderr ?? "", item.code ?? 0, item.killed ?? false);
+		});
+		const value = await adapter.createBuilderWorktree!(worktreeInput);
 		ok(value.kind === "failed");
 		if (value.kind === "failed") equal(value.code, item.expected);
 	}
-	const promptAdapter = createHerdrAdapter(async () => result(cases[4]!.stdout));
-	const prompt = await promptAdapter.promptBuilder!({ repositoryRoot: "/repo", name: "x", assignmentPrompt: "p" });
-	if (prompt.kind !== "failed") throw new Error("expected prompt failure");
-	equal(prompt.code, "malformed-response");
+
+	const agentCases: Array<{ name: string; stdout?: string; stderr?: string; code?: number; killed?: boolean; thrown?: string; expected: string }> = [
+		{ name: "partial agent_started", stdout: JSON.stringify({ result: { type: "agent_started", agent: { name: "x", agent: "pi" } } }), expected: "malformed-response" },
+		{ name: "killed agent start", stdout: JSON.stringify({ result: { type: "agent_started" } }), killed: true, expected: "killed" },
+		{ name: "exit-2 agent syntax failure", stderr: "syntax error", code: 2, expected: "malformed-response" },
+		{ name: "thrown agent runner", thrown: "runner exploded", expected: "runner-error" },
+		{ name: "contradictory agent pane identity", stdout: agentEnvelope("agent_started", "steward-b-abcdef12-01-01", { pane_id: "pane-other" }), expected: "malformed-response" },
+	];
+	for (const item of agentCases) {
+		const adapter = createHerdrAdapter(async () => {
+			if (item.thrown) throw new Error(item.thrown);
+			return result(item.stdout ?? "", item.stderr ?? "", item.code ?? 0, item.killed ?? false);
+		});
+		const value = await adapter.startBuilder!({ repositoryRoot: "/repo", name: "steward-b-abcdef12-01-01", paneId: "pane-1", model });
+		ok(value.kind === "failed", item.name);
+		if (value.kind === "failed") equal(value.code, item.expected, item.name);
+	}
+
+	const promptCases: Array<{ name: string; stdout?: string; stderr?: string; code?: number; killed?: boolean; thrown?: string; expected: string }> = [
+		{ name: "partial agent_prompted", stdout: JSON.stringify({ result: { type: "agent_prompted", agent: { name: "x" } } }), expected: "malformed-response" },
+		{ name: "killed prompt", stdout: JSON.stringify({ result: { type: "agent_prompted" } }), killed: true, expected: "killed" },
+		{ name: "exit-2 prompt syntax failure", stderr: "syntax error", code: 2, expected: "malformed-response" },
+		{ name: "thrown prompt runner", thrown: "runner exploded", expected: "runner-error" },
+		{ name: "contradictory prompt name identity", stdout: agentEnvelope("agent_prompted", "other-agent"), expected: "malformed-response" },
+	];
+	for (const item of promptCases) {
+		const adapter = createHerdrAdapter(async () => {
+			if (item.thrown) throw new Error(item.thrown);
+			return result(item.stdout ?? "", item.stderr ?? "", item.code ?? 0, item.killed ?? false);
+		});
+		const value = await adapter.promptBuilder!({ repositoryRoot: "/repo", name: "steward-b-abcdef12-01-01", assignmentPrompt: "p" });
+		ok(value.kind === "failed", item.name);
+		if (value.kind === "failed") equal(value.code, item.expected, item.name);
+	}
 });

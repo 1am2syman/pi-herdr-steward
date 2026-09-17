@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test:dispatch
+> vitest run test/dispatch.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+
+ Test Files  1 passed (1)
+      Tests  5 passed (5)
+   Start at  22:34:20
+   Duration  4.38s (transform 307ms, setup 0ms, import 1.77s, tests 2.38s, environment 0ms)

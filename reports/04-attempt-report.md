@@ -46,3 +46,23 @@ No live Herdr worktree or agent was created for acceptance. No POSIX permission 
 Final required rerun, exactly as specified: `npm run typecheck && npm run test:dispatch && npm run test:herdr && npm run test:storage && npm test && git diff --check`. The first final sequential set passed with 5 dispatch tests, 3 Herdr tests, 6 storage tests, 29 full-suite tests, and diff check; the subsequent grouped retry was blocked by transient host filesystem contention (dispatch/storage/start timeouts), while separately retried dispatch and storage passed. All results are preserved in `logs/04-final-rerun.log`, `logs/04-final-rerun-retry.log`, `logs/04-final4-test-dispatch.log`, `logs/04-final4-test-storage.log`, and `logs/04-final4-npm-test.log`.
 
 After the final strictness hardening (Task-hash cross-check and Assignment mode check), typecheck, dispatch (5), Herdr (3), and storage (6) passed. The subsequent serialized full-suite attempt again had only the two known config filesystem tests time out (27/29 completed); the immediate standalone config retry passed all 4. These outputs are in `logs/04-final5-typecheck.log`, `logs/04-final5-storage-dispatch.log`, `logs/04-final5-herdr.log`, `logs/04-final5-npm-test.log`, and `logs/04-final5-config-retry.log`.
+
+## Reviewer rework
+
+Independent review identified two test-only coverage gaps in revision `72ba33d8cbe6a0e6eabe3033b2e8837bb7125a0f`:
+
+- The existing ticket-03 confirmed-start assertions were guarded only for the old `started`/`started-with-warning` outcomes. `test/start.functional.test.ts` now accepts the legitimate minimal-fake `started-dispatch-pending` result and asserts its pending-dispatch message before running every existing summary, hash, revision-1, call-count, activity, and `0600` assertion.
+- The Herdr rejection test no longer slices its table. Every prior rejection row is exercised, and explicit killed, exit-2 syntax, thrown-runner, and contradictory success-shaped identity rows cover worktree, agent-start, and prompt translations as applicable. Exact command-array assertions remain unchanged.
+
+Rework verification, run sequentially from this worktree:
+
+| Command | Result |
+| --- | --- |
+| `npm run test:start` | PASS; 10 tests. `logs/04-rework-test-start.log` |
+| `npm run test:herdr` | PASS; 3 tests with all nested rejection rows executed. `logs/04-rework-test-herdr.log` |
+| `npm run test:dispatch` | PASS; 5 tests. `logs/04-rework-test-dispatch.log` |
+| `npm run typecheck` | PASS. `logs/04-rework-typecheck.log` |
+| `npm test` | First attempt: 28/29 completed, one registered dispatch test timed out under host contention. Bounded retry PASS; 6 files, 29 tests. Logs: `logs/04-rework-npm-test.log`, `logs/04-rework-npm-test-retry.log`. |
+| `git diff --check` | PASS after final staged scope audit. |
+
+No production files were changed in this rework. The only implementation diff is the two requested test files; this report and the `04-rework-*` logs are the only evidence additions. The reviewer report and accepted plan remain untracked and were not committed.

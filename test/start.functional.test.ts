@@ -129,7 +129,8 @@ it.sequential("registered /steward start confirms and persists one frozen pendin
 	if (!capture.handler) throw new Error("missing command handler");
 	await capture.handler("start", context(root));
 	ok(observed.summary);
-	if (!observed.summary || !observed.result || (observed.result.kind !== "started" && observed.result.kind !== "started-with-warning")) return;
+	if (!observed.summary || !observed.result || (observed.result.kind !== "started" && observed.result.kind !== "started-with-warning" && observed.result.kind !== "started-dispatch-pending")) return;
+	if (observed.result.kind === "started-dispatch-pending") match(observed.result.message, /Builder dispatch adapters are unavailable; the Run is durable and dispatch is pending/);
 	match(observed.summary.markdown, /Task 1.*requiredOutcome: Implement the approved behavior/s);
 	match(observed.summary.markdown, /Task 2.*requiredOutcome: Record the evidence/s);
 	match(observed.summary.markdown, /sha256:[0-9a-f]{64}/);
