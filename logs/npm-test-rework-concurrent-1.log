@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test
+> vitest run
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/t02
+
+
+ Test Files  2 passed (2)
+      Tests  5 passed (5)
+   Start at  17:07:48
+   Duration  2.53s (transform 450ms, setup 0ms, import 4.06s, tests 279ms, environment 1ms)

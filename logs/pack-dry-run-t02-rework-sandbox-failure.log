@@ -1,0 +1,7 @@
+npm pack --dry-run --json
+npm error code EROFS
+npm error syscall open
+npm error path /root/.npm/_cacache/tmp/***
+npm error errno -30
+npm error rofs EROFS: read-only file system
+Rerun with the required command and escalation succeeded; see pack-dry-run-t02-rework-final.json.

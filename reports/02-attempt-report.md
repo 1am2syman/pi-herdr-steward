@@ -28,6 +28,14 @@ The authoritative plan was not modified. No ticket-03+ behavior was added.
 - Controller Session model is shown separately as a Builder proposal and requires explicit confirmation before copying.
 - Configuration dispatch refuses `rpc`, `json`, and `print` before adapter construction/I/O with `Steward configuration requires interactive TUI mode.`
 
+## Rework diagnosis and fix
+
+The parent gate failure is preserved in `logs/test-config-t02.log` and `logs/test-t02.log`: the concurrent targeted/full Vitest launch timed out the same first two registered-command filesystem tests at the default 5,000 ms, while the model-diagnostic and non-TUI tests passed. The test bodies are not stuck in production code: isolated runs are fast, and the failure was reproduced when Vitest workers competed for host CPU/filesystem time. Before the fix, four concurrent full invocations also stretched the config file's measured test time to about 6.5 seconds, confirming sensitivity to host contention even when the run completed.
+
+The rework changes only `test/config.functional.test.ts`. The two tests that cover registered save/reload, atomic writes, recursive filesystem snapshots, and cancellation no-ops now have an explicit 15,000 ms per-test timeout. All assertions, fixtures, registered-handler calls, and production behavior are unchanged. This keeps the failure visible if the legitimate filesystem flow exceeds the expanded budget while preventing the host's contention from turning a passing acceptance test into a false timeout.
+
+Rework evidence is retained in `logs/npm-test-rework-concurrent-*.log`, `logs/npm-test-config-rework-concurrent.log`, and `logs/npm-test-full-rework-concurrent.log`.
+
 ## Verification evidence
 
 All final commands below were run sequentially from the package root; complete output is retained in `logs/`:
@@ -43,6 +51,11 @@ All final commands below were run sequentially from the package root; complete o
 - RPC `get_commands` registration — pass; `logs/rpc-get-commands-t02-final.log`
 - RPC `/steward config` rejection — exact TUI-only diagnostic; `logs/rpc-config-rejection-t02-final.log`
 - Interactive Pi TUI load/cancel — initial summary showed exact paths, all seven defaults, `not configured`, and a separate Controller proposal; Escape produced `Cancelled; configuration unchanged.`; `logs/manual-tui-t02.log`
+- Rework `npm run typecheck` — pass; `logs/typecheck-t02-rework-final.log`
+- Rework `npm run test:config` — 4 tests passed; `logs/test-config-t02-rework-final.log`
+- Rework normal `npm test` — 2 files / 5 tests passed; `logs/test-t02-rework-final.log`
+- Rework `git diff --check` — pass; `logs/diff-check-t02-rework-final.log`
+- Rework `npm pack --dry-run --json` — pass; `logs/pack-dry-run-t02-rework-final.json`; inspected contents are exactly the six listed package files and no tests/plans/logs/temp config/credentials.
 
 ## Failed attempts preserved
 

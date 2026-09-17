@@ -220,6 +220,11 @@ function modelAdapterThatAccepts(): StewardModelAdapter {
 }
 
 const noopRegistry = fakeRegistry([], []);
+// These two tests exercise registered-command setup, atomic filesystem writes,
+// reloads, and recursive no-op snapshots. Keep their assertions intact while
+// allowing the real host's filesystem/worker contention to exceed Vitest's
+// 5-second default during a full multi-file run.
+const CONFIG_FILESYSTEM_TEST_TIMEOUT_MS = 15_000;
 
 it.sequential("registered /steward config saves and reloads exact defaults", async () => {
 	const { repositoryRoot, userRoot } = await makeRoots();
@@ -274,7 +279,7 @@ it.sequential("registered /steward config saves and reloads exact defaults", asy
 	deepStrictEqual(loadedPlans, validPlans);
 	deepStrictEqual(await snapshotTree(repositoryRoot), beforeRepository);
 	deepStrictEqual(await snapshotTree(userRoot), beforeUser);
-});
+}, CONFIG_FILESYSTEM_TEST_TIMEOUT_MS);
 
 it.sequential("configuration cancellation is a filesystem no-op", async () => {
 	const empty = await makeRoots();
@@ -305,7 +310,7 @@ it.sequential("configuration cancellation is a filesystem no-op", async () => {
 	await populatedCapture.getHandler()("config", makeContext(populated.repositoryRoot, noopRegistry, cancelUi, fakeModel("controller", "model")));
 	deepStrictEqual(await snapshotTree(populated.repositoryRoot), populatedBeforeRepo);
 	deepStrictEqual(await snapshotTree(populated.userRoot), populatedBeforeUser);
-});
+}, CONFIG_FILESYSTEM_TEST_TIMEOUT_MS);
 
 it.sequential("invalid unavailable and unauthenticated models are diagnosed without substitution", async () => {
 	const { repositoryRoot, userRoot } = await makeRoots();

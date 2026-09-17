@@ -1,0 +1,8 @@
+package.json
+src/adapters.ts
+src/config-store.ts
+src/config.ts
+src/extension.ts
+src/steward.ts
+entry-count=6
+No tests, plans, logs, temporary configuration, or credential data included.
