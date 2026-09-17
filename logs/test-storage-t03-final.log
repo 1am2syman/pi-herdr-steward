@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test:storage
+> vitest run test/run-journal.storage.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/t03
+
+
+ Test Files  1 passed (1)
+      Tests  5 passed (5)
+   Start at  19:31:21
+   Duration  2.50s (transform 147ms, setup 0ms, import 1.47s, tests 795ms, environment 0ms)

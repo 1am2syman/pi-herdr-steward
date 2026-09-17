@@ -18,13 +18,13 @@ import {
 export type StewardUiSurface = Pick<ExtensionUIContext, "select" | "confirm" | "input" | "notify" | "setStatus">;
 export type StewardCommandContext = Pick<
 	ExtensionCommandContext,
-	"mode" | "hasUI" | "cwd" | "modelRegistry" | "model" | "thinkingLevel" | "scopedModels"
+	"mode" | "hasUI" | "cwd" | "modelRegistry" | "model" | "thinkingLevel" | "scopedModels" | "sessionManager"
 > & {
 	ui: StewardUiSurface;
 };
 type StewardSessionContext = Pick<
 	ExtensionContext,
-	"mode" | "hasUI" | "cwd" | "modelRegistry" | "model" | "thinkingLevel" | "scopedModels"
+	"mode" | "hasUI" | "cwd" | "modelRegistry" | "model" | "thinkingLevel" | "scopedModels" | "sessionManager"
 > & {
 	ui: StewardUiSurface;
 };
@@ -47,11 +47,12 @@ export type StewardAdapterFactory = (request: StewardHostRequest) => StewardDepe
 
 const defaultAdapterFactory: StewardAdapterFactory = (request) => createProductionAdapters(request);
 
-function requestFromContext(ctx: StewardCommandContext | StewardSessionContext): StewardHostRequest {
+function requestFromContext(ctx: StewardCommandContext | StewardSessionContext, exec?: ExtensionAPI["exec"]): StewardHostRequest {
 	return {
 		ui: ctx.ui as StewardUiSurface,
 		modelRegistry: ctx.modelRegistry,
 		scopedModels: ctx.scopedModels,
+		...(exec ? { exec } : {}),
 	};
 }
 
@@ -67,42 +68,47 @@ function runStatus(
 	ctx: StewardCommandContext | StewardSessionContext,
 	target: StatusTarget,
 	adapterFactory: StewardAdapterFactory,
+	exec?: ExtensionAPI["exec"],
 ): void {
-	createSteward(adapterFactory(requestFromContext(ctx))).status(ctx.cwd, target);
+	createSteward(adapterFactory(requestFromContext(ctx, exec))).status(ctx.cwd, target);
 }
 
 /** Register Steward's TUI-only session footer and status/configuration commands. */
 export function registerStewardExtension(
 	pi: StewardRegistrationSurface,
 	adapterFactory: StewardAdapterFactory = defaultAdapterFactory,
+	exec?: ExtensionAPI["exec"],
 ): void {
 	pi.on("session_start", (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		runStatus(ctx, "footer", adapterFactory);
+		runStatus(ctx, "footer", adapterFactory, exec);
 	});
 
 	pi.registerCommand("steward", {
-		description: "Inspect or configure Steward defaults.",
+		description: "Inspect, configure, or start Steward Runs.",
 		handler: async (args, ctx) => {
 			const command = args.trim();
-			if (command === "config" && ctx.mode !== "tui") {
-				throw new Error("Steward configuration requires interactive TUI mode.");
-			}
+			if (command === "start" && ctx.mode !== "tui") throw new Error("Steward start requires interactive TUI mode.");
+			if (command === "config" && ctx.mode !== "tui") throw new Error("Steward configuration requires interactive TUI mode.");
 			if (ctx.mode !== "tui") return;
 			if (command === "status") {
-				runStatus(ctx, "command", adapterFactory);
+				runStatus(ctx, "command", adapterFactory, exec);
 				return;
 			}
 			if (command === "config") {
-				await createSteward(adapterFactory(requestFromContext(ctx))).configure(ctx.cwd, proposalFromContext(ctx));
+				await createSteward(adapterFactory(requestFromContext(ctx, exec))).configure(ctx.cwd, proposalFromContext(ctx));
 				return;
 			}
-			ctx.ui.notify("Usage: /steward status | /steward config", "info");
+			if (command === "start") {
+				await createSteward(adapterFactory(requestFromContext(ctx, exec))).start(ctx.cwd, ctx.sessionManager.getSessionId());
+				return;
+			}
+			ctx.ui.notify("Usage: /steward status | /steward config | /steward start", "info");
 		},
 	});
 }
 
 /** Pi's package entrypoint. */
 export default function stewardExtension(pi: ExtensionAPI): void {
-	registerStewardExtension(pi);
+	registerStewardExtension(pi, undefined, pi.exec);
 }

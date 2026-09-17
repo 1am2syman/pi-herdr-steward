@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test:config
+> vitest run test/config.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/t03
+
+
+ Test Files  1 passed (1)
+      Tests  4 passed (4)
+   Start at  19:31:24
+   Duration  1.86s (transform 223ms, setup 0ms, import 1.54s, tests 102ms, environment 0ms)

@@ -1,6 +1,7 @@
+import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
-import { join } from "node:path";
-import { CONFIG_DIR_NAME, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { join, resolve } from "node:path";
+import { type ExecResult, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
 import {
 	formatModelChoice,
@@ -17,8 +18,9 @@ import {
 	type ThinkingLevel,
 } from "./config.ts";
 import { createConfigStore, type ConfigStoreOptions } from "./config-store.ts";
+import { createRunJournalStore } from "./run-journal-store.ts";
+import type { ExpectedArtifact, RunDraft, RunDraftInput, RunDraftResult, Verification } from "./run.ts";
 import type {
-	ActiveRunProbe,
 	ConfigurationEditResult,
 	ConfigurationEditorInput,
 	ConfigureResult,
@@ -27,13 +29,14 @@ import type {
 	StatusTarget,
 	StatusView,
 	StewardDependencies,
+	StewardGitAdapter,
+	StewardHerdrAdapter,
+	StewardClockAdapter,
 	StewardModelAdapter,
 	StewardUiAdapter,
 	StewardUiSurface,
 } from "./steward.ts";
 
-const STEWARD_DIRECTORY_NAME = "steward";
-const ACTIVE_RUN_FILE_NAME = "active-run.json";
 const STATUS_KEY = "pi-herdr-steward";
 
 type HostModel = NonNullable<ExtensionContext["model"]>;
@@ -46,14 +49,7 @@ export interface StewardHostRequest {
 	ui: StewardUiSurface;
 	modelRegistry: HostModelRegistry;
 	scopedModels: readonly HostScopedModel[];
-}
-
-function activeRunPath(repositoryRoot: string): string {
-	return join(repositoryRoot, CONFIG_DIR_NAME, STEWARD_DIRECTORY_NAME, ACTIVE_RUN_FILE_NAME);
-}
-
-function isMissingPath(error: unknown): boolean {
-	return error instanceof Error && "code" in error && error.code === "ENOENT";
+	exec?: (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => Promise<ExecResult>;
 }
 
 function safeErrorText(error: unknown): string {
@@ -63,19 +59,13 @@ function safeErrorText(error: unknown): string {
 /** Probe only the Steward-owned active journal path, without creating its parents. */
 export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJournalAdapter {
 	const configStore = createConfigStore(options);
-
-	function probeActive(repositoryRoot: string): ActiveRunProbe {
-		try {
-			lstatSync(activeRunPath(repositoryRoot));
-			return "present";
-		} catch (error: unknown) {
-			if (isMissingPath(error)) return "missing";
-			return "present";
-		}
-	}
+	const runStore = createRunJournalStore({ configDirName: options?.configDirName });
 
 	return {
-		probeActive,
+		probeActive: (repositoryRoot) => runStore.probeActive(repositoryRoot),
+		loadActive: runStore.loadActive,
+		createActive: runStore.createActive,
+		appendActivity: runStore.appendActivity,
 		loadRecoveryDefaults: () => configStore.loadRecoveryDefaults(),
 		loadModelPlans: (repositoryRoot) => configStore.loadModelPlans(repositoryRoot),
 		saveRecoveryDefaults: (recovery) => configStore.saveRecoveryDefaults(recovery),
@@ -365,6 +355,172 @@ async function editConfiguration(ui: PiStatusUi & Partial<PiConfigUi>, input: Co
 	return confirmed ? { kind: "save-model-plans", modelPlans } : { kind: "cancelled" };
 }
 
+type CommandRunner = NonNullable<StewardHostRequest["exec"]>;
+
+function unavailable(message: string): { kind: "unavailable"; message: string } {
+	return { kind: "unavailable", message };
+}
+
+function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerdrAdapter {
+	return {
+		async checkAvailability(repositoryRoot) {
+			if (!exec) return unavailable("The Pi command runner is unavailable.");
+			let result: ExecResult;
+			try {
+				result = await exec("herdr", ["status", "server", "--json"], { cwd: repositoryRoot, timeout: 5000 });
+			} catch (error: unknown) {
+				return unavailable(error instanceof Error ? error.message : "herdr status server --json failed.");
+			}
+			if (result.code !== 0 || result.killed) return unavailable(result.stderr.trim() || "herdr status server --json exited unsuccessfully.");
+			try {
+				const parsed: unknown = JSON.parse(result.stdout);
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return unavailable("Herdr returned malformed availability JSON.");
+				const value = parsed as Record<string, unknown>;
+				if (value.status !== "running" || value.running !== true || value.compatible !== true || value.endpoint_compatible !== true) return unavailable("Herdr server is stopped, incompatible, or has a stale endpoint.");
+				return {
+					kind: "available",
+					status: "running",
+					running: true,
+					compatible: true,
+					endpointCompatible: true,
+					...(typeof value.protocol === "number" ? { protocol: value.protocol } : {}),
+				};
+			} catch {
+				return unavailable("Herdr returned malformed availability JSON.");
+			}
+		},
+	};
+}
+
+function createGitAdapter(exec: CommandRunner | undefined): StewardGitAdapter {
+	function isMissing(error: unknown): boolean {
+		return error instanceof Error && "code" in error && error.code === "ENOENT";
+	}
+
+	async function run(repositoryRoot: string, args: string[]): Promise<ExecResult> {
+		if (!exec) throw new Error("The Pi command runner is unavailable.");
+		return exec("git", args, { cwd: repositoryRoot, timeout: 5000 });
+	}
+
+	return {
+		async inspectIntegrationBase(repositoryRoot) {
+			try {
+				const inside = await run(repositoryRoot, ["rev-parse", "--is-inside-work-tree"]);
+				if (inside.code !== 0 || inside.stdout.trim() !== "true") return unavailable("The current directory is not a Git worktree.");
+				const branch = await run(repositoryRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+				if (branch.code !== 0 || branch.stdout.trim() === "") return unavailable("Git is detached or has no attached branch.");
+				const head = await run(repositoryRoot, ["rev-parse", "--verify", "HEAD"]);
+				if (head.code !== 0 || !/^[0-9a-f]{40}$/.test(head.stdout.trim())) return unavailable("Git has no resolvable full HEAD revision.");
+				const status = await run(repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+				if (status.code !== 0) return unavailable("Git status could not be inspected.");
+				if (status.stdout.length > 0) return unavailable("The Git checkout is dirty, including tracked or untracked files.");
+				const gitDir = await run(repositoryRoot, ["rev-parse", "--git-dir"]);
+				if (gitDir.code !== 0 || gitDir.stdout.trim() === "") return unavailable("Git metadata could not be located.");
+				const markerRoot = resolve(repositoryRoot, gitDir.stdout.trim());
+				const operationMarkers = ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"];
+				for (const marker of operationMarkers) {
+					try {
+						lstatSync(join(markerRoot, marker));
+						return unavailable(`Git operation in progress (${marker}); finish or abort it before starting.`);
+					} catch (error: unknown) {
+						if (!isMissing(error)) return unavailable(`Git operation state could not be inspected (${marker}).`);
+					}
+				}
+				return { kind: "ready", branch: branch.stdout.trim(), revision: head.stdout.trim() };
+			} catch (error: unknown) {
+				return unavailable(error instanceof Error ? error.message : "Git integration-base inspection failed.");
+			}
+		},
+	};
+}
+
+function createClockAdapter(): StewardClockAdapter {
+	return { now: () => new Date(), randomUUID: () => randomUUID() };
+}
+
+function lines(value: string): string[] {
+	return value.split("\n").map((item) => item.trim()).filter((item) => item.length > 0);
+}
+
+function parseArtifacts(value: string): ExpectedArtifact[] | undefined {
+	const artifacts: ExpectedArtifact[] = [];
+	for (const entry of lines(value)) {
+		if (entry === "git-commit") artifacts.push({ kind: "git-commit" });
+		else if (entry.startsWith("file:")) artifacts.push({ kind: "file", path: entry.slice("file:".length).trim() });
+		else if (entry.startsWith("evidence:")) artifacts.push({ kind: "evidence", description: entry.slice("evidence:".length).trim() });
+		else return undefined;
+	}
+	return artifacts.length > 0 ? artifacts : undefined;
+}
+
+async function draftRun(ui: PiStatusUi & Partial<PiConfigUi>, input: RunDraftInput): Promise<RunDraftResult> {
+	const dialogs = getDialogSurface(ui);
+	const declaredOutcome = await dialogs.input("Run declared outcome", "What should this Run accomplish?");
+	if (declaredOutcome === undefined) return { kind: "cancelled" };
+	const tasks: RunDraft["tasks"] = [];
+	while (true) {
+		const requiredOutcome = await dialogs.input(`Task ${tasks.length + 1} required outcome`, "The concrete outcome for this Task");
+		if (requiredOutcome === undefined) return { kind: "cancelled" };
+		const allowedScopeText = await dialogs.input("Task allowed scope", "One relative path per line");
+		if (allowedScopeText === undefined) return { kind: "cancelled" };
+		const artifactText = await dialogs.input("Task expected Artifacts", "git-commit, file:reports/result.md, or evidence:description per line");
+		if (artifactText === undefined) return { kind: "cancelled" };
+		const expectedArtifacts = parseArtifacts(artifactText);
+		if (!expectedArtifacts) {
+			ui.notify("Expected Artifacts must use git-commit, file:path, or evidence:description.", "error");
+			return { kind: "cancelled" };
+		}
+		const verificationKind = await dialogs.select("Task verification", ["Command", "Criteria", "Cancel"]);
+		if (!verificationKind || verificationKind === "Cancel") return { kind: "cancelled" };
+		const verificationText = await dialogs.input(verificationKind === "Command" ? "Verification command" : "Verification criteria", "Exact inert verification text");
+		if (verificationText === undefined) return { kind: "cancelled" };
+		let verification: Verification = verificationKind === "Command" ? { kind: "command", command: verificationText } : { kind: "criteria", criteria: verificationText };
+		const codeChanging = expectedArtifacts.some((artifact) => artifact.kind === "git-commit");
+		if (verification.kind === "criteria" && codeChanging) {
+			const waiver = await dialogs.input("Deterministic command waiver", "Required for code-changing criteria verification");
+			if (waiver === undefined) return { kind: "cancelled" };
+			verification = { kind: "criteria", criteria: verification.criteria, deterministicCommandWaiver: waiver };
+		}
+		let reviewRequired = true;
+		if (codeChanging) {
+			reviewRequired = await dialogs.confirm("Require Review for this code-changing Task?", "Review is required by default. Choose no only if you explicitly accept the risk.");
+			if (!reviewRequired && !(await dialogs.confirm("Confirm Review disabled", "This code-changing Task will proceed without Review."))) return { kind: "cancelled" };
+		}
+		const task = { requiredOutcome, allowedScope: lines(allowedScopeText), expectedArtifacts, verification, reviewRequired };
+		ui.notify(
+			[`Task ${tasks.length + 1} draft`, `requiredOutcome: ${task.requiredOutcome}`, `allowedScope: ${task.allowedScope.join(", ")}`, `expectedArtifacts: ${task.expectedArtifacts.map((artifact) => artifact.kind).join(", ")}`, `verification: ${task.verification.kind}`, `reviewRequired: ${task.reviewRequired}`].join("\n"),
+			"info",
+		);
+		const taskAction = await dialogs.select(`Accept Task ${tasks.length + 1}?`, ["Accept Task", "Edit Task", "Cancel"]);
+		if (!taskAction || taskAction === "Cancel") return { kind: "cancelled" };
+		if (taskAction === "Edit Task") continue;
+		tasks.push(task);
+		const next = await dialogs.select("Run draft", ["Add another Task", "Review Run draft", "Cancel"]);
+		if (!next || next === "Cancel") return { kind: "cancelled" };
+		if (next === "Review Run draft") break;
+	}
+	const modelPlans = await editModelPlans(dialogs, {
+		recovery: input.recovery,
+		modelPlans: input.modelPlans,
+		recoveryPath: "not saved by /steward start",
+		modelPlansPath: "not saved by /steward start",
+		modelChoices: input.modelChoices,
+		proposal: undefined,
+	});
+	if (!modelPlans) return { kind: "cancelled" };
+	const finalKind = await dialogs.select("Final verification", ["Command", "Criteria", "Cancel"]);
+	if (!finalKind || finalKind === "Cancel") return { kind: "cancelled" };
+	const finalText = await dialogs.input(finalKind === "Command" ? "Final verification command" : "Final verification criteria", "Exact inert verification text");
+	if (finalText === undefined) return { kind: "cancelled" };
+	let finalVerification: Verification = finalKind === "Command" ? { kind: "command", command: finalText } : { kind: "criteria", criteria: finalText };
+	if (finalVerification.kind === "criteria" && tasks.some((task) => task.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"))) {
+		const waiver = await dialogs.input("Final deterministic command waiver", "Required for code-changing criteria verification");
+		if (waiver === undefined) return { kind: "cancelled" };
+		finalVerification = { kind: "criteria", criteria: finalVerification.criteria, deterministicCommandWaiver: waiver };
+	}
+	return { kind: "drafted", draft: { declaredOutcome, tasks, modelPlan: modelPlans, effectiveSettings: { ...input.recovery }, finalVerification } };
+}
+
 /** Present status and configuration through Pi's informational UI primitives. */
 export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): StewardUiAdapter {
 	function presentStatus(statusView: StatusView, target: StatusTarget): void {
@@ -381,26 +537,30 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		ui.notify(details ? `${result.message}\n${details}` : result.message, "error");
 	}
 
+	function presentStartResult(result: import("./steward.ts").StartResult): void {
+		ui.notify(result.message, result.kind === "started" ? "info" : result.kind === "started-with-warning" ? "warning" : result.kind === "cancelled" ? "info" : "error");
+	}
+
 	return {
 		presentStatus,
 		editConfiguration: (input) => editConfiguration(ui, input),
 		presentConfigurationResult,
+		draftRun: (input) => draftRun(ui, input),
+		confirmRun: (summary) => ui.confirm!("Confirm Steward Run", summary.markdown),
+		presentStartResult,
 	};
 }
 
 /** Assemble production adapters for one request without growing the seven-slot seam. */
 export function createProductionAdapters(request: StewardHostRequest, options?: ConfigStoreOptions): StewardDependencies {
-	const emptyHerdr: OpaqueAdapter = {};
-	const emptyGit: OpaqueAdapter = {};
 	const emptyProcess: OpaqueAdapter = {};
-	const emptyClock: OpaqueAdapter = {};
 	return {
 		runJournal: createRunJournalAdapter(options),
-		herdr: emptyHerdr,
-		git: emptyGit,
+		herdr: createHerdrAdapter(request.exec),
+		git: createGitAdapter(request.exec),
 		process: emptyProcess,
 		model: createPiModelAdapter(request.modelRegistry, request.scopedModels),
-		clock: emptyClock,
+		clock: createClockAdapter(),
 		ui: createPiUiAdapter(request.ui),
 	};
 }

@@ -160,6 +160,7 @@ function makeContext(repositoryRoot: string, registry: unknown, ui: StewardUiAda
 		model: model as StewardCommandContext["model"],
 		thinkingLevel: model ? "high" : undefined,
 		scopedModels: [],
+		sessionManager: { getSessionId: () => "config-session" } as StewardCommandContext["sessionManager"],
 		ui: contextUi,
 	};
 }
@@ -189,6 +190,13 @@ function makeUi(edit: (input: Parameters<StewardUiAdapter["editConfiguration"]>[
 		presentConfigurationResult(result) {
 			results.push(result);
 		},
+		async draftRun() {
+			return { kind: "cancelled" as const };
+		},
+		async confirmRun() {
+			return false;
+		},
+		presentStartResult() {},
 	};
 }
 
@@ -212,7 +220,15 @@ function makeDependencies(
 		},
 	};
 	void repositoryRoot;
-	return { runJournal, herdr: {}, git: {}, process: {}, model, clock: {}, ui };
+	return {
+		runJournal,
+		herdr: { async checkAvailability() { throw new Error("unexpected Herdr access"); } },
+		git: { async inspectIntegrationBase() { throw new Error("unexpected Git access"); } },
+		process: {},
+		model,
+		clock: { now: () => new Date(0), randomUUID: () => "test-uuid" },
+		ui,
+	};
 }
 
 function modelAdapterThatAccepts(): StewardModelAdapter {

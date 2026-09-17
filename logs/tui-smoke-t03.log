@@ -1,0 +1,6 @@
+Interactive TUI smoke (production host)
+Command: /steward start
+Observed: Error: Herdr is unavailable; restore the running compatible server before starting a Run. Error: Os { code: 1, kind: PermissionDenied, message: "Operation not permitted" }
+Result: start stopped before draft UI and persistence.
+Post-check: project_state=absent
+The direct read-only host check separately reported Herdr running, compatible, and endpoint-compatible; Pi's injected exec could not access the socket in this sandbox.

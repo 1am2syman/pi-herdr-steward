@@ -1,0 +1,5 @@
+rpc_exit=0
+project-steward-state=absent
+agent-files:
+auth.json
+models-store.json

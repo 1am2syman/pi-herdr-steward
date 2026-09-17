@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "EROFS",
+    "summary": "EROFS: read-only file system, open '/root/.npm/_cacache/tmp/***'",
+    "detail": "Often virtualized file systems, or other file systems that don't support symlinks, give this error."
+  }
+}

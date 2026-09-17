@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, unlink } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
@@ -15,11 +15,10 @@ import {
 	type RecoveryDefaults,
 	createBuiltinRecoveryDocument,
 } from "./config.ts";
+import { ensureProjectStateDirectory, resolveProjectStatePaths } from "./project-state.ts";
 
 const STEWARD_DIRECTORY_NAME = "steward";
 const DEFAULTS_FILE_NAME = "defaults.json";
-const GITIGNORE_FILE_NAME = ".gitignore";
-const GITIGNORE_CONTENT = "*\n";
 
 export interface ConfigStoreOptions {
 	agentDir?: string;
@@ -63,7 +62,7 @@ function projectDefaultsPath(repositoryRoot: string, configDirName: string): str
 }
 
 function projectStewardDirectory(repositoryRoot: string, configDirName: string): string {
-	return join(repositoryRoot, configDirName, STEWARD_DIRECTORY_NAME);
+	return resolveProjectStatePaths(repositoryRoot, configDirName).stewardDirectory;
 }
 
 async function readJson(path: string): Promise<
@@ -102,24 +101,6 @@ async function writeAtomically(path: string, content: string): Promise<void> {
 		await unlink(temporaryPath).catch(() => undefined);
 		throw error;
 	}
-}
-
-async function ensureDirectory(path: string): Promise<void> {
-	await mkdir(path, { recursive: true, mode: 0o700 });
-}
-
-async function ensureProjectSentinel(directory: string): Promise<void> {
-	const path = join(directory, GITIGNORE_FILE_NAME);
-	try {
-		const content = await readFile(path, "utf8");
-		if (content !== GITIGNORE_CONTENT) {
-			throw new Error(`Existing Steward sentinel has unexpected content at ${path}.`);
-		}
-		return;
-	} catch (error: unknown) {
-		if (!isMissingPath(error)) throw error;
-	}
-	await writeAtomically(path, GITIGNORE_CONTENT);
 }
 
 function loadError<T>(path: string, message: string): ConfigLoadResult<T> {
@@ -186,7 +167,8 @@ export function createConfigStore(options: ConfigStoreOptions = {}): ConfigStore
 			return { kind: "error", path: recoveryPath, diagnostics: validation.diagnostics };
 		}
 		try {
-			await ensureDirectory(dirname(recoveryPath));
+			await mkdir(dirname(recoveryPath), { recursive: true, mode: 0o700 });
+			await chmod(dirname(recoveryPath), 0o700).catch(() => undefined);
 			await writeAtomically(recoveryPath, serializeRecoveryDefaults(validation.value));
 			return { kind: "saved", path: recoveryPath, diagnostics: [] };
 		} catch (error: unknown) {
@@ -206,8 +188,7 @@ export function createConfigStore(options: ConfigStoreOptions = {}): ConfigStore
 			return { kind: "error", path, diagnostics: validation.diagnostics };
 		}
 		try {
-			await ensureDirectory(directory);
-			await ensureProjectSentinel(directory);
+			await ensureProjectStateDirectory(repositoryRoot, configDirName);
 			await writeAtomically(path, serializeModelPlans(validation.value));
 			return { kind: "saved", path, diagnostics: [] };
 		} catch (error: unknown) {

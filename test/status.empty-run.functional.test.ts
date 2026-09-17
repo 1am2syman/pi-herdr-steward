@@ -172,8 +172,8 @@ it("registered /steward status reports an empty Run and performs no writes", asy
     });
     const dependencies: StewardDependencies = {
       runJournal: createRunJournalAdapter(),
-      herdr: createOpaqueAdapter("herdr", adapterCalls),
-      git: createOpaqueAdapter("git", adapterCalls),
+      herdr: createOpaqueAdapter("herdr", adapterCalls) as never,
+      git: createOpaqueAdapter("git", adapterCalls) as never,
       process: createOpaqueAdapter("process", adapterCalls),
       model: {
         listModelChoices() {
@@ -183,7 +183,7 @@ it("registered /steward status reports an empty Run and performs no writes", asy
           return [];
         },
       },
-      clock: createOpaqueAdapter("clock", adapterCalls),
+      clock: createOpaqueAdapter("clock", adapterCalls) as never,
       ui: {
         presentStatus(statusView, target) {
           presentations.push({ statusView, target });
@@ -193,6 +193,13 @@ it("registered /steward status reports an empty Run and performs no writes", asy
           return { kind: "cancelled" as const };
         },
         presentConfigurationResult() {},
+        async draftRun() {
+          return { kind: "cancelled" as const };
+        },
+        async confirmRun() {
+          return false;
+        },
+        presentStartResult() {},
       },
     };
     const adapterFactory = (): StewardDependencies => dependencies;
@@ -208,6 +215,7 @@ it("registered /steward status reports an empty Run and performs no writes", asy
       model: undefined,
       thinkingLevel: undefined,
       scopedModels: [],
+      sessionManager: { getSessionId: () => "status-session" } as StewardCommandContext["sessionManager"],
       ui: {
         select: async () => undefined,
         confirm: async () => false,
