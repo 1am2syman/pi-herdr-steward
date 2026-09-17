@@ -1,0 +1,31 @@
+{
+  "name": "pi-herdr-steward",
+  "version": "0.1.0",
+  "description": "A compact Pi extension for inspecting Steward Runs.",
+  "type": "module",
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "steward"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/extension.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.9"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run test/status.empty-run.functional.test.ts"
+  }
+}
