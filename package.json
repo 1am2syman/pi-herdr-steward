@@ -26,6 +26,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run test/status.empty-run.functional.test.ts"
+    "test:config": "vitest run test/config.functional.test.ts",
+    "test": "vitest run"
   }
 }

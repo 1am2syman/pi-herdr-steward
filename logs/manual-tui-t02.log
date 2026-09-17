@@ -1,0 +1,13 @@
+Host-load smoke check (Pi 0.84.4, isolated PI_CODING_AGENT_DIR=/tmp/pi-herdr-steward-rpc-agent-P2oNmg)
+
+- Started: env PI_CODING_AGENT_DIR=/tmp/pi-herdr-steward-rpc-agent-P2oNmg PI_OFFLINE=1 pi --no-session --no-tools --offline -e .
+- Invoked: /steward config
+- Observed the initial interactive summary with:
+  - User-global recovery defaults at /tmp/pi-herdr-steward-rpc-agent-P2oNmg/steward/defaults.json
+  - all seven built-in values: 300s, 300s, 120s, 1800s, 1, 2, 5
+  - project-local Model Plans at <worktree>/.pi/steward/defaults.json: not configured
+  - separate exact Controller Session proposal: deepseek/deepseek-v4-pro [thinking=high]
+- Pressed Escape.
+- Observed: Cancelled; configuration unchanged.
+- Exited with Ctrl-D.
+- No temporary user or project config was saved.
