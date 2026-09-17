@@ -19,6 +19,7 @@ import { createPiUiAdapter, createRunJournalAdapter } from "../src/adapters.ts";
 import {
   registerStewardExtension,
   type StewardCommandHandler,
+  type StewardCommandContext,
   type StewardRegistrationSurface,
 } from "../src/extension.ts";
 import type {
@@ -174,13 +175,24 @@ it("registered /steward status reports an empty Run and performs no writes", asy
       herdr: createOpaqueAdapter("herdr", adapterCalls),
       git: createOpaqueAdapter("git", adapterCalls),
       process: createOpaqueAdapter("process", adapterCalls),
-      model: createOpaqueAdapter("model", adapterCalls),
+      model: {
+        listModelChoices() {
+          return [];
+        },
+        async validateModelPlans() {
+          return [];
+        },
+      },
       clock: createOpaqueAdapter("clock", adapterCalls),
       ui: {
         presentStatus(statusView, target) {
           presentations.push({ statusView, target });
           productionUiAdapter.presentStatus(statusView, target);
         },
+        async editConfiguration() {
+          return { kind: "cancelled" as const };
+        },
+        presentConfigurationResult() {},
       },
     };
     const adapterFactory = (): StewardDependencies => dependencies;
@@ -190,8 +202,16 @@ it("registered /steward status reports an empty Run and performs no writes", asy
     ok(commandRegistration.handler, "the registered steward command handler should be captured");
     await commandRegistration.handler("status", {
       mode: "tui",
+      hasUI: true,
       cwd: repositoryRoot,
+      modelRegistry: {} as StewardCommandContext["modelRegistry"],
+      model: undefined,
+      thinkingLevel: undefined,
+      scopedModels: [],
       ui: {
+        select: async () => undefined,
+        confirm: async () => false,
+        input: async () => undefined,
         notify() {},
         setStatus() {},
       },

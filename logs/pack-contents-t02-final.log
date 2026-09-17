@@ -1,0 +1,11 @@
+{
+  "filename": "pi-herdr-steward-0.1.0.tgz",
+  "files": [
+    "package.json",
+    "src/adapters.ts",
+    "src/config-store.ts",
+    "src/config.ts",
+    "src/extension.ts",
+    "src/steward.ts"
+  ]
+}

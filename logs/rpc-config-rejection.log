@@ -1,0 +1,2 @@
+{"type":"extension_error","extensionPath":"command:steward","event":"command","error":"Steward configuration requires interactive TUI mode."}
+{"id":"config","type":"response","command":"prompt","success":true}

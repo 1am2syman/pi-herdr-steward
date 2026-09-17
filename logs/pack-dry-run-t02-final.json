@@ -1,0 +1,46 @@
+[
+  {
+    "id": "pi-herdr-steward@0.1.0",
+    "name": "pi-herdr-steward",
+    "version": "0.1.0",
+    "size": 12084,
+    "unpackedSize": 52655,
+    "shasum": "b3ff9a869cbe02b896705880d58e6404dd532535",
+    "integrity": "sha512-g9kbyJrO0YoDBk47ref0Q+EZivxvbcTNDUtPB0IucusGlhKkGw9MzJvcx63caDbX3IRqvxyLPmMeqgVFXuUUKw==",
+    "filename": "pi-herdr-steward-0.1.0.tgz",
+    "files": [
+      {
+        "path": "package.json",
+        "size": 654,
+        "mode": 420
+      },
+      {
+        "path": "src/adapters.ts",
+        "size": 16317,
+        "mode": 420
+      },
+      {
+        "path": "src/config-store.ts",
+        "size": 8166,
+        "mode": 420
+      },
+      {
+        "path": "src/config.ts",
+        "size": 13960,
+        "mode": 420
+      },
+      {
+        "path": "src/extension.ts",
+        "size": 3579,
+        "mode": 420
+      },
+      {
+        "path": "src/steward.ts",
+        "size": 9979,
+        "mode": 420
+      }
+    ],
+    "entryCount": 6,
+    "bundled": []
+  }
+]
