@@ -64,13 +64,13 @@ function proposalFromContext(ctx: StewardCommandContext): ControllerSessionPropo
 	};
 }
 
-function runStatus(
+async function runStatus(
 	ctx: StewardCommandContext | StewardSessionContext,
 	target: StatusTarget,
 	adapterFactory: StewardAdapterFactory,
 	exec?: ExtensionAPI["exec"],
-): void {
-	createSteward(adapterFactory(requestFromContext(ctx, exec))).status(ctx.cwd, target);
+): Promise<void> {
+	await createSteward(adapterFactory(requestFromContext(ctx, exec))).status(ctx.cwd, target);
 }
 
 /** Register Steward's TUI-only session footer and status/configuration commands. */
@@ -79,9 +79,9 @@ export function registerStewardExtension(
 	adapterFactory: StewardAdapterFactory = defaultAdapterFactory,
 	exec?: ExtensionAPI["exec"],
 ): void {
-	pi.on("session_start", (_event, ctx) => {
+	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		runStatus(ctx, "footer", adapterFactory, exec);
+		await runStatus(ctx, "footer", adapterFactory, exec);
 	});
 
 	pi.registerCommand("steward", {
@@ -92,7 +92,7 @@ export function registerStewardExtension(
 			if (command === "config" && ctx.mode !== "tui") throw new Error("Steward configuration requires interactive TUI mode.");
 			if (ctx.mode !== "tui") return;
 			if (command === "status") {
-				runStatus(ctx, "command", adapterFactory, exec);
+				await runStatus(ctx, "command", adapterFactory, exec);
 				return;
 			}
 			if (command === "config") {

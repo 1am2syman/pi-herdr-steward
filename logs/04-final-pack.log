@@ -1,0 +1,66 @@
+[
+  {
+    "id": "pi-herdr-steward@0.1.0",
+    "name": "pi-herdr-steward",
+    "version": "0.1.0",
+    "size": 37569,
+    "unpackedSize": 182783,
+    "shasum": "e1c639a3b728ae69730fef64fbd703a590a556dd",
+    "integrity": "sha512-BKZaiDTFhSJWKaMQoYDs9BqDGsA4Jr5Ns5iDfQHkU6M6eASUetAcogJj42q7J/T2Acfnwf1VpOndmsHAE/z6kQ==",
+    "filename": "pi-herdr-steward-0.1.0.tgz",
+    "files": [
+      {
+        "path": "package.json",
+        "size": 934,
+        "mode": 420
+      },
+      {
+        "path": "src/adapters.ts",
+        "size": 35540,
+        "mode": 420
+      },
+      {
+        "path": "src/assignment-store.ts",
+        "size": 6652,
+        "mode": 420
+      },
+      {
+        "path": "src/config-store.ts",
+        "size": 7724,
+        "mode": 420
+      },
+      {
+        "path": "src/config.ts",
+        "size": 13960,
+        "mode": 420
+      },
+      {
+        "path": "src/extension.ts",
+        "size": 4112,
+        "mode": 420
+      },
+      {
+        "path": "src/project-state.ts",
+        "size": 5631,
+        "mode": 420
+      },
+      {
+        "path": "src/run-journal-store.ts",
+        "size": 15206,
+        "mode": 420
+      },
+      {
+        "path": "src/run.ts",
+        "size": 50131,
+        "mode": 420
+      },
+      {
+        "path": "src/steward.ts",
+        "size": 42893,
+        "mode": 420
+      }
+    ],
+    "entryCount": 10,
+    "bundled": []
+  }
+]

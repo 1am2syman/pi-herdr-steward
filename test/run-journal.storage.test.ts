@@ -6,8 +6,10 @@ import { deepStrictEqual, equal, match, ok } from "node:assert/strict";
 import { afterEach, it } from "vitest";
 
 import { createRunJournalStore } from "../src/run-journal-store.ts";
+import { resolveAssignmentPaths } from "../src/assignment-store.ts";
 import { buildInitialRunJournal, deserializeRunJournal, serializeRunJournal, type RunJournal } from "../src/run.ts";
 import { type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
+import type { BuilderAssignmentDocument } from "../src/run.ts";
 
 const roots: string[] = [];
 const plans: ProjectModelPlans = {
@@ -150,4 +152,42 @@ it.sequential("atomic reads observe only complete old or new snapshots", async (
 		await store.replaceActive(root, versions[index % versions.length]);
 	}
 	await Promise.all(reads);
+});
+
+it.sequential("Assignment creation is deterministic, protected, no-clobber, and byte-identity reusable", async () => {
+	const root = await makeRoot();
+	const store = createRunJournalStore();
+	const runId = "run-20260917T180000000Z-assignment";
+	const paths = resolveAssignmentPaths(root, runId, "task-01", "attempt-01");
+	const document: BuilderAssignmentDocument = {
+		schemaVersion: 1,
+		assignment: {
+			runId,
+			taskId: "task-01",
+			attemptId: "attempt-01",
+			role: "builder",
+			requiredOutcome: "Implement the bounded change",
+			allowedScope: ["src/change.ts"],
+			expectedArtifacts: [{ kind: "git-commit" }],
+			reportPath: paths.reportPath,
+			evidenceDirectory: paths.evidenceDirectory,
+			verification: { kind: "command", command: "npm test" },
+			actualModel: { model: "builder/primary", thinkingLevel: "high" },
+			specificationHash: "sha256:" + "a".repeat(64),
+			baseRevision: "0123456789abcdef0123456789abcdef01234567",
+			worktree: { path: "/tmp/builder-worktree", branch: "steward/run/task/attempt-01" },
+			herdr: { workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1", agentName: "steward-b-abcdef12-01-01" },
+		},
+	};
+	const first = await store.createAssignment(root, document);
+	equal(first.kind, "created");
+	const bytes = await readFile(paths.assignmentPath, "utf8");
+	equal(await stat(paths.assignmentPath).then((value) => value.mode & 0o777), 0o600);
+	const second = await store.createAssignment(root, document);
+	equal(second.kind, "existing-match");
+	equal(await readFile(paths.assignmentPath, "utf8"), bytes);
+	const conflict = await store.createAssignment(root, { ...document, assignment: { ...document.assignment, requiredOutcome: "A different bounded change" } });
+	equal(conflict.kind, "conflict");
+	equal(await readFile(paths.assignmentPath, "utf8"), bytes);
+	deepStrictEqual(await listTemporaryFiles(paths.attemptDirectory), []);
 });

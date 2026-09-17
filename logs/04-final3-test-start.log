@@ -1,0 +1,100 @@
+
+> pi-herdr-steward@0.1.0 test:start
+> vitest run test/start.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+ ❯ test/start.functional.test.ts (10 tests | 6 failed) 56834ms
+   × registered /steward start confirms and persists one frozen pending Run 15016ms
+   × start cancellation during drafting and final confirmation is a filesystem no-op 15011ms
+   × an existing active Run refuses before Herdr/model/UI work 5004ms
+   × activity logging failure leaves the authoritative journal and reports degraded logging 5005ms
+   × post-confirmation active, Herdr, model, and Git changes refuse without persistence 5008ms
+   × exclusive creation race refuses without overwriting the competing Run or appending activity 11773ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 6 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/start.functional.test.ts > registered /steward start confirms and persists one frozen pending Run
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:111:4
+    109| }
+    110|
+    111| it.sequential("registered /steward start confirms and persists one fro…
+       |    ^
+    112|  const root = await makeRoot();
+    113|  const config = createConfigStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/6]⎯
+
+ FAIL  test/start.functional.test.ts > start cancellation during drafting and final confirmation is a filesystem no-op
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:160:4
+    158| }, START_FILESYSTEM_TEST_TIMEOUT_MS);
+    159|
+    160| it.sequential("start cancellation during drafting and final confirmati…
+       |    ^
+    161|  const root = await makeRoot();
+    162|  let capture: { handler?: StewardCommandHandler } = {};
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/6]⎯
+
+ FAIL  test/start.functional.test.ts > an existing active Run refuses before Herdr/model/UI work
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:199:4
+    197| });
+    198|
+    199| it.sequential("an existing active Run refuses before Herdr/model/UI wo…
+       |    ^
+    200|  const root = await makeRoot();
+    201|  const store = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/6]⎯
+
+ FAIL  test/start.functional.test.ts > activity logging failure leaves the authoritative journal and reports degraded logging
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:297:4
+    295| });
+    296|
+    297| it.sequential("activity logging failure leaves the authoritative journ…
+       |    ^
+    298|  const root = await makeRoot();
+    299|  const production = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/6]⎯
+
+ FAIL  test/start.functional.test.ts > post-confirmation active, Herdr, model, and Git changes refuse without persistence
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:316:4
+    314| });
+    315|
+    316| it.sequential("post-confirmation active, Herdr, model, and Git changes…
+       |    ^
+    317|  const cases = ["active", "herdr", "model", "git"] as const;
+    318|  for (const change of cases) {
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/6]⎯
+
+ FAIL  test/start.functional.test.ts > exclusive creation race refuses without overwriting the competing Run or appending activity
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:380:4
+    378| });
+    379|
+    380| it.sequential("exclusive creation race refuses without overwriting the…
+       |    ^
+    381|  const root = await makeRoot();
+    382|  const production = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/6]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  6 failed | 4 passed (10)
+   Start at  21:29:44
+   Duration  58.93s (transform 268ms, setup 0ms, import 1.81s, tests 56.83s, environment 0ms)

@@ -1,0 +1,129 @@
+
+> pi-herdr-steward@0.1.0 test
+> vitest run --maxWorkers=1
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+ ❯ test/start.functional.test.ts (10 tests | 5 failed) 48319ms
+   × registered /steward start confirms and persists one frozen pending Run 15015ms
+   × start cancellation during drafting and final confirmation is a filesystem no-op 16975ms
+   × an existing active Run refuses before Herdr/model/UI work 5006ms
+   × activity logging failure leaves the authoritative journal and reports degraded logging 5003ms
+   × post-confirmation active, Herdr, model, and Git changes refuse without persistence 5004ms
+ ❯ test/dispatch.functional.test.ts (5 tests | 3 failed) 51021ms
+   × registered start persists each durable phase before the next Builder effect 17815ms
+   × retrying start refuses the active Run and reuses one Assignment 15010ms
+   × name collision changes only the intended name inside attempt-01 15006ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 8 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/dispatch.functional.test.ts > registered start persists each durable phase before the next Builder effect
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:132:4
+    130| }
+    131|
+    132| it.sequential("registered start persists each durable phase before the…
+       |    ^
+    133|  const root = await makeRoot();
+    134|  const observed: { value?: import("../src/steward.ts").StartResult } =…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/8]⎯
+
+ FAIL  test/dispatch.functional.test.ts > retrying start refuses the active Run and reuses one Assignment
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:167:4
+    165| });
+    166|
+    167| it.sequential("retrying start refuses the active Run and reuses one As…
+       |    ^
+    168|  const root = await makeRoot();
+    169|  const first: { value?: import("../src/steward.ts").StartResult } = {};
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/8]⎯
+
+ FAIL  test/dispatch.functional.test.ts > name collision changes only the intended name inside attempt-01
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:190:4
+    188| });
+    189|
+    190| it.sequential("name collision changes only the intended name inside at…
+       |    ^
+    191|  const root = await makeRoot();
+    192|  const observed: { value?: import("../src/steward.ts").StartResult } =…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/8]⎯
+
+ FAIL  test/start.functional.test.ts > registered /steward start confirms and persists one frozen pending Run
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:111:4
+    109| }
+    110|
+    111| it.sequential("registered /steward start confirms and persists one fro…
+       |    ^
+    112|  const root = await makeRoot();
+    113|  const config = createConfigStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/8]⎯
+
+ FAIL  test/start.functional.test.ts > start cancellation during drafting and final confirmation is a filesystem no-op
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:160:4
+    158| }, START_FILESYSTEM_TEST_TIMEOUT_MS);
+    159|
+    160| it.sequential("start cancellation during drafting and final confirmati…
+       |    ^
+    161|  const root = await makeRoot();
+    162|  let capture: { handler?: StewardCommandHandler } = {};
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/8]⎯
+
+ FAIL  test/start.functional.test.ts > an existing active Run refuses before Herdr/model/UI work
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:199:4
+    197| });
+    198|
+    199| it.sequential("an existing active Run refuses before Herdr/model/UI wo…
+       |    ^
+    200|  const root = await makeRoot();
+    201|  const store = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/8]⎯
+
+ FAIL  test/start.functional.test.ts > activity logging failure leaves the authoritative journal and reports degraded logging
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:297:4
+    295| });
+    296|
+    297| it.sequential("activity logging failure leaves the authoritative journ…
+       |    ^
+    298|  const root = await makeRoot();
+    299|  const production = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/8]⎯
+
+ FAIL  test/start.functional.test.ts > post-confirmation active, Herdr, model, and Git changes refuse without persistence
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:316:4
+    314| });
+    315|
+    316| it.sequential("post-confirmation active, Herdr, model, and Git changes…
+       |    ^
+    317|  const cases = ["active", "herdr", "model", "git"] as const;
+    318|  for (const change of cases) {
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/8]⎯
+
+
+ Test Files  2 failed | 4 passed (6)
+      Tests  8 failed | 21 passed (29)
+   Start at  21:36:46
+   Duration  111.63s (transform 389ms, setup 0ms, import 9.25s, tests 100.99s, environment 1ms)

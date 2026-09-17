@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test:herdr
+> vitest run test/herdr-adapter.contract.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  21:23:35
+   Duration  1.98s (transform 229ms, setup 0ms, import 1.75s, tests 11ms, environment 0ms)

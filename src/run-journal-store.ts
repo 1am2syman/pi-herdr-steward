@@ -4,6 +4,7 @@ import { chmod, link, lstat, open, readFile, rename, unlink } from "node:fs/prom
 import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
+import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
 import {
 	ensureProjectStateDirectory,
 	ensureOwnedDirectory,
@@ -57,6 +58,8 @@ export interface RunJournalStore {
 	createActive(repositoryRoot: string, journal: RunJournal): Promise<CreateActiveResult>;
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: ActivityEntry): Promise<ActivityAppendResult>;
+	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
+	createAssignment(repositoryRoot: string, document: import("./run.ts").BuilderAssignmentDocument): Promise<AssignmentCreateResult>;
 }
 
 const ACTIVE_NAME = "active-run.json";
@@ -169,6 +172,7 @@ export function resolveRunJournalPaths(repositoryRoot: string, configDirName = C
 
 export function createRunJournalStore(options: { configDirName?: string } = {}): RunJournalStore {
 	const configDirName = options.configDirName ?? CONFIG_DIR_NAME;
+	const assignmentStore = createAssignmentStore({ configDirName });
 
 	function resolvePaths(repositoryRoot: string): RunJournalPaths {
 		return pathsFor(repositoryRoot, configDirName);
@@ -296,7 +300,16 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		}
 	}
 
-	return { resolvePaths, probeActive, loadActive, createActive, replaceActive, appendActivity };
+	return {
+		resolvePaths,
+		probeActive,
+		loadActive,
+		createActive,
+		replaceActive,
+		appendActivity,
+		resolveAssignmentPaths: (repositoryRoot, runId, taskId, attemptId) => resolveAssignmentPaths(repositoryRoot, runId, taskId, attemptId, configDirName),
+		createAssignment: assignmentStore.createAssignment,
+	};
 }
 
 function requireLstat(path: string): boolean {

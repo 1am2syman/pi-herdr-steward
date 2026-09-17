@@ -1,0 +1,167 @@
+
+> pi-herdr-steward@0.1.0 typecheck
+> tsc --noEmit -p tsconfig.json
+
+
+> pi-herdr-steward@0.1.0 test:dispatch
+> vitest run test/dispatch.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+ ❯ test/dispatch.functional.test.ts (5 tests | 2 failed) 43976ms
+   × registered start persists each durable phase before the next Builder effect 15012ms
+   × retrying start refuses the active Run and reuses one Assignment 15007ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/dispatch.functional.test.ts > registered start persists each durable phase before the next Builder effect
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:132:4
+    130| }
+    131|
+    132| it.sequential("registered start persists each durable phase before the…
+       |    ^
+    133|  const root = await makeRoot();
+    134|  const observed: { value?: import("../src/steward.ts").StartResult } =…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  test/dispatch.functional.test.ts > retrying start refuses the active Run and reuses one Assignment
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:167:4
+    165| });
+    166|
+    167| it.sequential("retrying start refuses the active Run and reuses one As…
+       |    ^
+    168|  const root = await makeRoot();
+    169|  const first: { value?: import("../src/steward.ts").StartResult } = {};
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 3 passed (5)
+   Start at  21:32:23
+   Duration  46.21s (transform 334ms, setup 0ms, import 1.94s, tests 43.98s, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test:herdr
+> vitest run test/herdr-adapter.contract.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  21:33:10
+   Duration  1.97s (transform 256ms, setup 0ms, import 1.71s, tests 10ms, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test:storage
+> vitest run test/run-journal.storage.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  21:33:13
+   Duration  6.40s (transform 202ms, setup 0ms, import 1.67s, tests 4.46s, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test
+> vitest run --maxWorkers=1
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+ ❯ test/run-journal.storage.test.ts (6 tests | 4 failed) 20430ms
+   × replacement preserves the immediate previous valid snapshot 5012ms
+   × rejects malformed and invalid candidates without changing snapshots 5006ms
+   × atomic reads observe only complete old or new snapshots 5008ms
+   × Assignment creation is deterministic, protected, no-clobber, and byte-identity reusable 5079ms
+ ❯ test/start.functional.test.ts (10 tests | 1 failed) 17047ms
+   × registered /steward start confirms and persists one frozen pending Run 15016ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 5 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/run-journal.storage.test.ts > replacement preserves the immediate previous valid snapshot
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:93:4
+     91| });
+     92|
+     93| it.sequential("replacement preserves the immediate previous valid snap…
+       |    ^
+     94|  const root = await makeRoot();
+     95|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/5]⎯
+
+ FAIL  test/run-journal.storage.test.ts > rejects malformed and invalid candidates without changing snapshots
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:111:4
+    109| });
+    110|
+    111| it.sequential("rejects malformed and invalid candidates without changi…
+       |    ^
+    112|  const root = await makeRoot();
+    113|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/5]⎯
+
+ FAIL  test/run-journal.storage.test.ts > atomic reads observe only complete old or new snapshots
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:135:4
+    133| });
+    134|
+    135| it.sequential("atomic reads observe only complete old or new snapshots…
+       |    ^
+    136|  const root = await makeRoot();
+    137|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/5]⎯
+
+ FAIL  test/run-journal.storage.test.ts > Assignment creation is deterministic, protected, no-clobber, and byte-identity reusable
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:157:4
+    155| });
+    156|
+    157| it.sequential("Assignment creation is deterministic, protected, no-clo…
+       |    ^
+    158|  const root = await makeRoot();
+    159|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/5]⎯
+
+ FAIL  test/start.functional.test.ts > registered /steward start confirms and persists one frozen pending Run
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:111:4
+    109| }
+    110|
+    111| it.sequential("registered /steward start confirms and persists one fro…
+       |    ^
+    112|  const root = await makeRoot();
+    113|  const config = createConfigStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/5]⎯
+
+
+ Test Files  2 failed | 4 passed (6)
+      Tests  5 failed | 24 passed (29)
+   Start at  21:33:20
+   Duration  52.96s (transform 384ms, setup 0ms, import 9.60s, tests 41.86s, environment 1ms)
+
+logs/04-final-rerun.log:163: new blank line at EOF.
+Final required rerun command: npm run typecheck && npm run test:dispatch && npm run test:herdr && npm run test:storage && npm test && git diff --check
+First final sequential run: PASS — typecheck, dispatch 5, Herdr 3, storage 6, full suite 29, diff check.
+The later fail-fast rerun is preserved separately in logs/04-final-rerun-retry.log because host filesystem contention recurred.

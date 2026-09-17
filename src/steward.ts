@@ -14,11 +14,16 @@ import {
 	type ThinkingLevel,
 } from "./config.ts";
 import type { ActiveRunLoadResult, ActivityAppendResult, CreateActiveResult } from "./run-journal-store.ts";
+import type { AssignmentCreateResult, AssignmentPaths } from "./assignment-store.ts";
 import {
 	buildInitialRunJournal,
 	buildRunConfirmationSummary,
 	createRunIdentity,
 	isCodeChanging,
+	advanceRunJournal,
+	buildBuilderAssignment,
+	builderAssignmentSha256,
+	formatBuilderPrompt,
 	validateRunJournal,
 	validateRunDraft,
 	type IntegrationBase,
@@ -27,6 +32,10 @@ import {
 	type RunDraftInput,
 	type RunDraftResult,
 	type RunJournal,
+	type AttemptRecord,
+	type BuilderAssignmentDocument,
+	type DispatchRecord,
+	type TaskRecord,
 } from "./run.ts";
 
 /** The two presentation contexts supported by this slice. */
@@ -40,7 +49,10 @@ export interface RunJournalAdapter {
 	probeActive(repositoryRoot: string): ActiveRunProbe;
 	loadActive(repositoryRoot: string): Promise<ActiveRunLoadResult>;
 	createActive(repositoryRoot: string, journal: RunJournal): Promise<CreateActiveResult>;
+	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<import("./run-journal-store.ts").ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: import("./run.ts").ActivityEntry): Promise<ActivityAppendResult>;
+	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
+	createAssignment(repositoryRoot: string, document: BuilderAssignmentDocument): Promise<AssignmentCreateResult>;
 	loadRecoveryDefaults(): Promise<ConfigLoadResult<RecoveryDefaults>>;
 	loadModelPlans(repositoryRoot: string): Promise<ConfigLoadResult<ProjectModelPlans>>;
 	saveRecoveryDefaults(recovery: RecoveryDefaults): Promise<ConfigSaveResult>;
@@ -95,7 +107,23 @@ export interface StewardModelAdapter {
 /** The complete, deliberately fixed orchestration seam for this ticket. */
 export interface StewardHerdrAdapter {
 	checkAvailability(repositoryRoot: string): Promise<HerdrAvailability>;
+	createBuilderWorktree?(input: { repositoryRoot: string; branch: string; baseRevision: string; label: string }): Promise<HerdrWorktreeCreateResult>;
+	startBuilder?(input: { repositoryRoot: string; name: string; paneId: string; model: import("./config.ts").ModelChoice }): Promise<HerdrAgentStartResult>;
+	promptBuilder?(input: { repositoryRoot: string; name: string; assignmentPrompt: string }): Promise<HerdrPromptResult>;
 }
+
+export type HerdrWorktreeCreateResult =
+	| { kind: "created"; branch: string; path: string; workspaceId: string; tabId: string; paneId: string; terminalId: string }
+	| { kind: "failed"; stage: "worktree-create"; code: string; message: string };
+
+export type HerdrAgentStartResult =
+	| { kind: "started"; name: string; agentKind: "pi"; workspaceId: string; tabId: string; paneId: string; terminalId: string }
+	| { kind: "name-collision"; code: "agent_name_taken"; message: string }
+	| { kind: "failed"; stage: "agent-start"; code: string; message: string };
+
+export type HerdrPromptResult =
+	| { kind: "prompted"; name: string; workspaceId: string; tabId: string; paneId: string; terminalId: string }
+	| { kind: "failed"; stage: "agent-prompt"; code: string; message: string };
 
 export type HerdrAvailability =
 	| { kind: "available"; status: string; running: true; compatible: true; endpointCompatible: true; protocol?: number }
@@ -103,10 +131,16 @@ export type HerdrAvailability =
 
 export interface StewardGitAdapter {
 	inspectIntegrationBase(repositoryRoot: string): Promise<IntegrationBaseInspection>;
+	branchExists?(repositoryRoot: string, branch: string): Promise<boolean>;
+	inspectBuilderWorktree?(worktreePath: string, expectedRevision: string): Promise<BuilderWorktreeInspection>;
 }
 
 export type IntegrationBaseInspection =
 	| { kind: "ready"; branch: string; revision: string }
+	| { kind: "unavailable"; message: string };
+
+export type BuilderWorktreeInspection =
+	| { kind: "ready"; head: string; clean: true }
 	| { kind: "unavailable"; message: string };
 
 export interface StewardClockAdapter {
@@ -133,7 +167,7 @@ export interface EmptyFooterView {
 export interface ActiveFooterView {
 	run: "active";
 	attentionCount: 0;
-	text: "steward: active Run detected";
+	text: string;
 }
 
 export interface EmptyStatusView {
@@ -142,10 +176,31 @@ export interface EmptyStatusView {
 	footer: EmptyFooterView;
 }
 
+export interface ActiveAttemptStatusView {
+	runId: string;
+	taskId: string;
+	taskPhase: "building";
+	attemptId: string;
+	role: "builder";
+	attemptState: "prepared" | "active";
+	assignmentPath?: string;
+	assignmentHash?: string;
+	actualModel?: import("./config.ts").ModelChoice;
+	worktreeBranch?: string;
+	worktreePath?: string;
+	agentName?: string;
+	paneId?: string;
+	workspaceId?: string;
+	reportPath: string;
+	attention: "none";
+	dispatchPhase: DispatchRecord["phase"];
+}
+
 export interface ActiveStatusView {
 	kind: "present";
-	markdown: "An active Steward Run was detected. Detailed active status is outside ticket 01.";
+	markdown: string;
 	footer: ActiveFooterView;
+	activeAttempt?: ActiveAttemptStatusView;
 }
 
 export type StatusView = EmptyStatusView | ActiveStatusView;
@@ -160,13 +215,16 @@ export type ConfigureResult =
 export type StartResult =
 	| { kind: "cancelled"; message: string }
 	| { kind: "refused"; message: string }
+	| { kind: "started-and-dispatched"; journal: RunJournal; message: string }
+	| { kind: "started-dispatch-pending"; journal: RunJournal; message: string }
+	| { kind: "started-and-dispatched-with-warning"; journal: RunJournal; message: string }
 	| { kind: "started"; journal: RunJournal; message: string }
 	| { kind: "started-with-warning"; journal: RunJournal; message: string }
 	| { kind: "storage-error"; message: string };
 
 /** The ticket-01 and ticket-02 orchestration operations. */
 export interface Steward {
-	status(repositoryRoot: string, target: StatusTarget): StatusView;
+	status(repositoryRoot: string, target: StatusTarget): Promise<StatusView>;
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
 	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
 }
@@ -181,18 +239,58 @@ const EMPTY_STATUS: EmptyStatusView = {
 	},
 };
 
-const PRESENT_STATUS: ActiveStatusView = {
-	kind: "present",
-	markdown: "An active Steward Run was detected. Detailed active status is outside ticket 01.",
-	footer: {
-		run: "active",
-		attentionCount: 0,
-		text: "steward: active Run detected",
-	},
-};
-
-function buildStatusView(probe: ActiveRunProbe): StatusView {
-	return probe === "missing" ? EMPTY_STATUS : PRESENT_STATUS;
+function presentStatusForJournal(journal: RunJournal): ActiveStatusView {
+	const task = journal.run.tasks.find((candidate) => candidate.phase === "building" && candidate.attempts.length === 1);
+	const attempt = task?.attempts[0];
+	if (!task || !attempt) {
+		return {
+			kind: "present",
+			markdown: `Run ${journal.run.id} is active; no Builder Attempt has been dispatched.`,
+			footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` },
+		};
+	}
+	const dispatch = attempt.dispatch;
+	const actual = dispatch.phase === "worktree-intended" ? {} : {
+		worktreeBranch: dispatch.branch,
+		worktreePath: dispatch.worktreePath,
+		agentName: dispatch.agentName,
+		paneId: dispatch.paneId,
+		workspaceId: dispatch.workspaceId,
+		...(dispatch.phase === "prompt-intended" || dispatch.phase === "prompted" ? { assignmentHash: dispatch.assignmentSha256 } : {}),
+	};
+	const activeAttempt: ActiveAttemptStatusView = {
+		runId: journal.run.id,
+		taskId: task.contract.id,
+		taskPhase: "building",
+		attemptId: attempt.id,
+		role: "builder",
+		attemptState: attempt.state,
+		assignmentPath: attempt.assignmentPath,
+		actualModel: { ...attempt.actualModel },
+		reportPath: attempt.reportPath,
+		attention: task.attention,
+		dispatchPhase: dispatch.phase,
+		...actual,
+	};
+	const lines = [
+		`Run ${journal.run.id}: active`,
+		`Task ${task.contract.id}: building`,
+		`Attempt ${attempt.id}: ${attempt.state} (builder)`,
+		`Dispatch phase: ${dispatch.phase}`,
+		`Assignment: ${attempt.assignmentPath}${"assignmentHash" in activeAttempt && activeAttempt.assignmentHash ? ` (${activeAttempt.assignmentHash})` : ""}`,
+		`Report: ${attempt.reportPath}`,
+		`Model: ${attempt.actualModel.model} [thinking=${attempt.actualModel.thinkingLevel}]`,
+		...(activeAttempt.worktreeBranch ? [`Worktree: ${activeAttempt.worktreeBranch} @ ${activeAttempt.worktreePath}`] : []),
+		...(activeAttempt.agentName ? [`Herdr Builder: ${activeAttempt.agentName} (pane=${activeAttempt.paneId}, workspace=${activeAttempt.workspaceId})`] : []),
+		`Attention: ${task.attention}`,
+		"Completion: not inferred from Herdr activity; awaiting a validated Attempt Report.",
+	];
+	return {
+		kind: "present",
+		markdown: lines.join("\n"),
+		footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · building · 0 attention` },
+		activeAttempt,
+	};
 }
 
 function resultForSaveFailure(scope: ConfigurationScope, save: ConfigSaveResult): ConfigureResult {
@@ -205,10 +303,248 @@ function resultForSaveFailure(scope: ConfigurationScope, save: ConfigSaveResult)
 	};
 }
 
+type DispatchOutcome =
+	| { kind: "dispatched"; journal: RunJournal; message: string; warnings: string[] }
+	| { kind: "pending"; journal: RunJournal; message: string; warnings: string[] };
+
+function compactUuid(clock: StewardClockAdapter): string {
+	const value = clock.randomUUID().replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 8);
+	if (value.length === 0) throw new Error("Clock randomUUID must provide identity material.");
+	return value;
+}
+
+function transitionTimestamp(journal: RunJournal, now: Date): string {
+	return new Date(Math.max(now.getTime(), new Date(journal.run.updatedAt).getTime() + 1)).toISOString();
+}
+
+function safeHerdrName(value: string): boolean {
+	return /^[a-z][a-z0-9_-]{0,31}$/.test(value);
+}
+
+function validIdentity(value: string): boolean {
+	return value.trim().length > 0 && value === value.trim() && !value.includes("\u0000");
+}
+
+function findInitialCodeTask(journal: RunJournal): { task: TaskRecord; index: number } | undefined {
+	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+		const task = journal.run.tasks[index];
+		if (task && task.phase === "pending" && task.attempts.length === 0 && isCodeChanging([task])) return { task, index };
+	}
+	return undefined;
+}
+
+async function dispatchInitialBuilder(input: {
+	repositoryRoot: string;
+	controllerSessionId: string;
+	journal: RunJournal;
+	dependencies: StewardDependencies;
+}): Promise<DispatchOutcome> {
+	const { repositoryRoot, dependencies } = input;
+	let journal = input.journal;
+	const warnings: string[] = [];
+	const pending = (message: string): DispatchOutcome => ({ kind: "pending", journal, message, warnings });
+	const note = async (event: string, message: string): Promise<void> => {
+		try {
+			const result = await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: journal.run.updatedAt, runId: journal.run.id, event, message });
+			if (result.kind !== "appended") warnings.push(`Activity logging degraded at ${result.path}.`);
+		} catch (error: unknown) {
+			warnings.push(`Activity logging degraded: ${error instanceof Error ? error.message : "append failed."}`);
+		}
+	};
+	const persist = async (candidate: RunJournal, phase: string): Promise<boolean> => {
+		try {
+			const result = await dependencies.runJournal.replaceActive(repositoryRoot, candidate);
+			if (result.kind === "replaced") {
+				journal = result.journal;
+				return true;
+			}
+			warnings.push(`Dispatch stopped at ${phase}: durable Journal replacement failed.`);
+			return false;
+		} catch (error: unknown) {
+			warnings.push(`Dispatch stopped at ${phase}: ${error instanceof Error ? error.message : "durable Journal replacement failed."}`);
+			return false;
+		}
+	};
+
+	const selected = findInitialCodeTask(journal);
+	if (!selected) return { kind: "dispatched", journal, message: `Run ${journal.run.id} started; no approved code-changing Task is awaiting its initial Builder.`, warnings };
+	if (journal.run.integrationBase.kind !== "git") return pending("The Run has no Git integration base; Builder dispatch is pending and no external effect was attempted.");
+	if (journal.run.controllerSessionId !== input.controllerSessionId) return pending("The Controller Session changed before Builder dispatch; the prepared action is pending reconciliation.");
+	if (!dependencies.herdr.createBuilderWorktree || !dependencies.herdr.startBuilder || !dependencies.herdr.promptBuilder || !dependencies.git.branchExists || !dependencies.git.inspectBuilderWorktree) return pending("Builder dispatch adapters are unavailable; the Run is durable and dispatch is pending.");
+	let modelDiagnostics: ConfigDiagnostic[];
+	try {
+		modelDiagnostics = await dependencies.model.validateModelPlans(journal.run.modelPlan);
+	} catch (error: unknown) {
+		return pending(`Builder Model Plan revalidation failed; dispatch is pending. ${error instanceof Error ? error.message : "Validation failed."}`);
+	}
+	if (modelDiagnostics.length > 0) return pending(`Builder Model Plan is no longer available; dispatch is pending. ${modelDiagnostics.map((item) => item.message).join(" ")}`);
+
+	const task = selected.task;
+	const attemptId = "attempt-01";
+	const assignmentPaths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, task.contract.id, attemptId);
+	let branch = `steward/${journal.run.id}/${task.contract.id}/${attemptId}`;
+	try {
+		let branchCollisions = 0;
+		while (await dependencies.git.branchExists(repositoryRoot, branch)) {
+			if (branchCollisions >= 8) return pending("Steward could not reserve a unique Builder branch namespace; dispatch is pending.");
+			branchCollisions += 1;
+			branch = `steward/${journal.run.id}/${task.contract.id}/${attemptId}-${compactUuid(dependencies.clock)}`;
+		}
+	} catch (error: unknown) {
+		return pending(`Steward could not verify the Builder branch namespace; dispatch is pending. ${error instanceof Error ? error.message : "Branch inspection failed."}`);
+	}
+	let agentName = `steward-b-${compactUuid(dependencies.clock)}-${task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-01`;
+	if (!safeHerdrName(agentName)) return pending("Steward could not derive a valid Herdr Builder name; dispatch is pending.");
+	const model = { ...journal.run.modelPlan.builder.primary };
+	const initialAttempt: AttemptRecord = {
+		id: attemptId,
+		role: "builder",
+		state: "prepared",
+		preparedAt: transitionTimestamp(journal, dependencies.clock.now()),
+		actualModel: model,
+		specificationHash: task.specificationHash,
+		baseRevision: journal.run.integrationBase.revision,
+		assignmentPath: assignmentPaths.assignmentPath,
+		reportPath: assignmentPaths.reportPath,
+		evidenceDirectory: assignmentPaths.evidenceDirectory,
+		dispatch: { phase: "worktree-intended", branch, agentName },
+	};
+	let prepared: RunJournal;
+	try {
+		prepared = advanceRunJournal(journal, dependencies.clock.now(), (candidate) => {
+			const candidateTask = candidate.run.tasks[selected.index];
+			if (!candidateTask) throw new Error("Selected Task disappeared before dispatch.");
+			candidateTask.phase = "building";
+			candidateTask.attempts = [initialAttempt];
+		});
+	} catch (error: unknown) {
+		return pending(`Builder Attempt could not be prepared durably. ${error instanceof Error ? error.message : "Journal validation failed."}`);
+	}
+	if (!(await persist(prepared, "attempt-prepared"))) return pending("Builder Attempt preparation could not be persisted; dispatch is pending.");
+	await note("attempt-prepared", `Prepared Builder Attempt ${attemptId} for Task ${task.contract.id}.`);
+
+	let worktree: Extract<HerdrWorktreeCreateResult, { kind: "created" }>;
+	try {
+		const result = await dependencies.herdr.createBuilderWorktree({ repositoryRoot, branch, baseRevision: journal.run.integrationBase.revision, label: agentName });
+		if (result.kind !== "created" || result.branch !== branch || !isAbsolutePath(result.path) || !validIdentity(result.workspaceId) || !validIdentity(result.paneId) || !validIdentity(result.terminalId) || !validIdentity(result.tabId)) return pending("Herdr returned a malformed or contradictory worktree envelope; dispatch is pending.");
+		worktree = result;
+	} catch (error: unknown) {
+		return pending(`Builder worktree creation failed; dispatch is pending. ${error instanceof Error ? error.message : "Herdr worktree create failed."}`);
+	}
+	let inspected: BuilderWorktreeInspection;
+	try {
+		inspected = await dependencies.git.inspectBuilderWorktree(worktree.path, journal.run.integrationBase.revision);
+	} catch (error: unknown) {
+		return pending(`Builder worktree verification failed; dispatch is pending. ${error instanceof Error ? error.message : "Git inspection failed."}`);
+	}
+	if (inspected.kind !== "ready" || inspected.head !== journal.run.integrationBase.revision || !inspected.clean) return pending("Builder worktree base or clean-head verification failed; dispatch is pending.");
+
+	let actualStart: Extract<HerdrAgentStartResult, { kind: "started" }> | undefined;
+	for (let collision = 0; collision < 8; collision += 1) {
+		let intended: RunJournal;
+		try {
+			intended = advanceRunJournal(journal, dependencies.clock.now(), (candidate) => {
+				const candidateTask = candidate.run.tasks[selected.index];
+				const candidateAttempt = candidateTask?.attempts[0];
+				if (!candidateTask || !candidateAttempt) throw new Error("Prepared Builder Attempt disappeared before agent start.");
+				candidateAttempt.dispatch = { phase: "agent-intended", branch, agentName, worktreePath: worktree.path, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId };
+			});
+		} catch (error: unknown) {
+			return pending(`Builder agent intent could not be built durably; dispatch is pending. ${error instanceof Error ? error.message : "Journal validation failed."}`);
+		}
+		if (!(await persist(intended, "agent-intended"))) return pending("Builder agent intent could not be persisted; dispatch is pending.");
+		if (collision === 0) await note("worktree-created", `Created Builder worktree ${worktree.path} on branch ${worktree.branch}.`);
+		let started: HerdrAgentStartResult;
+		try {
+			started = await dependencies.herdr.startBuilder({ repositoryRoot, name: agentName, paneId: worktree.paneId, model });
+		} catch (error: unknown) {
+			return pending(`Builder agent start failed; dispatch is pending. ${error instanceof Error ? error.message : "Herdr agent start failed."}`);
+		}
+		if (started.kind === "name-collision") {
+			if (collision === 7) return pending("Eight Steward-owned Builder names collided; the prepared Attempt is pending reconciliation.");
+			agentName = `steward-b-${compactUuid(dependencies.clock)}-${task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-01`;
+			if (!safeHerdrName(agentName)) return pending("Steward could not derive a valid replacement Herdr Builder name; dispatch is pending.");
+			continue;
+		}
+		if (started.kind !== "started" || started.name !== agentName || started.agentKind !== "pi" || started.workspaceId !== worktree.workspaceId || started.paneId !== worktree.paneId || started.terminalId !== worktree.terminalId || !validIdentity(started.tabId)) return pending("Herdr returned a malformed or contradictory Builder start envelope; dispatch is pending.");
+		actualStart = started;
+		break;
+	}
+	if (!actualStart) return pending("Builder agent start did not produce an accepted identity; dispatch is pending.");
+	await note("builder-started", `Started Builder ${agentName} in worktree ${worktree.path}.`);
+
+	const agentIntent = journal.run.tasks[selected.index]?.attempts[0];
+	if (!agentIntent) return pending("Prepared Builder Attempt disappeared after agent start; dispatch is pending.");
+	let assignment: BuilderAssignmentDocument;
+	try {
+		assignment = buildBuilderAssignment({ run: journal.run, task: journal.run.tasks[selected.index], attempt: agentIntent, worktreePath: worktree.path, branch: worktree.branch, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId, agentName });
+	} catch (error: unknown) {
+		return pending(`Builder Assignment could not be built; dispatch is pending. ${error instanceof Error ? error.message : "Assignment validation failed."}`);
+	}
+	let assignmentResult: AssignmentCreateResult;
+	try {
+		assignmentResult = await dependencies.runJournal.createAssignment(repositoryRoot, assignment);
+	} catch (error: unknown) {
+		return pending(`Builder Assignment could not be persisted; dispatch is pending. ${error instanceof Error ? error.message : "Assignment storage failed."}`);
+	}
+	if (assignmentResult.kind !== "created" && assignmentResult.kind !== "existing-match") return pending("Builder Assignment path conflicts with different bytes; dispatch is pending and the Builder was not prompted.");
+	const assignmentHash = builderAssignmentSha256(assignmentResult.bytes);
+	let promptIntent: RunJournal;
+	try {
+		promptIntent = advanceRunJournal(journal, dependencies.clock.now(), (candidate) => {
+			const candidateTask = candidate.run.tasks[selected.index];
+			const candidateAttempt = candidateTask?.attempts[0];
+			if (!candidateTask || !candidateAttempt) throw new Error("Prepared Builder Attempt disappeared before prompt intent.");
+			candidateAttempt.dispatch = { phase: "prompt-intended", branch: worktree.branch, agentName, worktreePath: worktree.path, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId, assignmentSha256: assignmentHash };
+		});
+	} catch (error: unknown) {
+		return pending(`Builder prompt intent could not be built durably; dispatch is pending. ${error instanceof Error ? error.message : "Journal validation failed."}`);
+	}
+	if (!(await persist(promptIntent, "prompt-intended"))) return pending("Builder prompt intent could not be persisted; the Builder was not prompted.");
+	let prompted: HerdrPromptResult;
+	try {
+		prompted = await dependencies.herdr.promptBuilder({ repositoryRoot, name: agentName, assignmentPrompt: formatBuilderPrompt(assignment) });
+	} catch (error: unknown) {
+		return pending(`Builder prompt failed; dispatch is pending without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}`);
+	}
+	if (prompted.kind !== "prompted" || prompted.name !== agentName || prompted.workspaceId !== worktree.workspaceId || prompted.paneId !== worktree.paneId || prompted.terminalId !== worktree.terminalId || !validIdentity(prompted.tabId)) return pending("Herdr returned a malformed or contradictory Builder prompt envelope; dispatch is pending without a resend.");
+	const promptedAt = transitionTimestamp(journal, dependencies.clock.now());
+	let active: RunJournal;
+	try {
+		active = advanceRunJournal(journal, dependencies.clock.now(), (candidate) => {
+			const candidateTask = candidate.run.tasks[selected.index];
+			const candidateAttempt = candidateTask?.attempts[0];
+			if (!candidateTask || !candidateAttempt) throw new Error("Prepared Builder Attempt disappeared before activation.");
+			candidateAttempt.state = "active";
+			candidateAttempt.activatedAt = promptedAt;
+			candidateAttempt.dispatch = { phase: "prompted", branch: worktree.branch, agentName, worktreePath: worktree.path, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId, assignmentSha256: assignmentHash, promptedAt };
+		});
+	} catch (error: unknown) {
+		return pending(`Builder active Attempt could not be built durably; dispatch occurred and will not be resent. ${error instanceof Error ? error.message : "Journal validation failed."}`);
+	}
+	if (!(await persist(active, "active"))) return pending("Builder prompt succeeded, but active Attempt persistence failed; dispatch occurred and will not be resent.");
+	await note("builder-dispatched", `Prompted Builder ${agentName} with Assignment ${assignmentHash}.`);
+	return { kind: "dispatched", journal, message: `Run ${journal.run.id} dispatched Builder Attempt ${attemptId} for Task ${task.contract.id}. Assignment: ${assignmentResult.paths.assignmentPath}. Worktree: ${worktree.path}.`, warnings };
+}
+
+function isAbsolutePath(value: string): boolean {
+	return value.startsWith("/") && value.trim() === value && !value.includes("\u0000");
+}
+
 /** Assemble the plain-function orchestration seam without adding lifecycle machinery. */
-export function createSteward({ runJournal, herdr, git, model, clock, ui }: StewardDependencies): Steward {
-	function status(repositoryRoot: string, target: StatusTarget): StatusView {
-		const statusView = buildStatusView(runJournal.probeActive(repositoryRoot));
+export function createSteward({ runJournal, herdr, git, process, model, clock, ui }: StewardDependencies): Steward {
+	void process;
+	async function status(repositoryRoot: string, target: StatusTarget): Promise<StatusView> {
+		const loaded = await runJournal.loadActive(repositoryRoot);
+		const statusView = loaded.kind === "missing"
+			? EMPTY_STATUS
+			: loaded.kind === "invalid"
+				? {
+					kind: "present" as const,
+					markdown: `Active Steward Run state is invalid at ${loaded.paths.activePath}; status is read-only. ${loaded.diagnostics.map((item) => item.message).join(" ")}`,
+					footer: { run: "active" as const, attentionCount: 0 as const, text: "steward: active Run needs recovery" },
+				}
+				: presentStatusForJournal(loaded.journal);
 		ui.presentStatus(statusView, target);
 		return statusView;
 	}
@@ -466,14 +802,22 @@ export function createSteward({ runJournal, herdr, git, model, clock, ui }: Stew
 		}
 		if (created.kind === "active-exists") return refuse("Another active Run won the start race; no Run was overwritten.");
 		if (created.kind !== "created") return presentStart({ kind: "storage-error", message: `Run Journal could not be created at ${created.paths.activePath}; no Run was started. ${created.diagnostics.map((item) => item.message).join(" ")}` });
-		let activity: ActivityAppendResult;
+		const startWarnings: string[] = [];
 		try {
-			activity = await runJournal.appendActivity(repositoryRoot, { timestamp: validated.value.run.createdAt, runId: validated.value.run.id, event: "run-started", message: "Run Journal created; all Tasks are pending." });
+			const activity = await runJournal.appendActivity(repositoryRoot, { timestamp: validated.value.run.createdAt, runId: validated.value.run.id, event: "run-started", message: "Run Journal created; all Tasks are pending." });
+			if (activity.kind !== "appended") startWarnings.push(`non-authoritative activity logging is degraded at ${activity.path}.`);
 		} catch (error: unknown) {
-			return presentStart({ kind: "started-with-warning", journal: validated.value, message: `Run started as ${validated.value.run.id}; non-authoritative activity logging is degraded. The active-run.json Journal remains authoritative. ${error instanceof Error ? error.message : "Activity append failed."}` });
+			startWarnings.push(`non-authoritative activity logging is degraded: ${error instanceof Error ? error.message : "Activity append failed."}`);
 		}
-		if (activity.kind !== "appended") return presentStart({ kind: "started-with-warning", journal: validated.value, message: `Run started as ${validated.value.run.id}; non-authoritative activity logging is degraded at ${activity.path}. The active-run.json Journal remains authoritative.` });
-		return presentStart({ kind: "started", journal: validated.value, message: `Run ${validated.value.run.id} started. Journal: ${created.paths.activePath}. Activity log is non-authoritative; active-run.json is the Run Journal.` });
+		const dispatch = await dispatchInitialBuilder({ repositoryRoot, controllerSessionId, journal: validated.value, dependencies: { runJournal, herdr, git, process, model, clock, ui } });
+		const warnings = [...startWarnings, ...dispatch.warnings];
+		const warningText = warnings.length > 0 ? ` Warnings: ${warnings.join(" ")}` : "";
+		if (dispatch.kind === "pending") {
+			if (startWarnings.length > 0) return presentStart({ kind: "started-with-warning", journal: dispatch.journal, message: `${dispatch.message}${warningText} The active-run.json Journal remains authoritative.` });
+			return presentStart({ kind: "started-dispatch-pending", journal: dispatch.journal, message: `${dispatch.message}${warningText} The active-run.json Journal remains authoritative.` });
+		}
+		if (warnings.length > 0) return presentStart({ kind: "started-and-dispatched-with-warning", journal: dispatch.journal, message: `${dispatch.message}${warningText}` });
+		return presentStart({ kind: "started-and-dispatched", journal: dispatch.journal, message: dispatch.message });
 	}
 
 	return { status, configure, start };

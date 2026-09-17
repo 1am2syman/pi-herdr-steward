@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { type ExecResult, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
 import {
@@ -65,7 +65,10 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		probeActive: (repositoryRoot) => runStore.probeActive(repositoryRoot),
 		loadActive: runStore.loadActive,
 		createActive: runStore.createActive,
+		replaceActive: runStore.replaceActive,
 		appendActivity: runStore.appendActivity,
+		resolveAssignmentPaths: runStore.resolveAssignmentPaths,
+		createAssignment: runStore.createAssignment,
 		loadRecoveryDefaults: () => configStore.loadRecoveryDefaults(),
 		loadModelPlans: (repositoryRoot) => configStore.loadModelPlans(repositoryRoot),
 		saveRecoveryDefaults: (recovery) => configStore.saveRecoveryDefaults(recovery),
@@ -361,7 +364,55 @@ function unavailable(message: string): { kind: "unavailable"; message: string } 
 	return { kind: "unavailable", message };
 }
 
-function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerdrAdapter {
+type JsonObject = Record<string, unknown>;
+
+function objectValue(value: unknown): JsonObject | undefined {
+	return typeof value === "object" && value !== null && !Array.isArray(value) ? value as JsonObject : undefined;
+}
+
+function safeEnvelope(result: ExecResult): JsonObject | undefined {
+	if (result.code !== 0 || result.killed || result.stderr.trim().length > 0) return undefined;
+	try {
+		const parsed = JSON.parse(result.stdout) as unknown;
+		return objectValue(parsed);
+	} catch {
+		return undefined;
+	}
+}
+
+function safeErrorEnvelope(result: ExecResult): { id: string | undefined; code: string; message: string } | undefined {
+	if (result.code !== 1 || result.killed || result.stdout.trim().length > 0) return undefined;
+	try {
+		const parsed = objectValue(JSON.parse(result.stderr) as unknown);
+		const error = objectValue(parsed?.error);
+		return typeof error?.code === "string" && error.code.length > 0 && typeof error.message === "string" && error.message.trim().length > 0 && !error.code.includes("\u0000") && !error.message.includes("\u0000")
+			? { id: typeof parsed?.id === "string" ? parsed.id : undefined, code: error.code, message: error.message }
+			: undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function resultObject(envelope: JsonObject | undefined): JsonObject | undefined {
+	return objectValue(envelope?.result);
+}
+
+function safeIdentity(value: unknown): value is string {
+	return typeof value === "string" && value.length > 0 && value === value.trim() && !value.includes("\u0000");
+}
+
+function identityFields(value: JsonObject | undefined): { name: string; workspaceId: string; tabId: string; paneId: string; terminalId: string } | undefined {
+	if (!value || !safeIdentity(value.name) || !safeIdentity(value.workspace_id) || !safeIdentity(value.tab_id) || !safeIdentity(value.pane_id) || !safeIdentity(value.terminal_id)) return undefined;
+	return { name: value.name, workspaceId: value.workspace_id, tabId: value.tab_id, paneId: value.pane_id, terminalId: value.terminal_id };
+}
+
+function exactPiArgv(value: unknown, model: ModelChoice): boolean {
+	if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) return false;
+	const expected = ["--model", model.model, "--thinking", model.thinkingLevel];
+	return JSON.stringify(value) === JSON.stringify(expected) || JSON.stringify(value) === JSON.stringify(["pi", ...expected]);
+}
+
+export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerdrAdapter {
 	return {
 		async checkAvailability(repositoryRoot) {
 			if (!exec) return unavailable("The Pi command runner is unavailable.");
@@ -388,6 +439,59 @@ function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerdrAdapte
 			} catch {
 				return unavailable("Herdr returned malformed availability JSON.");
 			}
+		},
+		async createBuilderWorktree(input) {
+			if (!exec) return { kind: "failed", stage: "worktree-create", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			let result: ExecResult;
+			try {
+				result = await exec("herdr", ["worktree", "create", "--cwd", input.repositoryRoot, "--branch", input.branch, "--base", input.baseRevision, "--label", input.label, "--no-focus"], { cwd: input.repositoryRoot, timeout: 30000 });
+			} catch (error: unknown) {
+				return { kind: "failed", stage: "worktree-create", code: "runner-error", message: error instanceof Error ? error.message : "Herdr worktree create failed." };
+			}
+			const envelope = safeEnvelope(result);
+			const resultValue = resultObject(envelope);
+			const workspace = objectValue(resultValue?.workspace);
+			const tab = objectValue(resultValue?.tab);
+			const pane = objectValue(resultValue?.root_pane);
+			const worktree = objectValue(resultValue?.worktree);
+			if (resultValue?.type === "worktree_created" && workspace && tab && pane && worktree && safeIdentity(workspace.workspace_id) && safeIdentity(tab.tab_id) && safeIdentity(pane.pane_id) && safeIdentity(pane.terminal_id) && typeof worktree.branch === "string" && typeof worktree.path === "string" && typeof worktree.is_linked_worktree === "boolean" && safeIdentity(worktree.open_workspace_id) && worktree.is_linked_worktree && worktree.open_workspace_id === workspace.workspace_id && worktree.branch === input.branch && isAbsolute(worktree.path) && worktree.path === worktree.path.trim()) {
+				return { kind: "created", branch: worktree.branch, path: worktree.path, workspaceId: workspace.workspace_id, tabId: tab.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id };
+			}
+			const error = safeErrorEnvelope(result);
+			return { kind: "failed", stage: "worktree-create", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid worktree_created envelope." };
+		},
+		async startBuilder(input) {
+			if (!exec) return { kind: "failed", stage: "agent-start", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			let result: ExecResult;
+			try {
+				result = await exec("herdr", ["agent", "start", input.name, "--kind", "pi", "--pane", input.paneId, "--timeout", "30000", "--", "--model", input.model.model, "--thinking", input.model.thinkingLevel], { cwd: input.repositoryRoot, timeout: 30000 });
+			} catch (error: unknown) {
+				return { kind: "failed", stage: "agent-start", code: "runner-error", message: error instanceof Error ? error.message : "Herdr agent start failed." };
+			}
+			const collision = safeErrorEnvelope(result);
+			if (collision?.id === "cli:agent:start" && collision.code === "agent_name_taken") return { kind: "name-collision", code: "agent_name_taken", message: collision.message };
+			const envelope = safeEnvelope(result);
+			const resultValue = resultObject(envelope);
+			const agent = objectValue(resultValue?.agent);
+			const identity = identityFields(agent);
+			if (resultValue?.type === "agent_started" && identity && identity.name === input.name && identity.paneId === input.paneId && agent?.agent === "pi" && agent.agent_status === "idle" && agent.interactive_ready === true && exactPiArgv(agent.argv, input.model)) return { kind: "started", agentKind: "pi", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+			return { kind: "failed", stage: "agent-start", code: collision?.code ?? (result.killed ? "killed" : "malformed-response"), message: collision?.message ?? "Herdr returned no valid agent_started envelope." };
+		},
+		async promptBuilder(input) {
+			if (!exec) return { kind: "failed", stage: "agent-prompt", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			let result: ExecResult;
+			try {
+				result = await exec("herdr", ["agent", "prompt", input.name, input.assignmentPrompt], { cwd: input.repositoryRoot, timeout: 30000 });
+			} catch (error: unknown) {
+				return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Herdr agent prompt failed." };
+			}
+			const envelope = safeEnvelope(result);
+			const resultValue = resultObject(envelope);
+			const agent = objectValue(resultValue?.agent);
+			const identity = identityFields(agent);
+			if (resultValue?.type === "agent_prompted" && identity && identity.name === input.name) return { kind: "prompted", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+			const error = safeErrorEnvelope(result);
+			return { kind: "failed", stage: "agent-prompt", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid agent_prompted envelope." };
 		},
 	};
 }
@@ -429,6 +533,24 @@ function createGitAdapter(exec: CommandRunner | undefined): StewardGitAdapter {
 				return { kind: "ready", branch: branch.stdout.trim(), revision: head.stdout.trim() };
 			} catch (error: unknown) {
 				return unavailable(error instanceof Error ? error.message : "Git integration-base inspection failed.");
+			}
+		},
+		async branchExists(repositoryRoot, branch) {
+			const result = await run(repositoryRoot, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]);
+			if (result.code === 0 && !result.killed) return true;
+			if (result.code === 1 && !result.killed) return false;
+			throw new Error(result.stderr.trim() || "Git branch existence inspection failed.");
+		},
+		async inspectBuilderWorktree(worktreePath, expectedRevision) {
+			try {
+				const head = await exec!("git", ["rev-parse", "--verify", "HEAD"], { cwd: worktreePath, timeout: 5000 });
+				if (head.code !== 0 || head.killed || head.stdout.trim() !== expectedRevision) return { kind: "unavailable", message: "Builder worktree HEAD does not equal the selected Run base revision." };
+				const status = await exec!("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: worktreePath, timeout: 5000 });
+				if (status.code !== 0 || status.killed) return { kind: "unavailable", message: "Builder worktree clean-state inspection failed." };
+				if (status.stdout.length > 0) return { kind: "unavailable", message: "Builder worktree is not clean before dispatch." };
+				return { kind: "ready", head: expectedRevision, clean: true };
+			} catch (error: unknown) {
+				return { kind: "unavailable", message: error instanceof Error ? error.message : "Builder worktree inspection failed." };
 			}
 		},
 	};
@@ -538,7 +660,7 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 	}
 
 	function presentStartResult(result: import("./steward.ts").StartResult): void {
-		ui.notify(result.message, result.kind === "started" ? "info" : result.kind === "started-with-warning" ? "warning" : result.kind === "cancelled" ? "info" : "error");
+		ui.notify(result.message, result.kind === "started" || result.kind === "started-and-dispatched" ? "info" : result.kind === "started-with-warning" || result.kind === "started-and-dispatched-with-warning" || result.kind === "started-dispatch-pending" ? "warning" : result.kind === "cancelled" ? "info" : "error");
 	}
 
 	return {

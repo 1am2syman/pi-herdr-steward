@@ -1,0 +1,3 @@
+{"command":"get_commands","steward":[{"name":"steward","description":"Inspect, configure, or start Steward Runs.","source":"extension","sourceInfo":{"path":"/root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder/src/extension.ts","source":"cli","scope":"temporary","origin":"top-level"}}]}
+{"type":"extension_error","extensionPath":"command:steward","event":"command","error":"Steward start requires interactive TUI mode."}
+{"id":"start","type":"response","command":"prompt","success":true}

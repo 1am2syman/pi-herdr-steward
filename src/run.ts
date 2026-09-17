@@ -4,17 +4,20 @@ import { isAbsolute } from "node:path";
 import {
 	cloneModelPlans,
 	cloneRecoveryDefaults,
+	isThinkingLevel,
+	parseCanonicalModelReference,
 	validateProjectModelPlans,
 	validateRecoveryDefaults,
 	type ConfigDiagnostic,
 	type ProjectModelPlans,
+	type ModelChoice,
 	type RecoveryDefaults,
 } from "./config.ts";
 
 export const RUN_JOURNAL_SCHEMA_VERSION = 1 as const;
 
 export type RunStatus = "active";
-export type TaskPhase = "pending";
+export type TaskPhase = "pending" | "building";
 export type TaskAttention = "none";
 
 export type Verification =
@@ -35,13 +38,82 @@ export interface TaskContract {
 	reviewRequired: boolean;
 }
 
+export type DispatchRecord =
+	| { phase: "worktree-intended"; branch: string; agentName: string }
+	| {
+			phase: "agent-intended";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+		}
+	| {
+			phase: "prompt-intended";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			assignmentSha256: string;
+		}
+	| {
+			phase: "prompted";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			assignmentSha256: string;
+			promptedAt: string;
+		};
+
+export interface AttemptRecord {
+	id: string;
+	role: "builder";
+	state: "prepared" | "active";
+	preparedAt: string;
+	activatedAt?: string;
+	actualModel: ModelChoice;
+	specificationHash: string;
+	baseRevision: string;
+	assignmentPath: string;
+	reportPath: string;
+	evidenceDirectory: string;
+	dispatch: DispatchRecord;
+}
+
+export interface BuilderAssignmentDocument {
+	schemaVersion: 1;
+	assignment: {
+		runId: string;
+		taskId: string;
+		attemptId: string;
+		role: "builder";
+		requiredOutcome: string;
+		allowedScope: string[];
+		expectedArtifacts: ExpectedArtifact[];
+		reportPath: string;
+		evidenceDirectory: string;
+		verification: Verification;
+		actualModel: ModelChoice;
+		specificationHash: string;
+		baseRevision: string;
+		worktree: { path: string; branch: string };
+		herdr: { workspaceId: string; paneId: string; terminalId: string; agentName: string };
+	};
+}
+
 export interface TaskRecord {
 	specificationVersion: 1;
 	specificationHash: string;
 	contract: TaskContract;
 	phase: TaskPhase;
 	attention: TaskAttention;
-	attempts: [];
+	attempts: AttemptRecord[];
 	reworkCycles: 0;
 }
 
@@ -178,6 +250,82 @@ function pathValue(value: unknown): value is string {
 	return segments.every((segment) => segment.length > 0 && segment !== ".." && segment !== ".");
 }
 
+function absolutePathValue(value: unknown): value is string {
+	return typeof value === "string" && isAbsolute(value) && value === value.trim() && !value.includes("\u0000");
+}
+
+function modelChoiceValue(value: unknown, path: string): { value?: ModelChoice; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["model", "thinkingLevel"]) || typeof value.model !== "string" || !parseCanonicalModelReference(value.model) || !isThinkingLevel(value.thinkingLevel)) {
+		return { diagnostics: [diagnostic("invalid-task", "Model choices must contain exactly a canonical model reference and thinking level.", path)] };
+	}
+	return { value: { model: value.model, thinkingLevel: value.thinkingLevel }, diagnostics: [] };
+}
+
+function validateDispatch(value: unknown, path: string): { value?: DispatchRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Dispatch intent must be a recognized object.", path)] };
+	const common = ["phase", "branch", "agentName"];
+	const required = value.phase === "worktree-intended"
+		? common
+		: value.phase === "agent-intended"
+			? [...common, "worktreePath", "workspaceId", "paneId", "terminalId"]
+			: value.phase === "prompt-intended"
+				? [...common, "worktreePath", "workspaceId", "paneId", "terminalId", "assignmentSha256"]
+				: value.phase === "prompted"
+					? [...common, "worktreePath", "workspaceId", "paneId", "terminalId", "assignmentSha256", "promptedAt"]
+					: undefined;
+	if (!required || !exactKeys(value, required)) return { diagnostics: [diagnostic("invalid-task", "Dispatch intent has unknown or missing keys.", path)] };
+	if (!safeBranch(value.branch) || !herdrName(value.agentName)) return { diagnostics: [diagnostic("invalid-task", "Dispatch branch or agent name is unsafe.", path)] };
+	if (value.phase === "worktree-intended") return { value: { phase: value.phase, branch: value.branch, agentName: value.agentName }, diagnostics: [] };
+	if (!absolutePathValue(value.worktreePath) || !trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId)) return { diagnostics: [diagnostic("invalid-task", "Actual dispatch identities and worktree path must be non-empty.", path)] };
+	if (value.phase === "agent-intended") return { value: { phase: value.phase, branch: value.branch, agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId }, diagnostics: [] };
+	if (typeof value.assignmentSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.assignmentSha256)) return { diagnostics: [diagnostic("invalid-task", "Dispatch intent requires a lowercase Assignment byte hash.", path)] };
+	if (value.phase === "prompt-intended") return { value: { phase: value.phase, branch: value.branch, agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, assignmentSha256: value.assignmentSha256 }, diagnostics: [] };
+	if (!canonicalTimestamp(value.promptedAt)) return { diagnostics: [diagnostic("invalid-task", "Prompted dispatch requires a canonical timestamp.", `${path}.promptedAt`)] };
+	return { value: { phase: "prompted", branch: value.branch, agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, assignmentSha256: value.assignmentSha256, promptedAt: value.promptedAt }, diagnostics: [] };
+}
+
+function validateAttempt(value: unknown, path: string, task: TaskContract, base: IntegrationBase): { value?: AttemptRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value)) return { diagnostics: [diagnostic("invalid-task", "Attempt must be an object.", path)] };
+	const keys = Object.prototype.hasOwnProperty.call(value, "activatedAt")
+		? ["id", "role", "state", "preparedAt", "activatedAt", "actualModel", "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch"]
+		: ["id", "role", "state", "preparedAt", "actualModel", "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch"];
+	if (!exactKeys(value, keys) || !safeIdentifier(value.id) || value.role !== "builder" || (value.state !== "prepared" && value.state !== "active") || !canonicalTimestamp(value.preparedAt) || (value.state === "active" && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && Object.prototype.hasOwnProperty.call(value, "activatedAt"))) {
+		return { diagnostics: [diagnostic("invalid-task", "Attempt has invalid lifecycle fields.", path)] };
+	}
+	const model = modelChoiceValue(value.actualModel, `${path}.actualModel`);
+	const dispatch = validateDispatch(value.dispatch, `${path}.dispatch`);
+	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics];
+	if (typeof value.specificationHash !== "string" || value.specificationHash !== specificationHash(task)) diagnostics.push(diagnostic("invalid-task", "Attempt specificationHash must match its Task contract.", `${path}.specificationHash`));
+	if (typeof value.baseRevision !== "string" || base.kind !== "git" || value.baseRevision !== base.revision) diagnostics.push(diagnostic("invalid-task", "Attempt baseRevision must match the Run integration base.", `${path}.baseRevision`));
+	if (!absolutePathValue(value.assignmentPath) || !absolutePathValue(value.reportPath) || !absolutePathValue(value.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Attempt evidence paths must be absolute and safe.", path));
+	if (dispatch.value) {
+		if (value.state === "active" && (dispatch.value.phase !== "prompted" || value.activatedAt !== dispatch.value.promptedAt)) diagnostics.push(diagnostic("invalid-task", "Active Attempts require a prompted dispatch and matching activation timestamp.", path));
+		if (value.state === "prepared" && dispatch.value.phase === "prompted") diagnostics.push(diagnostic("invalid-task", "Prepared Attempts cannot have a prompted dispatch.", path));
+	}
+	if (diagnostics.length > 0 || !model.value || !dispatch.value || typeof value.id !== "string" || typeof value.preparedAt !== "string" || typeof value.specificationHash !== "string" || typeof value.baseRevision !== "string" || typeof value.assignmentPath !== "string" || typeof value.reportPath !== "string" || typeof value.evidenceDirectory !== "string") return { diagnostics };
+	return {
+		value: {
+			id: value.id,
+			role: "builder",
+			state: value.state,
+			preparedAt: value.preparedAt,
+			...(value.state === "active" ? { activatedAt: value.activatedAt as string } : {}),
+			actualModel: model.value,
+			specificationHash: value.specificationHash,
+			baseRevision: value.baseRevision,
+			assignmentPath: value.assignmentPath,
+			reportPath: value.reportPath,
+			evidenceDirectory: value.evidenceDirectory,
+			dispatch: dispatch.value,
+		},
+		diagnostics: [],
+	};
+}
+
+function herdrName(value: unknown): value is string {
+	return typeof value === "string" && /^[a-z][a-z0-9_-]{0,31}$/.test(value);
+}
+
 function cloneArtifact(artifact: ExpectedArtifact): ExpectedArtifact {
 	return artifact.kind === "git-commit"
 		? { kind: "git-commit" }
@@ -204,6 +352,18 @@ function cloneContract(contract: TaskContract): TaskContract {
 		expectedArtifacts: contract.expectedArtifacts.map(cloneArtifact),
 		verification: cloneVerification(contract.verification),
 		reviewRequired: contract.reviewRequired,
+	};
+}
+
+function cloneDispatch(dispatch: DispatchRecord): DispatchRecord {
+	return { ...dispatch };
+}
+
+function cloneAttempt(attempt: AttemptRecord): AttemptRecord {
+	return {
+		...attempt,
+		actualModel: { ...attempt.actualModel },
+		dispatch: cloneDispatch(attempt.dispatch),
 	};
 }
 
@@ -356,11 +516,22 @@ function validateRunRecord(value: unknown, path: string): { value?: RunRecord; d
 		const taskDiagnostics = [...contractResult.diagnostics];
 		if (task.specificationVersion !== 1) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationVersion must be 1.", `${taskPath}.specificationVersion`));
 		if (typeof task.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(task.specificationHash) || (contractResult.value && specificationHash(contractResult.value) !== task.specificationHash)) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationHash does not match its exact contract.", `${taskPath}.specificationHash`));
-		if (task.phase !== "pending" || task.attention !== "none" || !Array.isArray(task.attempts) || task.attempts.length !== 0 || task.reworkCycles !== 0) taskDiagnostics.push(diagnostic("invalid-task", "New Tasks must be pending with no attention, attempts, or rework cycles.", taskPath));
+		if ((task.phase !== "pending" && task.phase !== "building") || task.attention !== "none" || !Array.isArray(task.attempts) || task.reworkCycles !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Tasks must be pending or building with no attention or rework cycles.", taskPath));
+		const attempts: AttemptRecord[] = [];
+		if (Array.isArray(task.attempts)) {
+			if (task.attempts.length > 1) taskDiagnostics.push(diagnostic("invalid-task", "This schema allows at most one Builder Attempt per Task.", `${taskPath}.attempts`));
+			for (let attemptIndex = 0; attemptIndex < task.attempts.length; attemptIndex += 1) {
+				const attemptResult = contractResult.value && base.value ? validateAttempt(task.attempts[attemptIndex], `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value) : { diagnostics: [diagnostic("invalid-task", "Attempt cannot be validated without a valid Task and integration base.", `${taskPath}.attempts[${attemptIndex}]`)] };
+				if (attemptResult.value) attempts.push(attemptResult.value);
+				taskDiagnostics.push(...attemptResult.diagnostics);
+			}
+		}
+		if (task.phase === "pending" && attempts.length !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Pending Tasks must not have Attempts.", taskPath));
+		if (task.phase === "building" && (attempts.length !== 1 || attempts[0]?.role !== "builder")) taskDiagnostics.push(diagnostic("invalid-task", "Building Tasks require exactly one Builder Attempt.", taskPath));
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
 		if (contractResult.value) taskIds.add(contractResult.value.id);
 		if (taskDiagnostics.length > 0 || !contractResult.value || typeof task.specificationHash !== "string") diagnostics.push(...taskDiagnostics);
-		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: "pending", attention: "none", attempts: [], reworkCycles: 0 });
+		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase === "building" ? "building" : "pending", attention: "none", attempts, reworkCycles: 0 });
 	}
 	const plans = validateProjectModelPlans(value.modelPlan, `${path}.modelPlan`);
 	if (!plans.value || plans.diagnostics.length > 0) diagnostics.push(...plans.diagnostics.map((item: ConfigDiagnostic) => diagnostic("invalid-config", item.message, item.path)));
@@ -415,6 +586,159 @@ export function deserializeRunJournal(content: string, path?: string): { value?:
 	} catch {
 		return { diagnostics: [diagnostic("invalid-run", "Run Journal contains malformed JSON.", path)] };
 	}
+}
+
+function validateAssignment(value: unknown, path = "assignment.json"): { value?: BuilderAssignmentDocument; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["schemaVersion", "assignment"]) || value.schemaVersion !== 1 || !isRecord(value.assignment)) return { diagnostics: [diagnostic("invalid-task", "Assignment must contain exactly schemaVersion 1 and assignment.", path)] };
+	const assignment = value.assignment;
+	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "allowedScope", "expectedArtifacts", "reportPath", "evidenceDirectory", "verification", "actualModel", "specificationHash", "baseRevision", "worktree", "herdr"];
+	if (!exactKeys(assignment, keys)) return { diagnostics: [diagnostic("invalid-task", "Assignment contains unknown or missing keys.", path)] };
+	const diagnostics: RunDiagnostic[] = [];
+	if (!safeIdentifier(assignment.runId) || !assignment.runId.startsWith("run-")) diagnostics.push(diagnostic("invalid-task", "Assignment runId is unsafe.", `${path}.assignment.runId`));
+	if (!safeIdentifier(assignment.taskId) || !safeIdentifier(assignment.attemptId) || assignment.role !== "builder") diagnostics.push(diagnostic("invalid-task", "Assignment identity or role is invalid.", `${path}.assignment`));
+	if (!trimmedString(assignment.requiredOutcome) || !Array.isArray(assignment.allowedScope) || assignment.allowedScope.length === 0 || assignment.allowedScope.some((item) => !pathValue(item))) diagnostics.push(diagnostic("invalid-task", "Assignment scope and required outcome are invalid.", `${path}.assignment`));
+	const artifacts = validateExpectedArtifacts(assignment.expectedArtifacts, `${path}.assignment.expectedArtifacts`);
+	diagnostics.push(...artifacts.diagnostics);
+	const codeChanging = artifacts.value?.some((artifact) => artifact.kind === "git-commit") ?? false;
+	const verification = validateVerification(assignment.verification, `${path}.assignment.verification`, codeChanging);
+	diagnostics.push(...verification.diagnostics);
+	const model = modelChoiceValue(assignment.actualModel, `${path}.assignment.actualModel`);
+	diagnostics.push(...model.diagnostics);
+	if (!absolutePathValue(assignment.reportPath) || !absolutePathValue(assignment.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Assignment report paths must be absolute.", `${path}.assignment`));
+	if (typeof assignment.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(assignment.specificationHash) || typeof assignment.baseRevision !== "string" || !/^[0-9a-f]{40}$/.test(assignment.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Assignment hashes and baseRevision are invalid.", `${path}.assignment`));
+	const worktree = assignment.worktree;
+	if (!isRecord(worktree) || !exactKeys(worktree, ["path", "branch"]) || !absolutePathValue(worktree.path) || !safeBranch(worktree.branch)) diagnostics.push(diagnostic("invalid-task", "Assignment worktree is invalid.", `${path}.assignment.worktree`));
+	const herdr = assignment.herdr;
+	if (!isRecord(herdr) || !exactKeys(herdr, ["workspaceId", "paneId", "terminalId", "agentName"]) || !trimmedString(herdr.workspaceId) || !trimmedString(herdr.paneId) || !trimmedString(herdr.terminalId) || !herdrName(herdr.agentName)) diagnostics.push(diagnostic("invalid-task", "Assignment Herdr identities are invalid.", `${path}.assignment.herdr`));
+	if (diagnostics.length > 0 || !artifacts.value || !verification.value || !model.value || typeof assignment.runId !== "string" || typeof assignment.taskId !== "string" || typeof assignment.attemptId !== "string" || typeof assignment.requiredOutcome !== "string" || !Array.isArray(assignment.allowedScope) || typeof assignment.reportPath !== "string" || typeof assignment.evidenceDirectory !== "string" || typeof assignment.specificationHash !== "string" || typeof assignment.baseRevision !== "string" || !isRecord(worktree) || typeof worktree.path !== "string" || typeof worktree.branch !== "string" || !isRecord(herdr) || typeof herdr.workspaceId !== "string" || typeof herdr.paneId !== "string" || typeof herdr.terminalId !== "string" || typeof herdr.agentName !== "string") return { diagnostics };
+	return {
+		value: {
+			schemaVersion: 1,
+			assignment: {
+				runId: assignment.runId,
+				taskId: assignment.taskId,
+				attemptId: assignment.attemptId,
+				role: "builder",
+				requiredOutcome: assignment.requiredOutcome,
+				allowedScope: [...assignment.allowedScope] as string[],
+				expectedArtifacts: artifacts.value,
+				reportPath: assignment.reportPath,
+				evidenceDirectory: assignment.evidenceDirectory,
+				verification: verification.value,
+				actualModel: model.value,
+				specificationHash: assignment.specificationHash,
+				baseRevision: assignment.baseRevision,
+				worktree: { path: worktree.path, branch: worktree.branch },
+				herdr: { workspaceId: herdr.workspaceId, paneId: herdr.paneId, terminalId: herdr.terminalId, agentName: herdr.agentName },
+			},
+		},
+		diagnostics: [],
+	};
+}
+
+export function decodeBuilderAssignment(value: unknown, path?: string): { value?: BuilderAssignmentDocument; diagnostics: RunDiagnostic[] } {
+	return validateAssignment(value, path);
+}
+
+export function serializeBuilderAssignment(document: BuilderAssignmentDocument): string {
+	const validated = validateAssignment(document).value;
+	if (!validated) throw new Error("Cannot serialize an invalid Builder Assignment.");
+	return `${JSON.stringify(validated, null, 2)}\n`;
+}
+
+export function deserializeBuilderAssignment(content: string, path?: string): { value?: BuilderAssignmentDocument; diagnostics: RunDiagnostic[] } {
+	try {
+		return validateAssignment(JSON.parse(content) as unknown, path);
+	} catch {
+		return { diagnostics: [diagnostic("invalid-task", "Assignment contains malformed JSON.", path)] };
+	}
+}
+
+export function builderAssignmentSha256(content: string): string {
+	return `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`;
+}
+
+export function buildBuilderAssignment(input: {
+	run: RunRecord;
+	task: TaskRecord;
+	attempt: AttemptRecord;
+	worktreePath: string;
+	branch: string;
+	workspaceId: string;
+	paneId: string;
+	terminalId: string;
+	agentName: string;
+}): BuilderAssignmentDocument {
+	if (input.run.integrationBase.kind !== "git" || input.task.phase !== "building" || input.attempt.state !== "prepared") throw new Error("Builder Assignment requires a prepared building Task with a Git base.");
+	if (input.attempt.dispatch.phase !== "agent-intended" && input.attempt.dispatch.phase !== "prompt-intended" && input.attempt.dispatch.phase !== "prompted") throw new Error("Builder Assignment requires actual Builder resources.");
+	if (input.task.specificationHash !== specificationHash(input.task.contract) || input.attempt.specificationHash !== input.task.specificationHash) throw new Error("Builder Assignment requires the exact approved Task specification hash.");
+	const document: BuilderAssignmentDocument = {
+		schemaVersion: 1,
+		assignment: {
+			runId: input.run.id,
+			taskId: input.task.contract.id,
+			attemptId: input.attempt.id,
+			role: "builder",
+			requiredOutcome: input.task.contract.requiredOutcome,
+			allowedScope: [...input.task.contract.allowedScope],
+			expectedArtifacts: input.task.contract.expectedArtifacts.map(cloneArtifact),
+			reportPath: input.attempt.reportPath,
+			evidenceDirectory: input.attempt.evidenceDirectory,
+			verification: cloneVerification(input.task.contract.verification),
+			actualModel: { ...input.attempt.actualModel },
+			specificationHash: input.task.specificationHash,
+			baseRevision: input.attempt.baseRevision,
+			worktree: { path: input.worktreePath, branch: input.attempt.dispatch.branch },
+			herdr: { workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, agentName: input.agentName },
+		},
+	};
+	const validated = validateAssignment(document);
+	if (!validated.value || validated.diagnostics.length > 0) throw new Error(`Cannot build Builder Assignment: ${validated.diagnostics.map((item) => item.message).join("; ")}`);
+	return validated.value;
+}
+
+export function formatBuilderPrompt(document: BuilderAssignmentDocument): string {
+	const assignment = document.assignment;
+	return [
+		`Steward Builder Assignment ${assignment.runId}/${assignment.taskId}/${assignment.attemptId}`,
+		"",
+		"The following Assignment is authoritative and bounded:",
+		serializeBuilderAssignment(document).trimEnd(),
+		"",
+		`Modify only these worktree-relative paths: ${assignment.allowedScope.join(", ")}.`,
+		"Produce every expected Artifact, run the stated verification, and write the Attempt Report to the absolute reportPath.",
+		"Terminal or Herdr state is not completion; the Attempt Report is required.",
+		"Do not modify unrelated paths or dispatch another agent.",
+	].join("\n");
+}
+
+export function cloneRunJournal(journal: RunJournal): RunJournal {
+	return {
+		schemaVersion: 1,
+		journalRevision: journal.journalRevision,
+		run: {
+			...journal.run,
+			integrationBase: journal.run.integrationBase.kind === "git" ? { ...journal.run.integrationBase } : { kind: "none" },
+			tasks: journal.run.tasks.map((task) => ({ ...task, contract: cloneContract(task.contract), attempts: task.attempts.map(cloneAttempt) })),
+			modelPlan: cloneModelPlans(journal.run.modelPlan),
+			effectiveSettings: cloneRecoveryDefaults(journal.run.effectiveSettings),
+			finalVerification: cloneVerification(journal.run.finalVerification),
+		},
+	};
+}
+
+export function advanceRunJournal(journal: RunJournal, now: Date, update: (candidate: RunJournal) => void): RunJournal {
+	const candidate = cloneRunJournal(journal);
+	update(candidate);
+	const requested = now.getTime();
+	const previous = new Date(journal.run.updatedAt).getTime();
+	const next = Math.max(requested, previous + 1);
+	if (!Number.isFinite(next)) throw new Error("Run Journal timestamp cannot advance.");
+	candidate.journalRevision += 1;
+	candidate.run.updatedAt = new Date(next).toISOString();
+	const validation = validateRunJournal(candidate);
+	if (!validation.value || validation.diagnostics.length > 0) throw new Error(`Cannot advance invalid Run Journal: ${validation.diagnostics.map((item) => item.message).join("; ")}`);
+	return validation.value;
 }
 
 export function serializeRunJournal(journal: RunJournal): string {

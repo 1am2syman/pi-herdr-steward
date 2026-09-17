@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test:storage
+> vitest run test/run-journal.storage.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+
+ Test Files  1 passed (1)
+      Tests  6 passed (6)
+   Start at  21:41:18
+   Duration  3.90s (transform 202ms, setup 0ms, import 1.63s, tests 2.04s, environment 0ms)

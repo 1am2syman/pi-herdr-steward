@@ -1,0 +1,48 @@
+ package.json                     |   4 +-
+ src/adapters.ts                  | 122 +++++++++++-
+ src/extension.ts                 |  12 +-
+ src/run-journal-store.ts         |  15 +-
+ src/run.ts                       | 331 ++++++++++++++++++++++++++++++++-
+ src/steward.ts                   | 390 ++++++++++++++++++++++++++++++++++++---
+ test/run-journal.storage.test.ts |  40 ++++
+ 7 files changed, 877 insertions(+), 37 deletions(-)
+## steward/t04-dispatch-builder
+ M package.json
+ M src/adapters.ts
+ M src/extension.ts
+ M src/run-journal-store.ts
+ M src/run.ts
+ M src/steward.ts
+ M test/run-journal.storage.test.ts
+?? logs/04-final-diff-check.log
+?? logs/04-final-npm-ci.log
+?? logs/04-final-npm-test.log
+?? logs/04-final-scope-status.log
+?? logs/04-final-test-config-retry.log
+?? logs/04-final-test-config.log
+?? logs/04-final-test-dispatch.log
+?? logs/04-final-test-herdr.log
+?? logs/04-final-test-start.log
+?? logs/04-final-test-storage.log
+?? logs/04-final-typecheck.log
+?? logs/04-herdr-agent-help.log
+?? logs/04-herdr-status.log
+?? logs/04-herdr-version.log
+?? logs/04-herdr-worktree-help.log
+?? logs/04-host-import.log
+?? logs/04-npm-ci.log
+?? logs/04-npm-test-retry.log
+?? logs/04-npm-test-retry2.log
+?? logs/04-npm-test.log
+?? logs/04-rpc-host.log
+?? logs/04-test-config.log
+?? logs/04-test-dispatch.log
+?? logs/04-test-herdr.log
+?? logs/04-test-start-retry.log
+?? logs/04-test-start.log
+?? logs/04-test-storage.log
+?? logs/04-typecheck.log
+?? plans/04-dispatch-one-builder-durably.md
+?? src/assignment-store.ts
+?? test/dispatch.functional.test.ts
+?? test/herdr-adapter.contract.test.ts

@@ -1,0 +1,44 @@
+
+> pi-herdr-steward@0.1.0 test:config
+> vitest run test/config.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+ ❯ test/config.functional.test.ts (4 tests | 2 failed) 30031ms
+   × registered /steward config saves and reloads exact defaults 15012ms
+   × configuration cancellation is a filesystem no-op 15009ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/config.functional.test.ts > registered /steward config saves and reloads exact defaults
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/config.functional.test.ts:245:4
+    243| const CONFIG_FILESYSTEM_TEST_TIMEOUT_MS = 15_000;
+    244|
+    245| it.sequential("registered /steward config saves and reloads exact defa…
+       |    ^
+    246|  const { repositoryRoot, userRoot } = await makeRoots();
+    247|  const builderPrimary = fakeModel("builder", "provider-primary");
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  test/config.functional.test.ts > configuration cancellation is a filesystem no-op
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/config.functional.test.ts:300:4
+    298| }, CONFIG_FILESYSTEM_TEST_TIMEOUT_MS);
+    299|
+    300| it.sequential("configuration cancellation is a filesystem no-op", asyn…
+       |    ^
+    301|  const empty = await makeRoots();
+    302|  const results: ConfigureResult[] = [];
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 2 passed (4)
+   Start at  21:20:32
+   Duration  33.01s (transform 265ms, setup 0ms, import 1.89s, tests 30.03s, environment 0ms)

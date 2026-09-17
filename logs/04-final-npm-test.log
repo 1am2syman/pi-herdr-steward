@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test
+> vitest run --maxWorkers=1
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+
+ Test Files  6 passed (6)
+      Tests  28 passed (28)
+   Start at  21:21:19
+   Duration  14.23s (transform 379ms, setup 0ms, import 9.17s, tests 3.64s, environment 1ms)

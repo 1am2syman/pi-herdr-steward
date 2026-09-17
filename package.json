@@ -26,9 +26,11 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:dispatch": "vitest run test/dispatch.functional.test.ts",
+    "test:herdr": "vitest run test/herdr-adapter.contract.test.ts",
     "test:start": "vitest run test/start.functional.test.ts",
     "test:storage": "vitest run test/run-journal.storage.test.ts",
     "test:config": "vitest run test/config.functional.test.ts",
-    "test": "vitest run"
+    "test": "vitest run --maxWorkers=1"
   }
 }

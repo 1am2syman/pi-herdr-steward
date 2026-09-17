@@ -1,0 +1,48 @@
+
+> pi-herdr-steward@0.1.0 typecheck
+> tsc --noEmit -p tsconfig.json
+
+
+> pi-herdr-steward@0.1.0 test:dispatch
+> vitest run test/dispatch.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+ ❯ test/dispatch.functional.test.ts (5 tests | 2 failed) 36599ms
+   × dispatch failures preserve the last durable phase and never overstate success 15021ms
+   × registered status projects the validated journal without live-state access 15009ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 2 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/dispatch.functional.test.ts > dispatch failures preserve the last durable phase and never overstate success
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:208:4
+    206| });
+    207|
+    208| it.sequential("dispatch failures preserve the last durable phase and n…
+       |    ^
+    209|  const cases = [
+    210|   { name: "worktree", phase: "worktree-intended" as const, configure(d…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/2]⎯
+
+ FAIL  test/dispatch.functional.test.ts > registered status projects the validated journal without live-state access
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:272:4
+    270| });
+    271|
+    272| it.sequential("registered status projects the validated journal withou…
+       |    ^
+    273|  const root = await makeRoot();
+    274|  const observed: { value?: import("../src/steward.ts").StartResult; st…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/2]⎯
+
+
+ Test Files  1 failed (1)
+      Tests  2 failed | 3 passed (5)
+   Start at  21:34:27
+   Duration  38.77s (transform 279ms, setup 0ms, import 1.73s, tests 36.60s, environment 0ms)

@@ -1,0 +1,272 @@
+
+> pi-herdr-steward@0.1.0 test
+> vitest run
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder
+
+ ❯ test/config.functional.test.ts (4 tests | 2 failed) 30029ms
+   × registered /steward config saves and reloads exact defaults 15013ms
+   × configuration cancellation is a filesystem no-op 15007ms
+ ❯ test/run-journal.storage.test.ts (6 tests | 6 failed) 38455ms
+   × creates an exact protected journal and reloads it 5336ms
+   × two initial creates race without clobbering either complete input 5007ms
+   × replacement preserves the immediate previous valid snapshot 7677ms
+   × rejects malformed and invalid candidates without changing snapshots 10423ms
+   × atomic reads observe only complete old or new snapshots 5005ms
+   × Assignment creation is deterministic, protected, no-clobber, and byte-identity reusable 5005ms
+[vitest-pool]: Timeout terminating forks worker for test files /root/.herdr/worktrees/pi-herdr-steward/steward-t04-dispatch-builder/test/run-journal.storage.test.ts.
+ ❯ test/start.functional.test.ts (10 tests | 6 failed) 50050ms
+   × registered /steward start confirms and persists one frozen pending Run 15010ms
+   × start cancellation during drafting and final confirmation is a filesystem no-op 15006ms
+   × an existing active Run refuses before Herdr/model/UI work 5004ms
+   × activity logging failure leaves the authoritative journal and reports degraded logging 5004ms
+   × post-confirmation active, Herdr, model, and Git changes refuse without persistence 5009ms
+   × exclusive creation race refuses without overwriting the competing Run or appending activity 5003ms
+ ❯ test/dispatch.functional.test.ts (4 tests | 4 failed) 60038ms
+   × registered start persists each durable phase before the next Builder effect 15012ms
+   × retrying start refuses the active Run and reuses one Assignment 15008ms
+   × name collision changes only the intended name inside attempt-01 15010ms
+   × registered status projects the validated journal without live-state access 15005ms
+
+⎯⎯⎯⎯⎯⎯ Failed Tests 18 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/config.functional.test.ts > registered /steward config saves and reloads exact defaults
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/config.functional.test.ts:245:4
+    243| const CONFIG_FILESYSTEM_TEST_TIMEOUT_MS = 15_000;
+    244|
+    245| it.sequential("registered /steward config saves and reloads exact defa…
+       |    ^
+    246|  const { repositoryRoot, userRoot } = await makeRoots();
+    247|  const builderPrimary = fakeModel("builder", "provider-primary");
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/18]⎯
+
+ FAIL  test/config.functional.test.ts > configuration cancellation is a filesystem no-op
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/config.functional.test.ts:300:4
+    298| }, CONFIG_FILESYSTEM_TEST_TIMEOUT_MS);
+    299|
+    300| it.sequential("configuration cancellation is a filesystem no-op", asyn…
+       |    ^
+    301|  const empty = await makeRoots();
+    302|  const results: ConfigureResult[] = [];
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/18]⎯
+
+ FAIL  test/dispatch.functional.test.ts > registered start persists each durable phase before the next Builder effect
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:132:4
+    130| }
+    131|
+    132| it.sequential("registered start persists each durable phase before the…
+       |    ^
+    133|  const root = await makeRoot();
+    134|  const observed: { value?: import("../src/steward.ts").StartResult } =…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/18]⎯
+
+ FAIL  test/dispatch.functional.test.ts > retrying start refuses the active Run and reuses one Assignment
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:167:4
+    165| });
+    166|
+    167| it.sequential("retrying start refuses the active Run and reuses one As…
+       |    ^
+    168|  const root = await makeRoot();
+    169|  const first: { value?: import("../src/steward.ts").StartResult } = {};
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/18]⎯
+
+ FAIL  test/dispatch.functional.test.ts > name collision changes only the intended name inside attempt-01
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:190:4
+    188| });
+    189|
+    190| it.sequential("name collision changes only the intended name inside at…
+       |    ^
+    191|  const root = await makeRoot();
+    192|  const observed: { value?: import("../src/steward.ts").StartResult } =…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[5/18]⎯
+
+ FAIL  test/dispatch.functional.test.ts > registered status projects the validated journal without live-state access
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/dispatch.functional.test.ts:208:4
+    206| });
+    207|
+    208| it.sequential("registered status projects the validated journal withou…
+       |    ^
+    209|  const root = await makeRoot();
+    210|  const observed: { value?: import("../src/steward.ts").StartResult; st…
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[6/18]⎯
+
+ FAIL  test/run-journal.storage.test.ts > creates an exact protected journal and reloads it
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:61:4
+     59| }
+     60|
+     61| it.sequential("creates an exact protected journal and reloads it", asy…
+       |    ^
+     62|  const root = await makeRoot();
+     63|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[7/18]⎯
+
+ FAIL  test/run-journal.storage.test.ts > two initial creates race without clobbering either complete input
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:78:4
+     76| });
+     77|
+     78| it.sequential("two initial creates race without clobbering either comp…
+       |    ^
+     79|  const root = await makeRoot();
+     80|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[8/18]⎯
+
+ FAIL  test/run-journal.storage.test.ts > replacement preserves the immediate previous valid snapshot
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:93:4
+     91| });
+     92|
+     93| it.sequential("replacement preserves the immediate previous valid snap…
+       |    ^
+     94|  const root = await makeRoot();
+     95|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[9/18]⎯
+
+ FAIL  test/run-journal.storage.test.ts > rejects malformed and invalid candidates without changing snapshots
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:111:4
+    109| });
+    110|
+    111| it.sequential("rejects malformed and invalid candidates without changi…
+       |    ^
+    112|  const root = await makeRoot();
+    113|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[10/18]⎯
+
+ FAIL  test/run-journal.storage.test.ts > atomic reads observe only complete old or new snapshots
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:135:4
+    133| });
+    134|
+    135| it.sequential("atomic reads observe only complete old or new snapshots…
+       |    ^
+    136|  const root = await makeRoot();
+    137|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[11/18]⎯
+
+ FAIL  test/run-journal.storage.test.ts > Assignment creation is deterministic, protected, no-clobber, and byte-identity reusable
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/run-journal.storage.test.ts:157:4
+    155| });
+    156|
+    157| it.sequential("Assignment creation is deterministic, protected, no-clo…
+       |    ^
+    158|  const root = await makeRoot();
+    159|  const store = createRunJournalStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[12/18]⎯
+
+ FAIL  test/start.functional.test.ts > registered /steward start confirms and persists one frozen pending Run
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:111:4
+    109| }
+    110|
+    111| it.sequential("registered /steward start confirms and persists one fro…
+       |    ^
+    112|  const root = await makeRoot();
+    113|  const config = createConfigStore();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[13/18]⎯
+
+ FAIL  test/start.functional.test.ts > start cancellation during drafting and final confirmation is a filesystem no-op
+Error: Test timed out in 15000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:160:4
+    158| }, START_FILESYSTEM_TEST_TIMEOUT_MS);
+    159|
+    160| it.sequential("start cancellation during drafting and final confirmati…
+       |    ^
+    161|  const root = await makeRoot();
+    162|  let capture: { handler?: StewardCommandHandler } = {};
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[14/18]⎯
+
+ FAIL  test/start.functional.test.ts > an existing active Run refuses before Herdr/model/UI work
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:199:4
+    197| });
+    198|
+    199| it.sequential("an existing active Run refuses before Herdr/model/UI wo…
+       |    ^
+    200|  const root = await makeRoot();
+    201|  const store = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[15/18]⎯
+
+ FAIL  test/start.functional.test.ts > activity logging failure leaves the authoritative journal and reports degraded logging
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:297:4
+    295| });
+    296|
+    297| it.sequential("activity logging failure leaves the authoritative journ…
+       |    ^
+    298|  const root = await makeRoot();
+    299|  const production = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[16/18]⎯
+
+ FAIL  test/start.functional.test.ts > post-confirmation active, Herdr, model, and Git changes refuse without persistence
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:316:4
+    314| });
+    315|
+    316| it.sequential("post-confirmation active, Herdr, model, and Git changes…
+       |    ^
+    317|  const cases = ["active", "herdr", "model", "git"] as const;
+    318|  for (const change of cases) {
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[17/18]⎯
+
+ FAIL  test/start.functional.test.ts > exclusive creation race refuses without overwriting the competing Run or appending activity
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/start.functional.test.ts:380:4
+    378| });
+    379|
+    380| it.sequential("exclusive creation race refuses without overwriting the…
+       |    ^
+    381|  const root = await makeRoot();
+    382|  const production = createRunJournalAdapter();
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[18/18]⎯
+
+
+ Test Files  4 failed | 2 passed (6)
+      Tests  18 failed | 10 passed (28)
+   Start at  21:09:55
+   Duration  62.45s (transform 1.11s, setup 0ms, import 11.74s, tests 178.64s, environment 1ms)
