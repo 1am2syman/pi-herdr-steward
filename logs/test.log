@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test
+> vitest run test/status.empty-run.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/t01
+
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  14:35:32
+   Duration  1.83s (transform 93ms, setup 0ms, import 1.54s, tests 41ms, environment 0ms)
