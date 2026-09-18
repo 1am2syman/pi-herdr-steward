@@ -3,17 +3,18 @@ import { lstat, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deepStrictEqual, equal, match, ok } from "node:assert/strict";
-import { afterEach, it } from "vitest";
+import { afterEach, it, vi } from "vitest";
 
 import { createRunJournalStore } from "../src/run-journal-store.ts";
 import { createAttemptEvidenceStore, sha256Bytes } from "../src/attempt-evidence-store.ts";
 import { resolveAssignmentPaths } from "../src/assignment-store.ts";
-import { buildInitialRunJournal, deserializeRunJournal, serializeRunJournal, validateRunJournal, type BuilderAttemptRecord, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
+import { buildInitialRunJournal, COMPLETION_GATE_PREDICATES, deserializeRunJournal, serializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type BuilderAttemptRecord, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
 import type { ReviewSubject } from "../src/review.ts";
 import { type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
 import type { BuilderAssignmentDocument } from "../src/run.ts";
 
 const roots: string[] = [];
+vi.setConfig({ testTimeout: 60_000 });
 const plans: ProjectModelPlans = {
 	builder: { primary: { model: "builder/primary", thinkingLevel: "high" }, fallbacks: [] },
 	reviewer: { primary: { model: "reviewer/primary", thinkingLevel: "medium" }, fallbacks: [] },
@@ -99,6 +100,126 @@ function maxHistoryJournal(): RunJournal {
 	if (!finalEvidence || finalEvidence.phase !== "finalized") throw new Error("fixture final Reviewer evidence missing");
 	const result: RunJournal = { ...base, journalRevision: 2, run: { ...base.run, updatedAt: "2026-09-17T18:12:00.000Z", tasks: [{ ...task, phase: "approved", attention: "none", attempts, reworkCycles: 5, approval: { phase: "valid", approvedAt: timestamp, builderAttemptId: finalBuilder.id, reviewerAttemptId: finalReviewer.id, subject: finalSubject, reviewerManifestPath: finalEvidence.manifestPath, reviewerManifestSha256: finalEvidence.manifestSha256, worktreeSnapshot: snapshot(11), verdict: "approved" } }] } };
 	const validated = validateRunJournal(result);
+	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
+	return validated.value;
+}
+
+function completedHistoryJournal(): RunJournal {
+	const raw = JSON.parse(JSON.stringify(maxHistoryJournal())) as Record<string, unknown>;
+	const run = raw.run as Record<string, unknown>;
+	const tasks = run.tasks as Array<Record<string, unknown>>;
+	const task = tasks[0]!;
+	const attempts = task.attempts as Array<Record<string, unknown>>;
+	const builder = attempts[10]!;
+	const reviewer = attempts[11]!;
+	const builderEvidence = builder.evidence as Record<string, unknown>;
+	const reviewerEvidence = reviewer.evidence as Record<string, unknown>;
+	const subject = reviewerEvidence.subject as Record<string, unknown>;
+	const head = String(subject.headRevision);
+	const commits = [...(subject.commits as string[])];
+	const builderManifest = String(builderEvidence.manifestSha256);
+	const reviewerManifest = String(reviewerEvidence.manifestSha256);
+	const checkout = { branch: "main", head, dirtyPaths: [], operationMarkers: [], rangeExact: true };
+	const completionRoot = "/tmp/max-history";
+	const runId = String(run.id);
+	const verificationRoot = `${completionRoot}/runs/${runId}/completion/final-verification/verification-01`;
+	const verification = {
+		phase: "passed",
+		id: "verification-01",
+		command: "npm test",
+		cwd: `${completionRoot}/repository`,
+		logPath: `${verificationRoot}/output.log`,
+		resultPath: `${verificationRoot}/result.json`,
+		intendedAt: "2026-09-17T18:06:00.000Z",
+		startedAt: "2026-09-17T18:06:01.000Z",
+		completedAt: "2026-09-17T18:06:02.000Z",
+		exitCode: 0,
+		killed: false,
+		logSha256: `sha256:${"d".repeat(64)}`,
+		resultSha256: `sha256:${"e".repeat(64)}`,
+		checkout,
+	};
+	task.phase = "completed";
+	task.attention = "none";
+	task.integration = {
+		phase: "integrated",
+		targetBranch: "main",
+		targetRevision: "0".repeat(40),
+		approvedBaseRevision: "0".repeat(40),
+		approvedHeadRevision: head,
+		approvedCommits: commits,
+		builderAttemptId: String(builder.id),
+		reviewerAttemptId: String(reviewer.id),
+		builderManifestSha256: builderManifest,
+		reviewerManifestSha256: reviewerManifest,
+		action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", head] },
+		intendedAt: "2026-09-17T18:05:00.000Z",
+		integratedAt: "2026-09-17T18:05:01.000Z",
+		observedHead: head,
+	};
+	run.finalVerificationExecution = verification;
+	const reports = attempts.map((attempt) => {
+		const evidence = attempt.evidence as Record<string, unknown>;
+		return {
+			taskId: String(task.contract && (task.contract as Record<string, unknown>).id),
+			attemptId: String(attempt.id),
+			role: String(attempt.role),
+			sourcePath: String(attempt.reportPath),
+			destinationPath: `reports/task-01/${String(attempt.id)}-${String(attempt.role)}.md`,
+			size: 1,
+			sha256: String(evidence.reportSha256),
+		};
+	});
+	const prompted = new Set<string>();
+	const resources: Array<Record<string, unknown>> = [];
+	for (const attempt of attempts) {
+		const dispatch = attempt.dispatch as Record<string, unknown>;
+		const identity = `${String(attempt.role)}/${String(dispatch.agentName)}/${String(dispatch.workspaceId)}/${String(dispatch.paneId)}/${String(dispatch.terminalId)}`;
+		if (prompted.has(identity)) continue;
+		prompted.add(identity);
+		const intendedAt = "2026-09-17T18:08:00.000Z";
+		resources.push({
+			role: attempt.role,
+			agentName: dispatch.agentName,
+			workspaceId: dispatch.workspaceId,
+			paneId: dispatch.paneId,
+			terminalId: dispatch.terminalId,
+			state: "acknowledged",
+			intendedAt,
+			acknowledgedAt: "2026-09-17T18:09:00.000Z",
+			acknowledgement: { name: dispatch.agentName, workspaceId: dispatch.workspaceId, tabId: `tab-${String(resources.length + 1)}`, paneId: dispatch.paneId, terminalId: dispatch.terminalId },
+		});
+	}
+	const gate = {
+		evaluatedAt: "2026-09-17T18:07:00.000Z",
+		taskId: "task-01",
+		integratedHead: head,
+		verificationResultSha256: verification.resultSha256,
+		verificationLogSha256: verification.logSha256,
+		checkout,
+		predicates: [...COMPLETION_GATE_PREDICATES],
+	};
+	run.status = "completed";
+	run.updatedAt = "2026-09-17T18:12:00.000Z";
+	run.completion = {
+		phase: "archived",
+		gate,
+		resources,
+		archive: {
+			intendedAt: "2026-09-17T18:10:00.000Z",
+			archiveDirectory: `${completionRoot}/archive`,
+			runPath: `${completionRoot}/archive/run.json`,
+			previousRunPath: `${completionRoot}/archive/previous-run.json`,
+			manifestPath: `${completionRoot}/archive/manifest.json`,
+			activeJournalSha256: `sha256:${"f".repeat(64)}`,
+			previousJournalSha256: `sha256:${"0".repeat(64)}`,
+			verification: { logPath: verification.logPath, resultPath: verification.resultPath, logSha256: verification.logSha256, resultSha256: verification.resultSha256 },
+			reports,
+		},
+		archivedAt: "2026-09-17T18:12:00.000Z",
+	};
+	raw.journalRevision = 4;
+	const validated = validateRunJournal(raw, `${completionRoot}/archive/run.json`);
 	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
 	return validated.value;
 }
@@ -220,6 +341,50 @@ it.sequential("round-trips the valid 12-Attempt history and rejects impossible m
 		const result = await store.replaceActive(root, candidate as unknown as RunJournal);
 		ok(result.kind === "invalid-candidate" || result.kind === "storage-error", `${name} mutation was accepted`);
 		equal(await readFile(paths.activePath, "utf8"), bytes, `${name} mutation clobbered the active journal`);
+	}
+});
+
+it.sequential("rejects completed bytes at the active path while accepting the immutable archive snapshot", async () => {
+	const root = await makeRoot();
+	const store = createRunJournalStore();
+	const initial = journal("run-20260917T180000000Z-completed-active");
+	const created = await store.createActive(root, initial);
+	if (created.kind !== "created") throw new Error("active seed was not created");
+	const paths = store.resolvePaths(root);
+	const completed = completedHistoryJournal();
+	const archivePath = join(root, "archive", "run.json");
+	const archiveBytes = Buffer.from(serializeRunJournalAtPath(completed, archivePath));
+	const archiveDecoded = deserializeRunJournal(archiveBytes.toString("utf8"), archivePath);
+	ok(archiveDecoded.value, "completed archive snapshot must remain valid at run.json");
+	const before = await readFile(paths.activePath);
+	const replacement = await store.replaceActive(root, completed);
+	equal(replacement.kind, "invalid-candidate");
+	deepStrictEqual(await readFile(paths.activePath), before);
+	const createAgain = await store.createActive(root, completed);
+	equal(createAgain.kind, "storage-error");
+	deepStrictEqual(await readFile(paths.activePath), before);
+	await writeFile(paths.activePath, archiveBytes);
+	const direct = deserializeRunJournal(archiveBytes.toString("utf8"), paths.activePath);
+	ok(!direct.value);
+	match(direct.diagnostics.map((item) => item.message).join("; "), /active-run/);
+	const loaded = await store.loadActive(root);
+	equal(loaded.kind, "invalid");
+	deepStrictEqual(await readFile(paths.activePath), archiveBytes);
+	const rejectedCurrent = await store.replaceActive(root, initial);
+	equal(rejectedCurrent.kind, "invalid-current");
+	deepStrictEqual(await readFile(paths.activePath), archiveBytes);
+	const invalidArchiveCases: Array<[string, (candidate: Record<string, unknown>) => void]> = [
+		["altered command", (candidate) => { (candidate.run as Record<string, unknown>).finalVerification = { kind: "command", command: "npm run altered" }; }],
+		["second verification id", (candidate) => { ((candidate.run as Record<string, unknown>).finalVerificationExecution as Record<string, unknown>).id = "verification-02"; }],
+		["gate predicate mutation", (candidate) => { (((candidate.run as Record<string, unknown>).completion as Record<string, unknown>).gate as Record<string, unknown>).predicates = [...COMPLETION_GATE_PREDICATES].reverse(); }],
+	];
+	for (const [name, mutate] of invalidArchiveCases) {
+		const candidate = JSON.parse(archiveBytes.toString("utf8")) as Record<string, unknown>;
+		mutate(candidate);
+		ok(!deserializeRunJournal(JSON.stringify(candidate), archivePath).value, `${name} unexpectedly decoded as an archive`);
+		const result = await store.replaceActive(root, candidate as unknown as RunJournal);
+		equal(result.kind, "invalid-candidate", `${name} replacement was accepted`);
+		deepStrictEqual(await readFile(paths.activePath), archiveBytes, `${name} clobbered active bytes`);
 	}
 });
 

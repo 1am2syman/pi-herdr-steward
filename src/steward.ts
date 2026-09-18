@@ -1302,6 +1302,30 @@ function completionIntegrationIdentity(journal: RunJournal, task: TaskRecord, ev
 	};
 }
 
+function integrationIdentityMatches(actual: TaskIntegration, expected: TaskIntegration): boolean {
+	return actual.targetBranch === expected.targetBranch
+		&& actual.targetRevision === expected.targetRevision
+		&& actual.approvedBaseRevision === expected.approvedBaseRevision
+		&& actual.approvedHeadRevision === expected.approvedHeadRevision
+		&& JSON.stringify(actual.approvedCommits) === JSON.stringify(expected.approvedCommits)
+		&& actual.builderAttemptId === expected.builderAttemptId
+		&& actual.reviewerAttemptId === expected.reviewerAttemptId
+		&& actual.builderManifestSha256 === expected.builderManifestSha256
+		&& actual.reviewerManifestSha256 === expected.reviewerManifestSha256
+		&& JSON.stringify(actual.action) === JSON.stringify(expected.action);
+}
+
+function completionIntegrationInput(repositoryRoot: string, integration: Extract<TaskIntegration, { phase: "integrated" }>): IntegrationCheckoutInput {
+	return {
+		repositoryRoot,
+		targetBranch: integration.targetBranch,
+		targetRevision: integration.targetRevision,
+		approvedBaseRevision: integration.approvedBaseRevision,
+		approvedHeadRevision: integration.approvedHeadRevision,
+		approvedCommits: [...integration.approvedCommits],
+	};
+}
+
 function integrationObservationExact(input: IntegrationCheckoutInput, result: import("./steward.ts").IntegrationCheckoutResult): boolean {
 	return input.targetRevision === input.approvedBaseRevision && result.kind === "inspected" && result.observation.rangeExact && result.observation.branch === input.targetBranch && result.observation.head === input.approvedHeadRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0 && result.resolvedBaseRevision === input.approvedBaseRevision && result.resolvedHeadRevision === input.approvedHeadRevision && JSON.stringify(result.commits) === JSON.stringify(input.approvedCommits);
 }
@@ -1366,7 +1390,8 @@ async function collectCompletionReports(repositoryRoot: string, journal: RunJour
 }
 
 async function persistStopFailure(repositoryRoot: string, journal: RunJournal, taskId: string, resource: CompletionAgentIdentity, state: CompletionStopFailure["state"], diagnostic: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
-	const failure: CompletionStopFailure = { state, resource: { ...resource }, observedAt: transitionTimestamp(journal, dependencies.clock.now()), diagnostic: diagnostic.slice(0, 2_000) };
+	const identity: CompletionAgentIdentity = { role: resource.role, agentName: resource.agentName, workspaceId: resource.workspaceId, paneId: resource.paneId, terminalId: resource.terminalId };
+	const failure: CompletionStopFailure = { state, resource: identity, observedAt: transitionTimestamp(journal, dependencies.clock.now()), diagnostic: diagnostic.slice(0, 2_000) };
 	let incomplete: RunJournal;
 	try {
 		incomplete = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
@@ -1399,6 +1424,7 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 	}
 	let task = journal.run.tasks[0]!;
 	if (!task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") || !task.contract.reviewRequired) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Ticket-08 completion requires one reviewed code-changing Task; no integration effect was attempted.", dependencies);
+	if (journal.run.finalVerification.kind !== "command") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-unexecutable", "Final verification is criteria-only; ticket-08 requires one frozen executable command and did not attempt integration or launch a process.", dependencies);
 	if (task.phase === "approved" && task.attention === "none" && !task.integration) {
 		if (!dependencies.git.inspectIntegrationCheckout || !dependencies.git.integrateApprovedRange) return { journal, note: "Integration adapters are unavailable; Approval remains unchanged and no Git effect was attempted." };
 		const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
@@ -1442,7 +1468,13 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 	if (task.integration.phase !== "integrated") return { journal, note: task.attentionDiagnostic ?? "Integration is paused for user attention; no retry or recovery was attempted." };
 	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? "Integrated Task remains paused for user attention." };
 	if (!journal.run.finalVerificationExecution) {
-		if (journal.run.finalVerification.kind !== "command") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-unexecutable", "Final verification is criteria-only; ticket-08 requires one frozen executable command and did not launch a process.", dependencies);
+		const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
+		if ("message" in evidence) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", `Completion evidence revalidation failed before verification intent: ${evidence.message}`, dependencies);
+		const expectedIdentity = completionIntegrationIdentity(journal, task, evidence);
+		if (!expectedIdentity || !integrationIdentityMatches(task.integration, expectedIdentity)) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Integrated identity no longer matches the current protected Approval and finalized evidence; no verification effect was attempted.", dependencies);
+		const freshInput = completionIntegrationInput(repositoryRoot, task.integration);
+		const freshCheckout = await inspectCompletionCheckout(freshInput, dependencies);
+		if (!integrationObservationExact(freshInput, freshCheckout)) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "The persisted integrated Task no longer has a fresh exact clean target checkout; no verification effect was attempted.", dependencies);
 		if (!dependencies.process.runApprovedVerification || !dependencies.runJournal.resolveCompletionPaths || !dependencies.runJournal.finalizeVerificationResult) return { journal, note: "Final-verification process/storage adapters are unavailable; no process was launched." };
 		const paths = dependencies.runJournal.resolveCompletionPaths(repositoryRoot, journal.run.id);
 		const intendedAt = transitionTimestamp(journal, dependencies.clock.now());
@@ -1492,7 +1524,15 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? "Final verification is paused for user attention; no rerun was attempted." };
 	const execution = journal.run.finalVerificationExecution;
 	if (!execution || execution.phase !== "passed") return { journal, note: "Final verification has not produced a conclusive passing result; no rerun was attempted." };
-	const checkout = execution.checkout;
+	const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
+	if ("message" in evidence) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", `Completion evidence revalidation failed before the Completion Gate: ${evidence.message}`, dependencies);
+	const expectedIdentity = completionIntegrationIdentity(journal, task, evidence);
+	const integration = task.integration;
+	if (!integration || integration.phase !== "integrated" || !expectedIdentity || !integrationIdentityMatches(integration, expectedIdentity)) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Integrated identity no longer matches the current protected Approval and finalized evidence; the Completion Gate was not evaluated.", dependencies);
+	const freshInput = completionIntegrationInput(repositoryRoot, integration);
+	const freshObservation = await inspectCompletionCheckout(freshInput, dependencies);
+	if (freshObservation.kind !== "inspected" || !integrationObservationExact(freshInput, freshObservation)) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "The persisted verification result no longer has a fresh exact clean target checkout; the Completion Gate was not evaluated.", dependencies);
+	const checkout = freshObservation.observation;
 	const gate = completionGateFacts(journal, checkout, dependencies);
 	if (!gate) {
 		const result = evaluateCompletionGate(journal, checkout);

@@ -21,6 +21,7 @@ describe("ticket-08 Herdr graceful stop envelope", () => {
 
 	it.each([
 		["wrong name", { name: "reviewer-01", workspace_id: "ws-1", tab_id: "tab-1", pane_id: "pane-1", terminal_id: "term-1" }],
+		["wrong workspace", { name: "builder-01", workspace_id: "ws-2", tab_id: "tab-1", pane_id: "pane-1", terminal_id: "term-1" }],
 		["wrong pane", { name: "builder-01", workspace_id: "ws-1", tab_id: "tab-1", pane_id: "pane-2", terminal_id: "term-1" }],
 		["wrong terminal", { name: "builder-01", workspace_id: "ws-1", tab_id: "tab-1", pane_id: "pane-1", terminal_id: "term-2" }],
 		["malformed result", { name: "builder-01", workspace_id: "ws-1", tab_id: "tab-1", pane_id: "pane-1" }],

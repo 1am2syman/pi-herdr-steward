@@ -66,6 +66,12 @@ describe("ticket-08 local Git integration contract", () => {
 		expect(before.kind).toBe("inspected");
 		if (before.kind !== "inspected") return;
 		expect(before.observation.rangeExact).toBe(true);
+		const wrongBase = await adapter.inspectIntegrationCheckout!({ ...input, approvedBaseRevision: "3333333333333333333333333333333333333333" });
+		expect(wrongBase.kind).toBe("unavailable");
+		const rangeMismatch = await adapter.inspectIntegrationCheckout!({ ...input, approvedCommits: [...commits].reverse() });
+		expect(rangeMismatch.kind).toBe("inspected");
+		if (rangeMismatch.kind === "inspected") expect(rangeMismatch.observation.rangeExact).toBe(false);
+		expect(calls.some((call) => call.includes("merge"))).toBe(false);
 		const outcome = await adapter.integrateApprovedRange!({ ...input, action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", head] } });
 		expect(outcome.kind).toBe("completed");
 		expect(calls.some((call) => JSON.stringify(call) === JSON.stringify(["git", "merge", "--ff-only", "--no-edit", head]))).toBe(true);
@@ -92,5 +98,40 @@ describe("ticket-08 local Git integration contract", () => {
 		expect(result.kind).toBe("inspected");
 		if (result.kind === "inspected") expect(result.observation.dirtyPaths).toContain("untracked.txt");
 		expect(calls.some((call) => call.includes("merge"))).toBe(false);
+	});
+
+	it("rejects killed, stderr, and malformed read-only Git envelopes and preserves a nonzero merge acknowledgement", async () => {
+		const root = await mkdtemp(join(tmpdir(), "steward-t08-git-envelope-"));
+		roots.push(root);
+		await git(root, ["init", "-b", "main"]);
+		await git(root, ["config", "user.email", "test@example.invalid"]);
+		await git(root, ["config", "user.name", "Steward Test"]);
+		await writeFile(join(root, "file.txt"), "base\n");
+		await git(root, ["add", "file.txt"]);
+		await git(root, ["commit", "-m", "base"]);
+		const base = await git(root, ["rev-parse", "HEAD"]);
+		const input = { repositoryRoot: root, targetBranch: "main", targetRevision: base, approvedBaseRevision: base, approvedHeadRevision: base, approvedCommits: [base] };
+		for (const mode of ["killed", "stderr", "malformed"] as const) {
+			const calls: string[][] = [];
+			const adapter = createGitAdapter(async (command, args, options) => {
+				calls.push([command, ...args]);
+				if (mode === "killed" && args[0] === "rev-parse" && args[1] === "--is-inside-work-tree") return { stdout: "true", stderr: "", code: 0, killed: true };
+				if (mode === "stderr" && args[0] === "symbolic-ref") return { stdout: "main\n", stderr: "unexpected stderr", code: 0, killed: false };
+				if (mode === "malformed" && args[0] === "rev-list") return { stdout: "not-a-full-sha\n", stderr: "", code: 0, killed: false };
+				return runner([])(command, args, options);
+			});
+			const inspected = await adapter.inspectIntegrationCheckout!(input);
+			expect(inspected.kind).toBe("unavailable");
+			expect(calls.some((call) => call.includes("merge"))).toBe(false);
+		}
+		const mergeCalls: string[][] = [];
+		const adapter = createGitAdapter(async (command, args) => {
+			mergeCalls.push([command, ...args]);
+			if (args[0] === "merge") return { stdout: "", stderr: "conflict", code: 1, killed: false };
+			return runner([])(command, args);
+		});
+		const outcome = await adapter.integrateApprovedRange!({ ...input, action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", base] } });
+		expect(outcome).toEqual({ kind: "completed", code: 1, stdout: "", stderr: "conflict", killed: false });
+		expect(mergeCalls.filter((call) => call.includes("merge"))).toHaveLength(1);
 	});
 });

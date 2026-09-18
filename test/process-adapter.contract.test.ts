@@ -28,4 +28,18 @@ describe("ticket-08 process envelope", () => {
 		expect(result.kind).toBe("thrown");
 		expect(called).toBe(false);
 	});
+
+	it.each([
+		["empty command", ""],
+		["leading whitespace", " npm test"],
+		["trailing whitespace", "npm test "],
+		["relative cwd", "npm test", "relative/repository"],
+		["noncanonical cwd", "npm test", "/tmp/repository/../repository"],
+	] as Array<[string, string, string?]>) ("rejects %s without launching a second or altered command", async (_label, command, cwd = "/tmp/repository") => {
+		let called = false;
+		const adapter = createProcessAdapter(async () => { called = true; return { stdout: "", stderr: "", code: 0, killed: false }; });
+		const result = await adapter.runApprovedVerification!({ cwd, command });
+		expect(result.kind).toBe("thrown");
+		expect(called).toBe(false);
+	});
 });

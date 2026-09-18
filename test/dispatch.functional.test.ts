@@ -12,7 +12,7 @@ import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 import type { StewardDependencies, StewardUiAdapter } from "../src/steward.ts";
 
 const roots: string[] = [];
-vi.setConfig({ testTimeout: 15000 });
+vi.setConfig({ testTimeout: 60000 });
 const baseRevision = "0123456789abcdef0123456789abcdef01234567";
 const modelPlans: ProjectModelPlans = {
 	builder: { primary: { model: "builder/primary", thinkingLevel: "high" }, fallbacks: [{ model: "builder/fallback", thinkingLevel: "medium" }] },

@@ -1428,7 +1428,7 @@ function snapshotsEqual(left: ReviewWorktreeSnapshot, right: ReviewWorktreeSnaps
 	return left.head === right.head && left.dirtyStateFingerprint === right.dirtyStateFingerprint && JSON.stringify(left.dirtyPaths) === JSON.stringify(right.dirtyPaths) && JSON.stringify(left.operationMarkers) === JSON.stringify(right.operationMarkers);
 }
 
-function validateRunRecord(value: unknown, path: string): { value?: RunRecord; diagnostics: RunDiagnostic[] } {
+function validateRunRecord(value: unknown, path: string, options: { atActivePath: boolean } = { atActivePath: false }): { value?: RunRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) {
 		return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	}
@@ -1438,7 +1438,7 @@ function validateRunRecord(value: unknown, path: string): { value?: RunRecord; d
 	const diagnostics: RunDiagnostic[] = [];
 	if (!safeIdentifier(value.id) || !String(value.id).startsWith("run-")) diagnostics.push(diagnostic("invalid-run", "Run id must be a filesystem-safe run identifier.", `${path}.id`));
 	if (value.status !== "active" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "Run status must be active, completing, or completed.", `${path}.status`));
-	if (value.status === "completed" && path.endsWith("active-run.json")) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots are not legal in active-run.json.", `${path}.status`));
+	if (value.status === "completed" && options.atActivePath) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots are not legal in active-run.json.", `${path}.status`));
 	if (!trimmedString(value.declaredOutcome)) diagnostics.push(diagnostic("invalid-run", "declaredOutcome must be non-empty.", `${path}.declaredOutcome`));
 	if (!canonicalTimestamp(value.createdAt) || !canonicalTimestamp(value.updatedAt) || value.createdAt > value.updatedAt) diagnostics.push(diagnostic("invalid-run", "Run timestamps must be canonical UTC ISO values in order.", `${path}.createdAt`));
 	if (!trimmedString(value.controllerSessionId)) diagnostics.push(diagnostic("invalid-run", "controllerSessionId must be non-empty.", `${path}.controllerSessionId`));
@@ -1615,7 +1615,8 @@ export function validateRunJournal(value: unknown, path?: string): { value?: Run
 	if (!isRecord(value) || !exactKeys(value, ["schemaVersion", "journalRevision", "run"])) return { diagnostics: [diagnostic("invalid-run", "Run Journal contains unknown or missing keys.", journalPath)] };
 	if (value.schemaVersion !== RUN_JOURNAL_SCHEMA_VERSION) return { diagnostics: [diagnostic("invalid-run", "Unsupported Run Journal schemaVersion; expected 1.", journalPath)] };
 	if (typeof value.journalRevision !== "number" || !Number.isSafeInteger(value.journalRevision) || value.journalRevision < 1) return { diagnostics: [diagnostic("invalid-run", "journalRevision must be a positive safe integer.", `${journalPath}.journalRevision`)] };
-	const result = validateRunRecord(value.run, `${journalPath}.run`);
+	const atActivePath = journalPath === "active-run.json" || journalPath.endsWith("/active-run.json");
+	const result = validateRunRecord(value.run, `${journalPath}.run`, { atActivePath });
 	if (result.value && value.journalRevision === 1 && result.value.createdAt !== result.value.updatedAt) result.diagnostics.push(diagnostic("invalid-run", "Initial Run Journal revision must have equal createdAt and updatedAt values.", `${journalPath}.run.updatedAt`));
 	return result.value && result.diagnostics.length === 0 ? { value: { schemaVersion: 1, journalRevision: value.journalRevision, run: result.value }, diagnostics: [] } : { diagnostics: result.diagnostics };
 }
