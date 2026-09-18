@@ -13,7 +13,7 @@ import {
 	type RecoveryDefaults,
 	type ThinkingLevel,
 } from "./config.ts";
-import type { ActiveRunLoadResult, ActivityAppendResult, CreateActiveResult } from "./run-journal-store.ts";
+import type { ActiveRunLoadResult, ActivityAppendResult, AttemptReportInspection, CreateActiveResult } from "./run-journal-store.ts";
 import type { AssignmentCreateResult, AssignmentPaths } from "./assignment-store.ts";
 import {
 	buildInitialRunJournal,
@@ -58,6 +58,10 @@ import {
 	type CompletionGateFacts,
 	type CompletionArchiveIntent,
 	type CompletionRecord,
+	type MonitorCheckpoint,
+	type MonitorDigest,
+	type MonitorLifecycle,
+	type MonitorReportObservation,
 } from "./run.ts";
 import {
 	buildReviewerAssignment,
@@ -104,6 +108,8 @@ import type {
 	VerificationFinalizeResult,
 } from "./completion-store.ts";
 
+export type { MonitorDigest, MonitorLifecycle } from "./run.ts";
+
 /** The two presentation contexts supported by this slice. */
 export type StatusTarget = "command" | "footer";
 
@@ -117,6 +123,7 @@ export interface RunJournalAdapter {
 	createActive(repositoryRoot: string, journal: RunJournal): Promise<CreateActiveResult>;
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<import("./run-journal-store.ts").ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: import("./run.ts").ActivityEntry): Promise<ActivityAppendResult>;
+	inspectAttemptReport?(repositoryRoot: string, reportPath: string): Promise<AttemptReportInspection>;
 	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
 	createAssignment(repositoryRoot: string, document: BuilderAssignmentDocument | ReviewerAssignmentDocument): Promise<AssignmentCreateResult>;
 	loadBuilderEvidenceInputs?(input: import("./attempt-evidence-store.ts").BuilderEvidenceInputRequest): Promise<import("./attempt-evidence-store.ts").BuilderEvidenceInputs>;
@@ -176,6 +183,7 @@ export interface StewardUiAdapter {
 	confirmSameFamilyReview?(input: { builderModel: import("./config.ts").ModelChoice; reviewerModel: import("./config.ts").ModelChoice; subject: ReviewSubject; provider: string }): Promise<boolean>;
 	presentStartResult(result: StartResult): void;
 	notifyCompletion?(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void;
+	presentMonitorCondition?(input: MonitorConditionInput): void;
 }
 
 export interface StewardModelAdapter {
@@ -194,6 +202,9 @@ export interface StewardHerdrAdapter {
 	startReviewer?(input: { repositoryRoot: string; name: string; paneId: string; model: import("./config.ts").ModelChoice }): Promise<HerdrAgentStartResult>;
 	promptReviewer?(input: { repositoryRoot: string; name: string; assignmentPrompt: string }): Promise<HerdrPromptResult>;
 	stopAgentGracefully?(input: { repositoryRoot: string; name: string; workspaceId: string; paneId: string; terminalId: string }): Promise<HerdrStopResult>;
+	inspectManagedAgent?(identity: ManagedAgentIdentity): Promise<ManagedAgentInspection>;
+	waitForManagedAgent?(identity: ManagedAgentIdentity, timeoutMs: number, signal: AbortSignal): Promise<MonitorWaitResult>;
+	readManagedTerminal?(identity: ManagedAgentIdentity): Promise<MonitorDigest>;
 }
 
 export type HerdrWorktreeCreateResult =
@@ -229,6 +240,7 @@ export interface StewardGitAdapter {
 	inspectReviewWorktree?(worktreePath: string): Promise<import("./run.ts").ReviewWorktreeSnapshot | { kind: "unavailable"; message: string }>;
 	inspectIntegrationCheckout?(input: IntegrationCheckoutInput): Promise<IntegrationCheckoutResult>;
 	integrateApprovedRange?(input: IntegrationMutationInput): Promise<GitCommandOutcome>;
+	inspectManagedWorktreeProgress?(worktreePath: string): Promise<ManagedWorktreeProgress>;
 }
 
 export interface IntegrationCheckoutInput {
@@ -275,6 +287,58 @@ export type ProducedCodeArtifactInspection =
 export interface StewardClockAdapter {
 	now(): Date;
 	randomUUID(): string;
+	wait?(milliseconds: number, signal: AbortSignal): Promise<void>;
+}
+
+export interface ManagedAgentIdentity {
+	name: string;
+	workspaceId: string;
+	paneId: string;
+	terminalId: string;
+}
+
+export type ManagedAgentInspection =
+	| { kind: "observed"; identity: ManagedAgentIdentity; lifecycle: MonitorLifecycle; stateChangeSequence: number | null }
+	| { kind: "unavailable"; diagnostic: string };
+
+export type MonitorWaitResult =
+	| { kind: "settled"; lifecycle: Extract<MonitorLifecycle, "idle" | "done" | "blocked" | "unknown">; identity: ManagedAgentIdentity; stateChangeSequence: number | null }
+	| { kind: "timeout" }
+	| { kind: "unavailable"; diagnostic: string }
+	| { kind: "cancelled" };
+
+export type ManagedWorktreeProgress =
+	| { kind: "observed"; head: string; worktree: MonitorDigest; git: { head: string; digest: MonitorDigest } }
+	| { kind: "unavailable"; diagnostic: string };
+
+export type MonitorTrigger = "start" | "lifecycle" | "fallback" | "settled" | "turn" | "compaction" | "prompt" | "manual";
+
+export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "none" | "approval-required" | "blocked" | "degraded";
+
+export type MonitorCondition = "completed" | "approval-required" | "blocked" | "degraded" | "ordinary";
+
+export interface MonitorConditionInput {
+	condition: MonitorCondition;
+	runId?: string;
+	journalRevision?: number;
+	footerText: string;
+	notification?: { key: string; message: string; type: "info" | "warning" | "error" };
+}
+
+export interface MonitorPassResult {
+	action: MonitorWorkflowAction;
+	journal?: RunJournal;
+	note: string;
+	condition: MonitorCondition;
+	changedSources?: string[];
+	diagnostic?: string;
+	completed?: boolean;
+	notification?: boolean;
+}
+
+export interface MonitorAdvanceOptions {
+	interactive: boolean;
+	maximumActions: 1;
 }
 
 export interface StewardDependencies {
@@ -364,6 +428,10 @@ export interface Steward {
 	status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView>;
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
 	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
+	waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult>;
+	observeMonitorProgress(repositoryRoot: string, controllerSessionId: string, trigger: MonitorTrigger): Promise<MonitorPassResult>;
+	advanceNext(repositoryRoot: string, controllerSessionId: string, options: MonitorAdvanceOptions): Promise<MonitorPassResult>;
+	presentMonitor(result: MonitorPassResult, target: "footer" | "command"): void;
 }
 
 const EMPTY_STATUS: EmptyStatusView = {
@@ -513,7 +581,7 @@ type EvidenceDecision =
 	| { kind: "finalized"; journal: RunJournal; note: string }
 	| { kind: "unaccepted"; journal: RunJournal; note: string };
 
-type ReviewDecision = { journal: RunJournal; note: string };
+type ReviewDecision = { journal: RunJournal; note: string; action?: MonitorWorkflowAction; diagnostic?: string };
 type CompletionDecision = ReviewDecision & { completed?: boolean };
 
 function evidencePathsFor(attempt: AttemptRecord): EvidencePaths {
@@ -892,7 +960,7 @@ async function retainReviewerRepairFailure(repositoryRoot: string, journal: RunJ
 	return persistedRequested ? { journal: persistedRequested, note: `Reviewer Attempt ${reviewer.id} received one repair prompt; awaiting repaired report.` } : { journal: persistedIntent, note: "Reviewer report repair prompt succeeded but requested state could not be persisted; no resend will be attempted." };
 }
 
-async function validateActiveReviewerReport(repositoryRoot: string, journal: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, dependencies: StewardDependencies): Promise<ReviewDecision> {
+async function validateActiveReviewerReport(repositoryRoot: string, journal: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, dependencies: StewardDependencies, advanceVerdict = true): Promise<ReviewDecision> {
 	if (!dependencies.git.inspectReviewWorktree || !dependencies.runJournal.loadReviewerEvidenceInputs || !dependencies.runJournal.inspectReferencedReviewerEvidence || !dependencies.runJournal.finalizeReviewerEvidence) return { journal, note: "Review evidence adapters are unavailable; Review remains pending and no verdict was inferred." };
 	let before: import("./run.ts").ReviewWorktreeSnapshot | { kind: "unavailable"; message: string };
 	try { before = await dependencies.git.inspectReviewWorktree(reviewer.worktree.path); } catch (error: unknown) { return { journal, note: `Reviewer worktree inspection failed; no verdict was inferred. ${error instanceof Error ? error.message : "Inspection failed."}` }; }
@@ -966,7 +1034,7 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: persisted.run.updatedAt, runId: persisted.run.id, event: "reviewer-evidence-finalized", message: `Reviewer Attempt ${reviewer.id} finalized with explicit ${parsed.value.verdict} verdict; Task remains reviewing.` }).catch(() => undefined);
 	const updatedTask = persisted.run.tasks[candidate.index];
 	const updatedReviewer = updatedTask?.attempts[updatedTask.attempts.length - 1];
-	return updatedTask && updatedReviewer?.role === "reviewer" ? interpretReviewerVerdict(repositoryRoot, persisted, { ...candidate, task: updatedTask }, updatedReviewer, dependencies) : { journal: persisted, note: "Reviewer evidence finalized; explicit verdict recorded while Task remains reviewing." };
+	return updatedTask && updatedReviewer?.role === "reviewer" && advanceVerdict ? interpretReviewerVerdict(repositoryRoot, persisted, { ...candidate, task: updatedTask }, updatedReviewer, dependencies) : { journal: persisted, note: "Reviewer evidence finalized; explicit verdict recorded while Task remains reviewing.", action: "finalize-reviewer-evidence" };
 }
 
 async function interpretReviewerVerdict(repositoryRoot: string, journal: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, dependencies: StewardDependencies): Promise<ReviewDecision> {
@@ -1051,6 +1119,7 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 			delete task.attentionDiagnostic;
 			delete task.attentionReason;
 			task.attempts.push(prepared);
+			delete next.run.monitor;
 		});
 	} catch (error: unknown) { return { journal, note: `Reviewer pane intent could not be built; no pane was created. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
 	const persistedPrepared = await persistReviewJournal(repositoryRoot, preparedJournal, dependencies);
@@ -1138,11 +1207,42 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	return { journal: persistedActive, note: `Reviewer Attempt ${activeReviewer.id} dispatched; awaiting an explicit Reviewer Attempt Report.` };
 }
 
-async function advanceEligibleReview(repositoryRoot: string, controllerSessionId: string, journal: RunJournal, dependencies: StewardDependencies): Promise<ReviewDecision> {
+async function persistReviewApprovalRequired(repositoryRoot: string, journal: RunJournal, candidate: { index: number; task: TaskRecord }, choice: import("./config.ts").ModelChoice, provider: string, dependencies: StewardDependencies): Promise<ReviewDecision> {
+	const note = `Same-provider Reviewer ${choice.model} requires explicit Controller approval for this exact Review subject (${provider}). Run /steward status in the Controller Session to approve it.`;
+	if (candidate.task.attention === "needs-user" && candidate.task.attentionReason === "review-approval-required") return { journal, note, action: "approval-required" };
+	let paused: RunJournal;
+	try {
+		paused = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const task = next.run.tasks[candidate.index];
+			if (!task) throw new Error("Review Task disappeared while retaining approval-required state.");
+			task.phase = "reviewing";
+			task.attention = "needs-user";
+			task.attentionReason = "review-approval-required";
+			task.attentionDiagnostic = note.slice(0, 2_000);
+		});
+	} catch (error: unknown) {
+		return { journal, note: `${note} Durable approval-required state could not be built: ${error instanceof Error ? error.message : "Journal validation failed."}`, action: "degraded" };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, paused, dependencies);
+	if (!persisted) return { journal, note: `${note} Durable approval-required state could not be persisted; no Reviewer was launched.`, action: "degraded" };
+	await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: persisted.run.updatedAt, runId: persisted.run.id, event: "review-approval-required", message: `Same-provider Reviewer ${choice.model} awaits explicit Controller approval for the exact Review subject.` }).catch(() => undefined);
+	return { journal: persisted, note, action: "approval-required" };
+}
+
+async function advanceEligibleReview(repositoryRoot: string, controllerSessionId: string, journal: RunJournal, dependencies: StewardDependencies, automatic = false): Promise<ReviewDecision> {
 	const reviewerSelected = reviewerTaskCandidate(journal);
-	if (reviewerSelected) return validateActiveReviewerReport(repositoryRoot, journal, reviewerSelected, reviewerSelected.reviewer, dependencies);
+	if (reviewerSelected) {
+		if (automatic && dependencies.runJournal.inspectAttemptReport) {
+			let report: AttemptReportInspection;
+			try { report = await dependencies.runJournal.inspectAttemptReport(repositoryRoot, reviewerSelected.reviewer.reportPath); } catch (error: unknown) { return { journal, note: `Reviewer report observation is unavailable; no repair or verdict action was attempted. ${error instanceof Error ? error.message : "Report inspection failed."}` }; }
+			if (report.kind === "missing") return { journal, note: "Reviewer Attempt Report is not present yet; no repair or verdict was inferred." };
+			if (report.kind === "unavailable") return { journal, note: `Reviewer report observation is unavailable; no repair or verdict action was attempted. ${report.diagnostic}` };
+		}
+		return validateActiveReviewerReport(repositoryRoot, journal, reviewerSelected, reviewerSelected.reviewer, dependencies, !automatic);
+	}
 	const selected = reviewTaskCandidate(journal);
 	if (!selected) return { journal, note: "" };
+	if (automatic && selected.task.attentionReason === "review-approval-required") return { journal, note: selected.task.attentionDiagnostic ?? "Review awaits explicit Controller approval.", action: "approval-required" };
 	const derived = await deriveReviewSubject({ runId: journal.run.id, task: selected.task, builder: selected.builder }, dependencies);
 	if (!derived.subject || !derived.manifestPath || !derived.manifestSha256) return { journal, note: derived.message ?? "Review dispatch pending; immutable Builder evidence subject is unavailable." };
 	if (!dependencies.model.inspectModelChoice) return { journal, note: "Review dispatch pending; Reviewer model inspection is unavailable." };
@@ -1156,6 +1256,7 @@ async function advanceEligibleReview(repositoryRoot: string, controllerSessionId
 	let independence: ReviewerIndependence;
 	if (selection.kind === "unavailable") return pauseReview(repositoryRoot, selected, journal, dependencies, `No available Reviewer Model Choice remains. Update the future Reviewer Model Plan explicitly; diagnostics: ${selection.diagnostics.map((item) => item.message).join(" ")}`);
 	if (selection.kind === "same-family-approval-required") {
+		if (automatic) return persistReviewApprovalRequired(repositoryRoot, journal, selected, selection.choice, selection.provider, dependencies);
 		let confirmed = false;
 		if (!dependencies.ui.confirmSameFamilyReview) return pauseReview(repositoryRoot, selected, journal, dependencies, "Same-provider Reviewer confirmation is unavailable; Review is paused for explicit Controller confirmation.");
 		try { confirmed = await dependencies.ui.confirmSameFamilyReview({ builderModel: selected.builder.actualModel, reviewerModel: selection.choice, subject: derived.subject, provider: selection.provider }); }
@@ -1185,6 +1286,42 @@ function safeHerdrName(value: string): boolean {
 
 function validIdentity(value: string): boolean {
 	return value.trim().length > 0 && value === value.trim() && !value.includes("\u0000");
+}
+
+function currentMonitorAttempt(journal: RunJournal): { task: TaskRecord; index: number; attempt: AttemptRecord } | undefined {
+	const candidates: Array<{ task: TaskRecord; index: number; attempt: AttemptRecord }> = [];
+	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+		const task = journal.run.tasks[index];
+		const attempt = task?.attempts.at(-1);
+		if (!task || !attempt || (task.phase !== "building" && task.phase !== "reworking" && task.phase !== "reviewing" && task.phase !== "approved" && task.phase !== "integrating" && task.phase !== "completed") || attempt.dispatch.phase !== "prompted") continue;
+		candidates.push({ task, index, attempt });
+	}
+	return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function monitorIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
+	const dispatch = attempt.dispatch;
+	return dispatch.phase === "prompted" ? { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId } : undefined;
+}
+
+function monitorChangedSources(previous: MonitorCheckpoint | undefined, next: MonitorCheckpoint): string[] {
+	if (!previous) return ["lifecycle", "terminal", "worktree", "git", "report"];
+	const changed: string[] = [];
+	if (previous.agent.lifecycle !== next.agent.lifecycle || previous.agent.stateChangeSequence !== next.agent.stateChangeSequence || previous.agent.name !== next.agent.name || previous.agent.workspaceId !== next.agent.workspaceId || previous.agent.paneId !== next.agent.paneId || previous.agent.terminalId !== next.agent.terminalId) changed.push("lifecycle");
+	if (JSON.stringify(previous.terminal) !== JSON.stringify(next.terminal)) changed.push("terminal");
+	if (JSON.stringify(previous.worktree) !== JSON.stringify(next.worktree)) changed.push("worktree");
+	if (JSON.stringify(previous.git) !== JSON.stringify(next.git)) changed.push("git");
+	if (JSON.stringify(previous.report) !== JSON.stringify(next.report)) changed.push("report");
+	return changed;
+}
+
+function monitorFooter(journal: RunJournal, condition: MonitorCondition, diagnostic?: string): string {
+	if (condition === "completed") return "steward: no active Run";
+	const task = journal.run.tasks.find((candidate) => candidate.attention !== "none") ?? journal.run.tasks[0];
+	const attention = journal.run.tasks.filter((candidate) => candidate.attention !== "none").length;
+	const phase = task?.phase ?? journal.run.status;
+	const suffix = diagnostic ? ` · ${diagnostic.slice(0, 160)}` : "";
+	return `steward: ${journal.run.id} · ${phase} · ${attention} attention${suffix}`;
 }
 
 async function validateApprovedTasks(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<ReviewDecision> {
@@ -1411,9 +1548,9 @@ async function persistStopFailure(repositoryRoot: string, journal: RunJournal, t
 	return persisted ? { journal: persisted, note: `Graceful stop paused at ${resource.agentName}; no archive or completion notification was attempted.` } : { journal, note: "Graceful-stop failure could not be retained durably; no /quit resend or archive was attempted." };
 }
 
-async function advanceApprovedCompletion(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<CompletionDecision> {
+async function advanceApprovedCompletion(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies, oneAction = false): Promise<CompletionDecision> {
 	let journal = journalInput;
-	if (journal.run.status === "completing") return advanceCompletionLifecycle(repositoryRoot, journal, dependencies);
+	if (journal.run.status === "completing") return advanceCompletionLifecycle(repositoryRoot, journal, dependencies, oneAction);
 	if (journal.run.status !== "active") return { journal, note: "" };
 	const approvedTasks = journal.run.tasks.filter((candidate) => candidate.phase === "approved" && candidate.attention === "none" && candidate.approval?.phase === "valid");
 	const integratingTask = journal.run.tasks.find((candidate) => candidate.integration?.phase === "integrated");
@@ -1461,7 +1598,8 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 		const persistedClassified = await persistReviewJournal(repositoryRoot, classifiedJournal, dependencies);
 		if (!persistedClassified) return { journal, note: "Git integration returned but its post-state could not be retained durably; no merge retry was attempted." };
 		journal = persistedClassified;
-		if (classified.phase !== "integrated") return { journal, note: classified.diagnostic };
+		if (classified.phase !== "integrated") return { journal, note: classified.diagnostic, action: "integrate-approved-range" };
+		if (oneAction) return { journal, note: `Approved range ${input.approvedHeadRevision} was integrated and classified.`, action: "integrate-approved-range" };
 	}
 	task = journal.run.tasks[0]!;
 	if (!task.integration || task.integration.phase === "intended") return { journal, note: task.integration ? "Integration intent is durably retained; ticket-08 will not retry or infer its post-state." : "" };
@@ -1519,6 +1657,7 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 		if (!persisted) return { journal, note: "Final-verification result could not be retained durably; no process rerun was attempted." };
 		journal = persisted;
 		if (reason) return { journal, note: journal.run.tasks[0]?.attentionDiagnostic ?? "Final verification is paused for user attention." };
+		if (oneAction) return { journal, note: "Final verification completed and was durably classified.", action: "run-final-verification" };
 	}
 	task = journal.run.tasks[0]!;
 	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? "Final verification is paused for user attention; no rerun was attempted." };
@@ -1543,10 +1682,11 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 	catch (error: unknown) { return { journal, note: `Completion Gate passed in memory but could not be retained durably; no agent stop or archive effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
 	const persistedGate = await persistReviewJournal(repositoryRoot, gateJournal, dependencies);
 	if (!persistedGate) return { journal, note: "Completion Gate passed in memory but could not be retained durably; no agent stop or archive effect was attempted." };
+	if (oneAction) return { journal: persistedGate, note: "Completion Gate passed and was durably recorded; graceful stopping is queued for a later pass.", action: "pass-completion-gate" };
 	return advanceCompletionLifecycle(repositoryRoot, persistedGate, dependencies);
 }
 
-async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<CompletionDecision> {
+async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies, oneAction = false): Promise<CompletionDecision> {
 	let journal = journalInput;
 	const task = journal.run.tasks[0];
 	if (!task || journal.run.status !== "completing" || !journal.run.completion) return { journal, note: "" };
@@ -1562,6 +1702,7 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 		if (!persisted) return { journal, note: "Graceful-stop intent could not be persisted; no /quit was sent." };
 		journal = persisted;
 		completion = journal.run.completion!;
+		if (oneAction) return { journal, note: "Graceful-stop intent was persisted; one recorded resource will be stopped on a later pass.", action: "stop-next-agent" };
 	}
 	if (completion.phase === "stops-intended") {
 		const stopCompletion = completion;
@@ -1582,6 +1723,7 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 			if (!persisted) return persistStopFailure(repositoryRoot, journal, task.contract.id, resource, "ambiguous", "Graceful-stop acknowledgement could not be persisted; no resend will be attempted.", dependencies);
 			journal = persisted;
 			completion = journal.run.completion!;
+			if (oneAction) return { journal, note: `Gracefully stopped ${resource.agentName}; the next recorded resource remains queued.`, action: "stop-next-agent" };
 		}
 		completion = journal.run.completion!;
 		if (completion.phase === "stops-intended" && completion.resources.every((resource) => resource.state === "acknowledged")) {
@@ -1592,6 +1734,7 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 			if (!persisted) return { journal, note: "Graceful-stop completion could not be persisted; archive was not attempted." };
 			journal = persisted;
 			completion = journal.run.completion!;
+			if (oneAction) return { journal, note: "All recorded resources are stopped; completion archive is queued for a later pass.", action: "stop-next-agent" };
 		}
 	}
 	if (completion.phase === "stops-incomplete") return { journal, note: "Graceful stop is durably incomplete; no /quit resend, archive, cleanup, or notification was attempted." };
@@ -1617,7 +1760,7 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 		if (published.kind !== "published" && published.kind !== "existing-match") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", `Completion archive was not published: ${"message" in published ? published.message : "unknown archive failure"}`, dependencies);
 		await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: finalJournal.run.updatedAt, runId: finalJournal.run.id, event: "run-completed", message: `Run ${finalJournal.run.id} was archived at ${paths.archiveDirectory}.` }).catch(() => undefined);
 		try { dependencies.ui.notifyCompletion?.({ runId: journal.run.id, targetBranch: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.branch : "unknown", integratedHead: completion.gate.integratedHead, verificationResultPath: execution.resultPath, verificationLogPath: execution.logPath, archivePath: paths.archiveDirectory }); } catch { /* The archive remains authoritative if UI delivery fails. */ }
-		return { journal: finalJournal, note: `Run ${journal.run.id} archived and completion notification was attempted.`, completed: true };
+		return { journal: finalJournal, note: `Run ${journal.run.id} archived and completion notification was attempted.`, action: "publish-completion-archive", completed: true };
 	}
 	return { journal, note: "" };
 }
@@ -1647,6 +1790,7 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 			delete task.attentionReason;
 			task.reworkCycles = cycle;
 			task.attempts.push(prepared);
+			delete next.run.monitor;
 		});
 	} catch (error: unknown) { return { journal, note: `Rework cycle reservation failed before Assignment or prompt effects. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
 	const persistedReserved = await persistReviewJournal(repositoryRoot, reserved, dependencies);
@@ -2213,5 +2357,173 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return presentStart({ kind: "started-and-dispatched", journal: dispatch.journal, message: dispatch.message });
 	}
 
-	return { status, configure, start };
+	const monitorDependencies: StewardDependencies = { runJournal, herdr, git, process, model, clock, ui };
+
+	function monitorResult(action: MonitorWorkflowAction, journal: RunJournal | undefined, note: string, diagnostic?: string, completed = false, changedSources?: readonly string[]): MonitorPassResult {
+		let condition: MonitorCondition;
+		if (completed || journal?.run.status === "completed" || journal?.run.completion?.phase === "archived") condition = "completed";
+		else if (journal?.run.tasks.some((task) => task.attention === "needs-user" && task.attentionReason === "review-approval-required") || action === "approval-required") condition = "approval-required";
+		else if (journal?.run.tasks.some((task) => task.attention !== "none") || action === "blocked") condition = "blocked";
+		else if (diagnostic || action === "degraded") condition = "degraded";
+		else condition = "ordinary";
+		return { action, ...(journal ? { journal } : {}), note, condition, ...(diagnostic ? { diagnostic } : {}), ...(completed ? { completed: true } : {}), ...(changedSources ? { changedSources: [...changedSources] } : {}) };
+	}
+
+	function observationIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
+		return monitorIdentity(attempt);
+	}
+
+	async function observeMonitorProgress(repositoryRoot: string, controllerSessionId: string, trigger: MonitorTrigger): Promise<MonitorPassResult> {
+		const loaded = await runJournal.loadActive(repositoryRoot);
+		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; monitoring is dormant." : "Active Run state is invalid; monitoring is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
+		const journal = loaded.journal;
+		if (journal.run.controllerSessionId !== controllerSessionId) return monitorResult("none", journal, "Controller Session does not match; monitor observation is read-only.");
+		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; monitoring is dormant.", undefined, true);
+		const selected = currentMonitorAttempt(journal);
+		if (!selected || !observationIdentity(selected.attempt)) return monitorResult("none", journal, "No current prompted Steward Attempt is available for monitoring.");
+		const identity = observationIdentity(selected.attempt)!;
+		let agent: ManagedAgentInspection = { kind: "unavailable", diagnostic: "Herdr monitoring inspection is unavailable." };
+		try { if (herdr.inspectManagedAgent) agent = await herdr.inspectManagedAgent(identity); } catch (error: unknown) { agent = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr monitoring inspection failed." }; }
+		let terminal: MonitorDigest = { kind: "unavailable", diagnostic: "Herdr terminal observation is unavailable." };
+		try { if (herdr.readManagedTerminal) terminal = await herdr.readManagedTerminal(identity); } catch (error: unknown) { terminal = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr terminal observation failed." }; }
+		let worktree: MonitorDigest = { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." };
+		let gitProgress: { head: string | null; digest: string | null; diagnostic?: string } = { head: null, digest: null, diagnostic: "Managed Git observation is unavailable." };
+		try {
+			const progress = git.inspectManagedWorktreeProgress ? await git.inspectManagedWorktreeProgress(selected.attempt.dispatch.phase === "prompted" ? selected.attempt.dispatch.worktreePath : "") : { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." } as ManagedWorktreeProgress;
+			if (progress.kind === "observed") { worktree = progress.worktree; gitProgress = { head: progress.git.head, digest: progress.git.digest.kind === "observed" ? progress.git.digest.sha256 : null, ...(progress.git.digest.kind === "unavailable" ? { diagnostic: progress.git.digest.diagnostic } : {}) }; }
+			else { worktree = { kind: "unavailable", diagnostic: progress.diagnostic }; gitProgress = { head: null, digest: null, diagnostic: progress.diagnostic }; }
+		} catch (error: unknown) { const diagnostic = error instanceof Error ? error.message : "Managed worktree observation failed."; worktree = { kind: "unavailable", diagnostic }; gitProgress = { head: null, digest: null, diagnostic }; }
+		let report: MonitorReportObservation = { kind: "unavailable", diagnostic: "Attempt Report observation is unavailable." };
+		try {
+			if (runJournal.inspectAttemptReport) {
+				const inspectedReport = await runJournal.inspectAttemptReport(repositoryRoot, selected.attempt.reportPath);
+				report = inspectedReport;
+			}
+		} catch (error: unknown) { report = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Attempt Report observation failed." }; }
+		const lifecycle = agent.kind === "observed" ? agent.lifecycle : "unavailable";
+		const stateChangeSequence = agent.kind === "observed" ? agent.stateChangeSequence : null;
+		const observedAt = new Date(Math.max(clock.now().getTime(), new Date(journal.run.updatedAt).getTime() + 1)).toISOString();
+		const checkpoint: MonitorCheckpoint = { observedAt, taskId: selected.task.contract.id, attemptId: selected.attempt.id, role: selected.attempt.role, agent: { ...identity, lifecycle, stateChangeSequence }, terminal, worktree, git: gitProgress, report };
+		const changedSources = monitorChangedSources(journal.run.monitor, checkpoint);
+		const degraded = agent.kind === "unavailable" || terminal.kind === "unavailable" || worktree.kind === "unavailable" || Boolean(gitProgress.diagnostic) || report.kind === "unavailable";
+		if (changedSources.length === 0) return monitorResult(degraded ? "degraded" : "none", journal, `${trigger} monitoring scan found no changed durable facts.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
+		let candidate: RunJournal;
+		try { candidate = advanceRunJournal(journal, clock.now(), (next) => { next.run.monitor = checkpoint; }); }
+		catch (error: unknown) { return monitorResult("degraded", journal, "Monitor observation could not be built durably; workflow state was unchanged.", error instanceof Error ? error.message : "Monitor checkpoint validation failed.", false, changedSources); }
+		if (!runJournal.replaceActive) return monitorResult("degraded", journal, "Monitor checkpoint storage is unavailable; workflow state was unchanged.", "Monitor checkpoint storage is unavailable.", false, changedSources);
+		let replaced: import("./run-journal-store.ts").ReplaceActiveResult;
+		try { replaced = await runJournal.replaceActive(repositoryRoot, candidate); } catch (error: unknown) { return monitorResult("degraded", journal, "Monitor checkpoint could not be persisted; no workflow action was attempted.", error instanceof Error ? error.message : "Monitor checkpoint storage failed.", false, changedSources); }
+		if (replaced.kind !== "replaced") return monitorResult("degraded", journal, "Monitor checkpoint lost a Journal race or encountered invalid current state; no workflow action was attempted.", "Monitor checkpoint replacement was rejected.", false, changedSources);
+		let activityFailed = false;
+		try {
+			const activity = await runJournal.appendActivity(repositoryRoot, { timestamp: replaced.journal.run.updatedAt, runId: replaced.journal.run.id, event: "monitor-observed", message: `Observed Attempt ${selected.attempt.id}: ${changedSources.join(", ")}.` });
+			activityFailed = activity.kind !== "appended";
+		} catch { activityFailed = true; }
+		if (activityFailed) return monitorResult("degraded", replaced.journal, "Monitor checkpoint persisted, but activity logging is degraded; no workflow action was attempted.", "Activity append failed after authoritative checkpoint persistence.", false, changedSources);
+		return monitorResult(degraded ? "degraded" : "record-observation", replaced.journal, `Observed Attempt ${selected.attempt.id}: ${changedSources.join(", ")}.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
+	}
+
+	async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
+		const loaded = await runJournal.loadActive(repositoryRoot);
+		if (loaded.kind !== "loaded" || loaded.journal.run.controllerSessionId !== controllerSessionId || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active Controller-owned Run is available for a lifecycle wait." };
+		const selected = currentMonitorAttempt(loaded.journal);
+		const identity = selected ? observationIdentity(selected.attempt) : undefined;
+		if (!identity || !herdr.inspectManagedAgent || !herdr.waitForManagedAgent) return { kind: "unavailable", diagnostic: "The current prompted Attempt or Herdr lifecycle wait is unavailable." };
+		const interval = Math.max(1, loaded.journal.run.effectiveSettings.passiveInspectionIntervalSeconds) * 1_000;
+		let inspected: ManagedAgentInspection;
+		try { inspected = await herdr.inspectManagedAgent(identity); } catch {
+			try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
+			return { kind: "timeout" };
+		}
+		if (inspected.kind !== "observed") {
+			try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
+			return { kind: "timeout" };
+		}
+		if (inspected.lifecycle !== "working") {
+			try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
+			return { kind: "timeout" };
+		}
+		if (signal.aborted) return { kind: "cancelled" };
+		try {
+			const waited = await herdr.waitForManagedAgent(identity, Math.min(interval, 30_000), signal);
+			if (waited.kind === "timeout" || waited.kind === "unavailable") {
+				try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
+			}
+			return waited.kind === "unavailable" ? { kind: "timeout" } : waited;
+		} catch (error: unknown) { return signal.aborted || (error instanceof Error && error.name === "AbortError") ? { kind: "cancelled" } : { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr lifecycle wait failed." }; }
+	}
+
+	async function advanceNext(repositoryRoot: string, controllerSessionId: string, options: MonitorAdvanceOptions): Promise<MonitorPassResult> {
+		const loaded = await runJournal.loadActive(repositoryRoot);
+		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; advancement is dormant." : "Active Run state is invalid; advancement is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
+		let journal = loaded.journal;
+		if (journal.run.controllerSessionId !== controllerSessionId) return monitorResult("none", journal, "Controller Session does not match; advancement is read-only.");
+		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; advancement is dormant.", undefined, true);
+		const activity = { failed: false, diagnostic: "" };
+		const authoritativeActivity = monitorDependencies.runJournal.appendActivity.bind(monitorDependencies.runJournal);
+		const deps: StewardDependencies = {
+			...monitorDependencies,
+			runJournal: {
+				...monitorDependencies.runJournal,
+				appendActivity: async (root, entry) => {
+					try {
+						const result = await authoritativeActivity(root, entry);
+						if (result.kind !== "appended") {
+							activity.failed = true;
+							activity.diagnostic = "Activity append failed after authoritative workflow persistence.";
+						}
+						return result;
+					} catch (error: unknown) {
+						activity.failed = true;
+						activity.diagnostic = error instanceof Error ? error.message.slice(0, 2_000) : "Activity append failed after authoritative workflow persistence.";
+						throw error;
+					}
+				},
+			},
+		};
+		const activityDegraded = (journalValue: RunJournal, note: string): MonitorPassResult | undefined => activity.failed ? monitorResult("degraded", journalValue, `${note} Workflow state remains authoritative; no later automatic action was attempted in this pass.`, activity.diagnostic) : undefined;
+		const beforeBuilder = activeBuilder(journal);
+		if (beforeBuilder) {
+			const beforeRevision = journal.journalRevision;
+			const decision = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, journal, deps);
+			journal = decision.journal;
+			const degraded = activityDegraded(journal, decision.note || "Builder evidence decision completed.");
+			if (degraded) return degraded;
+			if (journal.journalRevision !== beforeRevision) return monitorResult("finalize-builder-evidence", journal, decision.note || "Builder evidence was durably finalized.");
+		}
+		const beforeApprovalRevision = journal.journalRevision;
+		const approval = await validateApprovedTasks(repositoryRoot, journal, deps);
+		journal = approval.journal;
+		const approvalDegraded = activityDegraded(journal, approval.note || "Approval decision completed.");
+		if (approvalDegraded) return approvalDegraded;
+		if (journal.journalRevision !== beforeApprovalRevision) return monitorResult("invalidate-approval", journal, approval.note || "Approval was invalidated before a later effect.");
+		const beforeReview = journal.journalRevision;
+		const review = await advanceEligibleReview(repositoryRoot, controllerSessionId, journal, deps, !options.interactive);
+		journal = review.journal;
+		const reviewDegraded = activityDegraded(journal, review.note || "Review decision completed.");
+		if (reviewDegraded) return reviewDegraded;
+		if (review.action) return monitorResult(review.action, journal, review.note, review.diagnostic);
+		if (journal.journalRevision !== beforeReview) {
+			const task = journal.run.tasks[0];
+			const latest = task?.attempts.at(-1);
+			const action: MonitorWorkflowAction = task?.phase === "approved" ? "finalize-reviewer-evidence" : latest?.role === "reviewer" ? "dispatch-reviewer" : "dispatch-rework-builder";
+			return monitorResult(action, journal, review.note);
+		}
+		const completion = await advanceApprovedCompletion(repositoryRoot, journal, deps, true);
+		journal = completion.journal;
+		const completionDegraded = activityDegraded(journal, completion.note || "Completion decision completed.");
+		if (completionDegraded) return completionDegraded;
+		return monitorResult(completion.action ?? "none", journal, completion.note, completion.diagnostic, completion.completed);
+	}
+
+	function presentMonitor(result: MonitorPassResult, target: "footer" | "command"): void {
+		const journal = result.journal;
+		if (!ui.presentMonitorCondition) return;
+		const footerText = journal ? monitorFooter(journal, result.condition, result.diagnostic) : result.condition === "degraded" ? "steward: monitoring degraded" : "steward: no active Run";
+		const notification = result.notification === false ? undefined : result.condition === "approval-required" ? { key: `${journal?.run.id ?? "none"}:approval-required:${journal?.journalRevision ?? 0}`, message: result.note, type: "warning" as const } : result.condition === "blocked" ? { key: `${journal?.run.id ?? "none"}:blocked:${journal?.journalRevision ?? 0}`, message: result.note, type: "warning" as const } : result.condition === "degraded" ? { key: `${journal?.run.id ?? "none"}:degraded:${result.diagnostic ?? result.note}`, message: result.note, type: "warning" as const } : undefined;
+		ui.presentMonitorCondition({ condition: result.condition, ...(journal ? { runId: journal.run.id, journalRevision: journal.journalRevision } : {}), footerText, ...(notification ? { notification } : {}) });
+		if (target === "command" && journal) ui.presentStatus(presentStatusForJournal(journal, result.note), "command");
+	}
+
+	return { status, configure, start, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
 }

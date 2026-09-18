@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { type ExecResult, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 
@@ -36,6 +37,12 @@ import type {
 	StewardModelAdapter,
 	StewardUiAdapter,
 	StewardUiSurface,
+	ManagedAgentIdentity,
+	ManagedAgentInspection,
+	MonitorDigest,
+	MonitorLifecycle,
+	MonitorWaitResult,
+	ManagedWorktreeProgress,
 } from "./steward.ts";
 import type { ReviewerChoiceInspection } from "./review.ts";
 import { createHash } from "node:crypto";
@@ -52,7 +59,7 @@ export interface StewardHostRequest {
 	ui: StewardUiSurface;
 	modelRegistry: HostModelRegistry;
 	scopedModels: readonly HostScopedModel[];
-	exec?: (command: string, args: string[], options?: { cwd?: string; timeout?: number }) => Promise<ExecResult>;
+	exec?: (command: string, args: string[], options?: { cwd?: string; timeout?: number; signal?: AbortSignal }) => Promise<ExecResult>;
 }
 
 function safeErrorText(error: unknown): string {
@@ -70,6 +77,7 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		createActive: runStore.createActive,
 		replaceActive: runStore.replaceActive,
 		appendActivity: runStore.appendActivity,
+		inspectAttemptReport: runStore.inspectAttemptReport,
 		resolveAssignmentPaths: runStore.resolveAssignmentPaths,
 		createAssignment: runStore.createAssignment,
 		loadBuilderEvidenceInputs: runStore.loadBuilderEvidenceInputs,
@@ -393,6 +401,30 @@ function identityFields(value: JsonObject | undefined): { name: string; workspac
 	return { name: value.name, workspaceId: value.workspace_id, tabId: value.tab_id, paneId: value.pane_id, terminalId: value.terminal_id };
 }
 
+function lifecycleValue(value: unknown): MonitorLifecycle | undefined {
+	if (value === "working") return "working";
+	if (value === "blocked") return "blocked";
+	if (value === "idle") return "idle";
+	if (value === "done" || value === "completed") return "done";
+	if (value === "unknown") return "unknown";
+	return undefined;
+}
+
+function exactManagedAgent(identity: ManagedAgentIdentity, result: ExecResult, envelopeId: "cli:agent:get" | "cli:agent:wait"): ManagedAgentInspection | undefined {
+	const envelope = safeEnvelope(result);
+	const value = resultObject(envelope);
+	const agent = objectValue(value?.agent);
+	const actual = identityFields(agent);
+	const lifecycle = lifecycleValue(agent?.agent_status);
+	const sequence = agent?.state_change_seq;
+	if (envelope?.id !== envelopeId || value?.type !== "agent_info" || agent?.agent !== "pi" || !actual || actual.name !== identity.name || actual.workspaceId !== identity.workspaceId || actual.paneId !== identity.paneId || actual.terminalId !== identity.terminalId || !lifecycle || (sequence !== undefined && sequence !== null && (typeof sequence !== "number" || !Number.isSafeInteger(sequence) || sequence < 0))) return undefined;
+	return { kind: "observed", identity: { ...identity }, lifecycle, stateChangeSequence: sequence === undefined || sequence === null ? null : sequence };
+}
+
+function monitorDigest(bytes: Buffer): Extract<MonitorDigest, { kind: "observed" }> {
+	return { kind: "observed", byteCount: bytes.length, sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}` };
+}
+
 function exactPiArgv(value: unknown, model: ModelChoice): boolean {
 	if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) return false;
 	const expected = ["--model", model.model, "--thinking", model.thinkingLevel];
@@ -532,6 +564,45 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			if (value?.type === "agent_prompted" && identity && identity.name === input.name && identity.workspaceId === input.workspaceId && identity.paneId === input.paneId && identity.terminalId === input.terminalId) return { kind: "acknowledged", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
 			const error = safeErrorEnvelope(result);
 			return { kind: result.killed ? "ambiguous" : "failed", message: error?.message ?? "Herdr returned no valid same-identity /quit acknowledgement." };
+		},
+		async inspectManagedAgent(identity) {
+			if (!exec) return { kind: "unavailable", diagnostic: "The Pi command runner is unavailable." };
+			try {
+				const result = await exec("herdr", ["agent", "get", identity.name], { timeout: 5000 });
+				const observed = exactManagedAgent(identity, result, "cli:agent:get");
+				return observed ?? { kind: "unavailable", diagnostic: result.killed ? "Herdr agent get was killed." : "Herdr returned no valid same-identity agent_info envelope." };
+			} catch (error: unknown) {
+				return { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr agent get failed." };
+			}
+		},
+		async waitForManagedAgent(identity, timeoutMs, signal): Promise<MonitorWaitResult> {
+			if (!exec) return { kind: "unavailable", diagnostic: "The Pi command runner is unavailable." };
+			try {
+				const result = await exec("herdr", ["agent", "wait", identity.name, "--until", "idle", "--until", "done", "--until", "blocked", "--until", "unknown", "--timeout", String(timeoutMs)], { timeout: timeoutMs + 1000, signal });
+				if (result.killed || signal.aborted) return { kind: "cancelled" };
+				const observed = exactManagedAgent(identity, result, "cli:agent:wait");
+				if (observed) {
+					if (observed.kind === "observed" && observed.lifecycle === "working") return { kind: "unavailable", diagnostic: "Herdr wait returned a still-working agent; no busy-loop was started." };
+					if (observed.kind !== "observed") return { kind: "unavailable", diagnostic: observed.diagnostic };
+					return { kind: "settled", lifecycle: observed.lifecycle as Extract<MonitorLifecycle, "idle" | "done" | "blocked" | "unknown">, identity: observed.identity, stateChangeSequence: observed.stateChangeSequence };
+				}
+				const error = safeErrorEnvelope(result);
+				if (error?.id !== "cli:agent:wait") return { kind: "unavailable", diagnostic: error?.message ?? "Herdr returned no valid same-identity wait envelope." };
+				if (error.code.toLowerCase().includes("timeout") || error.message.toLowerCase().includes("timeout")) return { kind: "timeout" };
+				return { kind: "unavailable", diagnostic: error?.message ?? "Herdr returned no valid same-identity wait envelope." };
+			} catch (error: unknown) {
+				return signal.aborted || (error instanceof Error && (error.name === "AbortError" || error.message.toLowerCase().includes("abort"))) ? { kind: "cancelled" } : { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr agent wait failed." };
+			}
+		},
+		async readManagedTerminal(identity) {
+			if (!exec) return { kind: "unavailable", diagnostic: "The Pi command runner is unavailable." };
+			try {
+				const result = await exec("herdr", ["agent", "read", identity.name, "--source", "recent-unwrapped", "--lines", "200"], { timeout: 5000 });
+					if (result.code !== 0 || result.killed || result.stderr.length > 0 || result.stdout.length > 256 * 1024) return { kind: "unavailable", diagnostic: result.stderr.trim() || "Herdr terminal read was unavailable." };
+				return monitorDigest(Buffer.from(result.stdout, "utf8"));
+			} catch (error: unknown) {
+				return { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr terminal read failed." };
+			}
 		},
 	};
 }
@@ -694,6 +765,42 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 				return unavailable(error instanceof Error ? error.message : "Integration checkout inspection failed.");
 			}
 		},
+		async inspectManagedWorktreeProgress(worktreePath): Promise<ManagedWorktreeProgress> {
+			if (!isAbsolute(worktreePath) || worktreePath !== resolve(worktreePath)) return { kind: "unavailable", diagnostic: "Managed worktree path is not an exact absolute path." };
+			try {
+				if (await realpath(worktreePath) !== worktreePath) return { kind: "unavailable", diagnostic: "Managed worktree path resolves through a symlink." };
+				const headResult = await execCommand(worktreePath, ["rev-parse", "--verify", "HEAD"]);
+				if (headResult.code !== 0 || headResult.killed || headResult.stderr.length > 0 || !/^[0-9a-f]{40}\n?$/.test(headResult.stdout)) return { kind: "unavailable", diagnostic: "Managed worktree HEAD inspection was unavailable." };
+				const status = await execCommand(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+				if (status.stdout.length > 16 * 1024 * 1024) return { kind: "unavailable", diagnostic: "Managed worktree status output exceeded the read bound." };
+				const statusPaths = parsePorcelainPaths(status.stdout, status.code, status.killed, status.stderr);
+				if (!statusPaths) return { kind: "unavailable", diagnostic: "Managed worktree status output was malformed." };
+				const trackedDiff = await execCommand(worktreePath, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD"]);
+				const stagedDiff = await execCommand(worktreePath, ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv"]);
+				if ([trackedDiff, stagedDiff].some((result) => result.code !== 0 || result.killed || result.stderr.length > 0 || result.stdout.length > 16 * 1024 * 1024)) return { kind: "unavailable", diagnostic: "Managed worktree Git diff inspection was unavailable or exceeded the read bound." };
+				const untrackedFacts: string[] = [];
+				const statusEntries = status.stdout.length === 0 ? [] : status.stdout.slice(0, -1).split("\u0000");
+				for (const entry of statusEntries) {
+					if (!entry.startsWith("?? ")) continue;
+					const path = entry.slice(3);
+					const absolute = resolve(worktreePath, path);
+					if (!validGitPath(path) || !absolute.startsWith(`${resolve(worktreePath)}/`)) return { kind: "unavailable", diagnostic: "Managed worktree contained an unsafe untracked path." };
+					const info = await lstat(absolute);
+					if (!info.isFile() || info.isSymbolicLink() || info.size > 16 * 1024 * 1024 || (await realpath(absolute)) !== absolute) return { kind: "unavailable", diagnostic: `Untracked path is not a bounded regular file: ${path}` };
+					const bytes = await readFile(absolute);
+					if (bytes.length !== info.size || bytes.length > 16 * 1024 * 1024) return { kind: "unavailable", diagnostic: `Untracked path changed while being observed: ${path}` };
+					untrackedFacts.push(`${path}\0${monitorDigest(bytes).sha256}`);
+				}
+				untrackedFacts.sort();
+				const statusBytes = Buffer.from(status.stdout, "utf8");
+				const worktreeBytes = Buffer.concat([Buffer.from("steward-monitor-worktree-v1\0", "utf8"), statusBytes, Buffer.from(untrackedFacts.join("\0"), "utf8")]);
+				const gitBytes = Buffer.concat([Buffer.from("steward-monitor-git-v1\0", "utf8"), Buffer.from(trackedDiff.stdout, "utf8"), Buffer.from("\0", "utf8"), Buffer.from(stagedDiff.stdout, "utf8")]);
+				const gitDigest = monitorDigest(gitBytes);
+				return { kind: "observed", head: headResult.stdout.trim(), worktree: monitorDigest(worktreeBytes), git: { head: headResult.stdout.trim(), digest: gitDigest } };
+			} catch (error: unknown) {
+				return { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Managed worktree progress inspection failed." };
+			}
+		},
 		async integrateApprovedRange(input) {
 			if (input.action.kind !== "fast-forward" || JSON.stringify(input.action.argv) !== JSON.stringify(["merge", "--ff-only", "--no-edit", input.approvedHeadRevision])) return { kind: "thrown", message: "Integration action is not the fixed fast-forward envelope." };
 			try {
@@ -762,7 +869,26 @@ function parsePorcelainPaths(stdout: string, code: number, killed: boolean, stde
 }
 
 function createClockAdapter(): StewardClockAdapter {
-	return { now: () => new Date(), randomUUID: () => randomUUID() };
+	return {
+		now: () => new Date(),
+		randomUUID: () => randomUUID(),
+		wait: (milliseconds, signal) => new Promise<void>((resolvePromise, reject) => {
+			if (signal.aborted) {
+				reject(Object.assign(new Error("The monitor wait was aborted."), { name: "AbortError" }));
+				return;
+			}
+			const timer = setTimeout(() => {
+				signal.removeEventListener("abort", onAbort);
+				resolvePromise();
+			}, Math.max(0, milliseconds));
+			const onAbort = () => {
+				clearTimeout(timer);
+				signal.removeEventListener("abort", onAbort);
+				reject(Object.assign(new Error("The monitor wait was aborted."), { name: "AbortError" }));
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+		}),
+	};
 }
 
 function lines(value: string): string[] {
@@ -872,6 +998,11 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		ui.notify(`Steward Run ${input.runId} completed on ${input.targetBranch} at ${input.integratedHead}. Final verification: ${input.verificationResultPath} (output: ${input.verificationLogPath}). Archive: ${input.archivePath}`, "info");
 	}
 
+	function presentMonitorCondition(input: import("./steward.ts").MonitorConditionInput): void {
+		ui.setStatus(STATUS_KEY, input.condition === "completed" ? undefined : input.footerText);
+		if (input.notification) ui.notify(input.notification.message, input.notification.type);
+	}
+
 	async function confirmSameFamilyReview(input: { builderModel: ModelChoice; reviewerModel: ModelChoice; subject: import("./review.ts").ReviewSubject; provider: string }): Promise<boolean> {
 		const dialogs = getDialogSurface(ui);
 		const subject = input.subject.kind === "git" ? `Git ${input.subject.baseRevision}..${input.subject.headRevision} (${input.subject.commits.length} commit(s))` : `non-Git artifacts: ${input.subject.artifacts.map((artifact) => artifact.identity).join(", ")}`;
@@ -882,11 +1013,12 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		presentStatus,
 		editConfiguration: (input) => editConfiguration(ui, input),
 		presentConfigurationResult,
-		 draftRun: (input) => draftRun(ui, input),
+		draftRun: (input) => draftRun(ui, input),
 		confirmRun: (summary) => ui.confirm!("Confirm Steward Run", summary.markdown),
 		confirmSameFamilyReview,
 		presentStartResult,
 		notifyCompletion,
+		presentMonitorCondition,
 	};
 }
 

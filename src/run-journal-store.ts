@@ -1,7 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
-import { chmod, link, lstat, open, readFile, rename, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, link, lstat, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
@@ -53,6 +53,11 @@ export type ActivityAppendResult =
 	| { kind: "appended"; path: string }
 	| { kind: "storage-error"; path: string; diagnostics: RunDiagnostic[] };
 
+export type AttemptReportInspection =
+	| { kind: "missing" }
+	| { kind: "present"; size: number; sha256: string }
+	| { kind: "unavailable"; diagnostic: string };
+
 export interface RunJournalStore {
 	resolvePaths(repositoryRoot: string): RunJournalPaths;
 	probeActive(repositoryRoot: string): "missing" | "present";
@@ -60,6 +65,7 @@ export interface RunJournalStore {
 	createActive(repositoryRoot: string, journal: RunJournal): Promise<CreateActiveResult>;
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: ActivityEntry): Promise<ActivityAppendResult>;
+	inspectAttemptReport(repositoryRoot: string, reportPath: string): Promise<AttemptReportInspection>;
 	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
 	createAssignment(repositoryRoot: string, document: import("./run.ts").AssignmentDocument): Promise<AssignmentCreateResult>;
 	loadBuilderEvidenceInputs(input: BuilderEvidenceInputRequest): Promise<BuilderEvidenceInputs>;
@@ -177,6 +183,43 @@ async function ensureNoUnexpectedPrevious(path: string): Promise<void> {
 
 function runActivityPath(paths: RunJournalPaths, runId: string): string {
 	return join(paths.activityRoot, runId, "activity.log");
+}
+
+async function inspectStableAttemptReport(repositoryRoot: string, reportPath: string, configDirName: string): Promise<AttemptReportInspection> {
+	const state = resolveProjectStatePaths(repositoryRoot, configDirName);
+	const root = resolve(state.stewardDirectory);
+	if (!isAbsolute(reportPath) || reportPath !== resolve(reportPath) || !reportPath.endsWith("/report.md")) return { kind: "unavailable", diagnostic: "Attempt Report path is not an exact Steward-owned report path." };
+	const relativePath = relative(root, reportPath);
+	if (relativePath.startsWith("..") || isAbsolute(relativePath) || relativePath.includes("\\") || relativePath.split("/").some((part) => part === "" || part === "." || part === "..") || !relativePath.startsWith("runs/")) return { kind: "unavailable", diagnostic: "Attempt Report path escaped the Steward state directory." };
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		const info = await lstat(reportPath);
+		if (!info.isFile() || info.isSymbolicLink()) return { kind: "unavailable", diagnostic: "Attempt Report is not a regular non-symlink file." };
+		if (info.size > 64 * 1024) return { kind: "unavailable", diagnostic: "Attempt Report exceeds the bounded observation size." };
+		if ((await realpath(reportPath)) !== reportPath) return { kind: "unavailable", diagnostic: "Attempt Report resolves through a symlink." };
+		handle = await open(reportPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const before = await handle.stat();
+		if (!before.isFile() || before.dev !== info.dev || before.ino !== info.ino || before.size !== info.size) return { kind: "unavailable", diagnostic: "Attempt Report changed before observation." };
+		const digest = createHash("sha256");
+		let size = 0;
+		while (size <= 64 * 1024) {
+			const chunk = Buffer.alloc(Math.min(64 * 1024, 64 * 1024 + 1 - size));
+			const read = await handle.read(chunk, 0, chunk.length, null);
+			if (read.bytesRead === 0) break;
+			const bytes = chunk.subarray(0, read.bytesRead);
+			size += read.bytesRead;
+			if (size > 64 * 1024) return { kind: "unavailable", diagnostic: "Attempt Report exceeds the bounded observation size." };
+			digest.update(bytes);
+		}
+		const after = await handle.stat();
+		if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || size !== before.size) return { kind: "unavailable", diagnostic: "Attempt Report changed while it was observed." };
+		return { kind: "present", size, sha256: `sha256:${digest.digest("hex")}` };
+	} catch (error: unknown) {
+		if (missing(error)) return { kind: "missing" };
+		return { kind: "unavailable", diagnostic: filesystemErrorText(error).slice(0, 2_000) };
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
 }
 
 export function resolveRunJournalPaths(repositoryRoot: string, configDirName = CONFIG_DIR_NAME): RunJournalPaths {
@@ -314,6 +357,10 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		}
 	}
 
+	async function inspectAttemptReport(repositoryRoot: string, reportPath: string): Promise<AttemptReportInspection> {
+		return inspectStableAttemptReport(repositoryRoot, reportPath, configDirName);
+	}
+
 	async function archiveRun(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult> {
 		const paths = resolvePaths(input.repositoryRoot);
 		const active = await readJournalFile(paths.activePath);
@@ -344,6 +391,7 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		createActive,
 		replaceActive,
 		appendActivity,
+		inspectAttemptReport,
 		resolveAssignmentPaths: (repositoryRoot, runId, taskId, attemptId) => resolveAssignmentPaths(repositoryRoot, runId, taskId, attemptId, configDirName),
 		createAssignment: assignmentStore.createAssignment,
 		loadBuilderEvidenceInputs: evidenceStore.loadBuilderEvidenceInputs,

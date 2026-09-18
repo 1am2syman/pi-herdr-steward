@@ -1,18 +1,28 @@
 import type {
+	AgentSettledEvent,
+	AgentStartEvent,
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionHandler,
 	ExtensionUIContext,
+	SessionBeforeCompactEvent,
+	SessionCompactEvent,
+	SessionShutdownEvent,
 	SessionStartEvent,
+	TurnEndEvent,
+	TurnStartEvent,
+	UIPromptEndEvent,
+	UIPromptStartEvent,
 } from "@earendil-works/pi-coding-agent";
 
 import { createProductionAdapters, type StewardHostRequest } from "./adapters.ts";
+import { createStewardSessionMonitor, type StewardSessionMonitor } from "./monitor.ts";
 import {
 	createSteward,
 	type ControllerSessionProposal,
+	type Steward,
 	type StewardDependencies,
-	type StatusTarget,
 } from "./steward.ts";
 
 export type StewardUiSurface = Pick<ExtensionUIContext, "select" | "confirm" | "input" | "notify" | "setStatus">;
@@ -30,6 +40,16 @@ type StewardSessionContext = Pick<
 };
 export type StewardCommandHandler = (args: string, ctx: StewardCommandContext) => Promise<void>;
 type StewardSessionHandler = ExtensionHandler<SessionStartEvent>;
+type StewardLifecycleHandler<E, R = undefined> = ExtensionHandler<E, R>;
+type SessionBeforeCompactResult = { cancel?: boolean; compaction?: unknown };
+type SessionCompactFailedEvent = {
+	type: "session_compact_failed";
+	reason: "manual" | "threshold" | "overflow";
+	errorMessage?: string;
+	aborted: boolean;
+	willRetry: boolean;
+	fromExtension: boolean;
+};
 
 export interface StewardCommandOptions {
 	description?: string;
@@ -40,6 +60,16 @@ export interface StewardCommandOptions {
 export interface StewardRegistrationSurface {
 	registerCommand(name: "steward", options: StewardCommandOptions): void;
 	on(event: "session_start", handler: StewardSessionHandler): void;
+	on(event: "session_before_compact", handler: StewardLifecycleHandler<SessionBeforeCompactEvent, SessionBeforeCompactResult>): void;
+	on(event: "session_compact", handler: StewardLifecycleHandler<SessionCompactEvent>): void;
+	on(event: "session_compact_failed", handler: StewardLifecycleHandler<SessionCompactFailedEvent>): void;
+	on(event: "session_shutdown", handler: StewardLifecycleHandler<SessionShutdownEvent>): void;
+	on(event: "agent_start", handler: StewardLifecycleHandler<AgentStartEvent>): void;
+	on(event: "agent_settled", handler: StewardLifecycleHandler<AgentSettledEvent>): void;
+	on(event: "ui_prompt_start", handler: StewardLifecycleHandler<UIPromptStartEvent>): void;
+	on(event: "ui_prompt_end", handler: StewardLifecycleHandler<UIPromptEndEvent>): void;
+	on(event: "turn_start", handler: StewardLifecycleHandler<TurnStartEvent>): void;
+	on(event: "turn_end", handler: StewardLifecycleHandler<TurnEndEvent>): void;
 }
 
 /** A test seam for replacing request-scoped adapters while keeping the seven slots fixed. */
@@ -64,14 +94,27 @@ function proposalFromContext(ctx: StewardCommandContext): ControllerSessionPropo
 	};
 }
 
-async function runStatus(
+interface StewardRuntime {
+	repositoryRoot: string;
+	controllerSessionId: string;
+	steward: Steward;
+	monitor: StewardSessionMonitor;
+	monitorStarted: boolean;
+}
+
+function sameRuntime(runtime: StewardRuntime | undefined, ctx: StewardCommandContext | StewardSessionContext): boolean {
+	return Boolean(runtime && runtime.repositoryRoot === ctx.cwd && runtime.controllerSessionId === ctx.sessionManager.getSessionId());
+}
+
+function makeRuntime(
 	ctx: StewardCommandContext | StewardSessionContext,
-	target: StatusTarget,
 	adapterFactory: StewardAdapterFactory,
-	exec?: ExtensionAPI["exec"],
-): Promise<void> {
-	const controllerSessionId = target === "command" && "sessionManager" in ctx ? ctx.sessionManager.getSessionId() : undefined;
-	await createSteward(adapterFactory(requestFromContext(ctx, exec))).status(ctx.cwd, target, controllerSessionId);
+	exec: ExtensionAPI["exec"] | undefined,
+): StewardRuntime {
+	const controllerSessionId = ctx.sessionManager.getSessionId();
+	const steward = createSteward(adapterFactory(requestFromContext(ctx, exec)));
+	const monitor = createStewardSessionMonitor({ repositoryRoot: ctx.cwd, controllerSessionId, steward });
+	return { repositoryRoot: ctx.cwd, controllerSessionId, steward, monitor, monitorStarted: false };
 }
 
 /** Register Steward's TUI-only session footer and status/configuration commands. */
@@ -80,9 +123,33 @@ export function registerStewardExtension(
 	adapterFactory: StewardAdapterFactory = defaultAdapterFactory,
 	exec?: ExtensionAPI["exec"],
 ): void {
+	let runtime: StewardRuntime | undefined;
+
+	function eventRuntime(ctx: StewardSessionContext): StewardRuntime | undefined {
+		return ctx.mode === "tui" && sameRuntime(runtime, ctx) ? runtime : undefined;
+	}
+
 	pi.on("session_start", async (_event, ctx) => {
 		if (ctx.mode !== "tui") return;
-		await runStatus(ctx, "footer", adapterFactory, exec);
+		if (runtime) await runtime.monitor.stop();
+		runtime = makeRuntime(ctx, adapterFactory, exec);
+		runtime.monitor.start();
+		runtime.monitorStarted = true;
+	});
+	pi.on("agent_start", (_event, ctx) => eventRuntime(ctx)?.monitor.markAgentBusy());
+	pi.on("turn_start", (_event, ctx) => eventRuntime(ctx)?.monitor.markAgentBusy());
+	pi.on("turn_end", (_event, ctx) => eventRuntime(ctx)?.monitor.wake("turn"));
+	pi.on("agent_settled", (_event, ctx) => eventRuntime(ctx)?.monitor.markAgentSettled());
+	pi.on("session_before_compact", (_event, ctx) => eventRuntime(ctx)?.monitor.markCompactionStarted());
+	pi.on("session_compact", (_event, ctx) => eventRuntime(ctx)?.monitor.markCompactionEnded());
+	pi.on("session_compact_failed", (_event, ctx) => eventRuntime(ctx)?.monitor.markCompactionEnded());
+	pi.on("ui_prompt_start", (_event, ctx) => eventRuntime(ctx)?.monitor.markUiPromptStarted());
+	pi.on("ui_prompt_end", (_event, ctx) => eventRuntime(ctx)?.monitor.markUiPromptEnded());
+	pi.on("session_shutdown", async (_event, ctx) => {
+		const current = eventRuntime(ctx);
+		if (!current) return;
+		await current.monitor.stop();
+		if (runtime === current) runtime = undefined;
 	});
 
 	pi.registerCommand("steward", {
@@ -92,19 +159,27 @@ export function registerStewardExtension(
 			if (command === "start" && ctx.mode !== "tui") throw new Error("Steward start requires interactive TUI mode.");
 			if (command === "config" && ctx.mode !== "tui") throw new Error("Steward configuration requires interactive TUI mode.");
 			if (ctx.mode !== "tui") return;
-			if (command === "status") {
-				await runStatus(ctx, "command", adapterFactory, exec);
-				return;
+			if (!sameRuntime(runtime, ctx) || !runtime?.monitorStarted) {
+				if (runtime) await runtime.monitor.stop();
+				runtime = makeRuntime(ctx, adapterFactory, exec);
 			}
-			if (command === "config") {
-				await createSteward(adapterFactory(requestFromContext(ctx, exec))).configure(ctx.cwd, proposalFromContext(ctx));
-				return;
-			}
-			if (command === "start") {
-				await createSteward(adapterFactory(requestFromContext(ctx, exec))).start(ctx.cwd, ctx.sessionManager.getSessionId());
-				return;
-			}
-			ctx.ui.notify("Usage: /steward status | /steward config | /steward start", "info");
+			const current = runtime;
+			if (!current) return;
+			await current.monitor.runExclusive(async () => {
+				if (command === "status") {
+					await current.steward.status(ctx.cwd, "command", current.controllerSessionId);
+					return;
+				}
+				if (command === "config") {
+					await current.steward.configure(ctx.cwd, proposalFromContext(ctx));
+					return;
+				}
+				if (command === "start") {
+					await current.steward.start(ctx.cwd, current.controllerSessionId);
+					return;
+				}
+				ctx.ui.notify("Usage: /steward status | /steward config | /steward start", "info");
+			});
 		},
 	});
 }

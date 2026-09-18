@@ -8,7 +8,7 @@ import { afterEach, it, vi } from "vitest";
 import { createRunJournalStore } from "../src/run-journal-store.ts";
 import { createAttemptEvidenceStore, sha256Bytes } from "../src/attempt-evidence-store.ts";
 import { resolveAssignmentPaths } from "../src/assignment-store.ts";
-import { buildInitialRunJournal, COMPLETION_GATE_PREDICATES, deserializeRunJournal, serializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type BuilderAttemptRecord, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
+import { buildInitialRunJournal, cloneRunJournal, COMPLETION_GATE_PREDICATES, deserializeRunJournal, serializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type BuilderAttemptRecord, type MonitorCheckpoint, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
 import type { ReviewSubject } from "../src/review.ts";
 import { type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
 import type { BuilderAssignmentDocument } from "../src/run.ts";
@@ -224,6 +224,28 @@ function completedHistoryJournal(): RunJournal {
 	return validated.value;
 }
 
+function monitoredHistoryJournal(): RunJournal {
+	const base = maxHistoryJournal();
+	const task = base.run.tasks[0]!;
+	const attempt = task.attempts.at(-1)!;
+	if (attempt.dispatch.phase !== "prompted") throw new Error("monitor fixture requires a prompted latest Attempt");
+	const digest = { kind: "observed" as const, byteCount: 0, sha256: `sha256:${"a".repeat(64)}` };
+	const checkpoint: MonitorCheckpoint = {
+		observedAt: base.run.updatedAt,
+		taskId: task.contract.id,
+		attemptId: attempt.id,
+		role: attempt.role,
+		agent: { name: attempt.dispatch.agentName, workspaceId: attempt.dispatch.workspaceId, paneId: attempt.dispatch.paneId, terminalId: attempt.dispatch.terminalId, lifecycle: "idle", stateChangeSequence: 12 },
+		terminal: digest,
+		worktree: digest,
+		git: { head: "0".repeat(40), digest: `sha256:${"b".repeat(64)}` },
+		report: { kind: "present", size: 0, sha256: `sha256:${"c".repeat(64)}` },
+	};
+	const validated = validateRunJournal({ ...base, run: { ...base.run, monitor: checkpoint } });
+	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
+	return validated.value;
+}
+
 async function makeRoot(): Promise<string> {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-storage-"));
 	roots.push(root);
@@ -248,7 +270,62 @@ it.sequential("creates an exact protected journal and reloads it", async () => {
 	equal((await stat(result.paths.stewardDirectory)).mode & 0o777, 0o700);
 	equal((await stat(result.paths.activePath)).mode & 0o777, 0o600);
 	deepStrictEqual((await store.loadActive(root)).kind, "loaded");
+	ok(!Object.prototype.hasOwnProperty.call(input.run, "monitor"));
 	deepStrictEqual(await listTemporaryFiles(result.paths.stewardDirectory), []);
+});
+
+it.sequential("accepts an optional strict monitor checkpoint, clones it, and rejects unknown monitor keys", async () => {
+	const root = await makeRoot();
+	const store = createRunJournalStore();
+	const monitored = monitoredHistoryJournal();
+	const seed = cloneRunJournal(monitored);
+	seed.journalRevision = 1;
+	seed.run.updatedAt = seed.run.createdAt;
+	seed.run.status = "active";
+	seed.run.tasks = seed.run.tasks.map((task) => { const { approval: _approval, ...withoutApproval } = task; return { ...withoutApproval, phase: "pending" as const, attention: "none" as const, attempts: [], reworkCycles: 0 }; });
+	delete seed.run.monitor;
+	const created = await store.createActive(root, seed);
+	if (created.kind !== "created") throw new Error("monitor fixture seed was not created");
+	const cloned = cloneRunJournal(monitored);
+	deepStrictEqual(cloned.run.monitor, monitored.run.monitor);
+	const replaced = await store.replaceActive(root, monitored);
+	equal(replaced.kind, "replaced");
+	const loaded = await store.loadActive(root);
+	if (loaded.kind !== "loaded") throw new Error("monitored Journal did not reload");
+	deepStrictEqual(loaded.journal.run.monitor, monitored.run.monitor);
+	const paths = store.resolvePaths(root);
+	const candidate = JSON.parse(serializeRunJournal(monitored)) as Record<string, unknown>;
+	const run = candidate.run as Record<string, unknown>;
+	run.monitor = { ...(run.monitor as Record<string, unknown>), unexpected: true };
+	const decoded = deserializeRunJournal(JSON.stringify(candidate), paths.activePath);
+	ok(!decoded.value);
+	const rejected = await store.replaceActive(root, candidate as unknown as RunJournal);
+	equal(rejected.kind, "invalid-candidate");
+	equal(await readFile(paths.activePath, "utf8"), serializeRunJournal(monitored));
+});
+
+it.sequential("rejects a stale monitor replacement without clobbering the newer Journal", async () => {
+	const root = await makeRoot();
+	const store = createRunJournalStore();
+	const monitored = monitoredHistoryJournal();
+	const seed = cloneRunJournal(monitored);
+	seed.journalRevision = 1;
+	seed.run.updatedAt = seed.run.createdAt;
+	seed.run.status = "active";
+	seed.run.tasks = seed.run.tasks.map((task) => { const { approval: _approval, ...withoutApproval } = task; return { ...withoutApproval, phase: "pending" as const, attention: "none" as const, attempts: [], reworkCycles: 0 }; });
+	delete seed.run.monitor;
+	if ((await store.createActive(root, seed)).kind !== "created") throw new Error("stale fixture seed was not created");
+	if ((await store.replaceActive(root, monitored)).kind !== "replaced") throw new Error("stale fixture monitor was not installed");
+	const current = cloneRunJournal(monitored);
+	const newer = { ...current, journalRevision: current.journalRevision + 1, run: { ...current.run, updatedAt: "2026-09-17T18:13:00.000Z", declaredOutcome: "Newer authoritative bytes" } };
+	if ((await store.replaceActive(root, newer)).kind !== "replaced") throw new Error("newer Journal was not installed");
+	const stale = { ...current, run: { ...current.run, updatedAt: "2026-09-17T18:12:30.000Z" } };
+	const result = await store.replaceActive(root, stale);
+	equal(result.kind, "invalid-candidate");
+	const loaded = await store.loadActive(root);
+	if (loaded.kind !== "loaded") throw new Error("newer Journal disappeared");
+	equal(loaded.journal.journalRevision, newer.journalRevision);
+	equal(loaded.journal.run.declaredOutcome, newer.run.declaredOutcome);
 });
 
 it.sequential("two initial creates race without clobbering either complete input", async () => {

@@ -25,6 +25,7 @@ export type TaskAttentionReason =
 	| "rework-preflight"
 	| "protected-evidence"
 	| "rework-exhausted"
+	| "review-approval-required"
 	| "integration-preflight"
 	| "integration-failed"
 	| "integration-ambiguous"
@@ -509,6 +510,36 @@ export type CompletionRecord =
 	| { phase: "archive-intended"; gate: CompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent }
 	| { phase: "archived"; gate: CompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent; archivedAt: string };
 
+export type MonitorLifecycle = "working" | "blocked" | "idle" | "done" | "unknown" | "unavailable";
+
+export type MonitorDigest =
+	| { kind: "observed"; byteCount: number; sha256: string }
+	| { kind: "unavailable"; diagnostic: string };
+
+export type MonitorReportObservation =
+	| { kind: "missing" }
+	| { kind: "present"; size: number; sha256: string }
+	| { kind: "unavailable"; diagnostic: string };
+
+export interface MonitorCheckpoint {
+	observedAt: string;
+	taskId: string;
+	attemptId: string;
+	role: "builder" | "reviewer";
+	agent: {
+		name: string;
+		workspaceId: string;
+		paneId: string;
+		terminalId: string;
+		lifecycle: MonitorLifecycle;
+		stateChangeSequence: number | null;
+	};
+	terminal: MonitorDigest;
+	worktree: MonitorDigest;
+	git: { head: string | null; digest: string | null; diagnostic?: string };
+	report: MonitorReportObservation;
+}
+
 export type CompletionGateResult =
 	| { passed: true; facts: Omit<CompletionGateFacts, "evaluatedAt"> }
 	| { passed: false; failures: string[] };
@@ -573,6 +604,7 @@ export interface RunRecord {
 	finalVerification: Verification;
 	finalVerificationExecution?: FinalVerificationExecution;
 	completion?: CompletionRecord;
+	monitor?: MonitorCheckpoint;
 }
 
 export interface RunJournal {
@@ -1086,6 +1118,24 @@ function cloneCompletion(completion: CompletionRecord): CompletionRecord {
 	return { phase: completion.phase, gate, resources: completion.resources.map((resource) => cloneCompletionResource(resource) as Extract<CompletionStopResource, { state: "acknowledged" }>), archive: cloneCompletionArchive(completion.archive), archivedAt: completion.archivedAt };
 }
 
+function cloneMonitorDigest(digest: MonitorDigest): MonitorDigest {
+	return digest.kind === "observed" ? { ...digest } : { ...digest };
+}
+
+function cloneMonitorCheckpoint(monitor: MonitorCheckpoint): MonitorCheckpoint {
+	return {
+		observedAt: monitor.observedAt,
+		taskId: monitor.taskId,
+		attemptId: monitor.attemptId,
+		role: monitor.role,
+		agent: { ...monitor.agent },
+		terminal: cloneMonitorDigest(monitor.terminal),
+		worktree: cloneMonitorDigest(monitor.worktree),
+		git: { ...monitor.git },
+		report: { ...monitor.report },
+	};
+}
+
 function canonicalContract(contract: TaskContract): TaskContract {
 	return cloneContract(contract);
 }
@@ -1428,13 +1478,59 @@ function snapshotsEqual(left: ReviewWorktreeSnapshot, right: ReviewWorktreeSnaps
 	return left.head === right.head && left.dirtyStateFingerprint === right.dirtyStateFingerprint && JSON.stringify(left.dirtyPaths) === JSON.stringify(right.dirtyPaths) && JSON.stringify(left.operationMarkers) === JSON.stringify(right.operationMarkers);
 }
 
+function monitorDiagnostic(value: unknown): value is string {
+	return boundedText(value, 2_000);
+}
+
+function monitorHash(value: unknown): value is string {
+	return typeof value === "string" && /^sha256:[0-9a-f]{64}$/.test(value);
+}
+
+function validateMonitorDigest(value: unknown, path: string): { value?: MonitorDigest; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.kind !== "string") return { diagnostics: [diagnostic("invalid-run", "Monitor digest must be an observed or unavailable record.", path)] };
+	if (value.kind === "observed" && exactKeys(value, ["kind", "byteCount", "sha256"]) && typeof value.byteCount === "number" && Number.isSafeInteger(value.byteCount) && value.byteCount >= 0 && value.byteCount <= 16 * 1024 * 1024 && monitorHash(value.sha256)) return { value: { kind: "observed", byteCount: value.byteCount, sha256: value.sha256 }, diagnostics: [] };
+	if (value.kind === "unavailable" && exactKeys(value, ["kind", "diagnostic"]) && monitorDiagnostic(value.diagnostic)) return { value: { kind: "unavailable", diagnostic: value.diagnostic }, diagnostics: [] };
+	return { diagnostics: [diagnostic("invalid-run", "Monitor digest has invalid exact bounded fields.", path)] };
+}
+
+function validateMonitorReport(value: unknown, path: string): { value?: MonitorReportObservation; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.kind !== "string") return { diagnostics: [diagnostic("invalid-run", "Monitor report observation must be a recognized record.", path)] };
+	if (value.kind === "missing" && exactKeys(value, ["kind"])) return { value: { kind: "missing" }, diagnostics: [] };
+	if (value.kind === "present" && exactKeys(value, ["kind", "size", "sha256"]) && typeof value.size === "number" && Number.isSafeInteger(value.size) && value.size >= 0 && value.size <= 64 * 1024 && monitorHash(value.sha256)) return { value: { kind: "present", size: value.size, sha256: value.sha256 }, diagnostics: [] };
+	if (value.kind === "unavailable" && exactKeys(value, ["kind", "diagnostic"]) && monitorDiagnostic(value.diagnostic)) return { value: { kind: "unavailable", diagnostic: value.diagnostic }, diagnostics: [] };
+	return { diagnostics: [diagnostic("invalid-run", "Monitor report observation has invalid exact bounded fields.", path)] };
+}
+
+function validateMonitorCheckpoint(value: unknown, path: string, run: { createdAt: string; updatedAt: string; tasks: TaskRecord[] }): { value?: MonitorCheckpoint; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["observedAt", "taskId", "attemptId", "role", "agent", "terminal", "worktree", "git", "report"])) return { diagnostics: [diagnostic("invalid-run", "Monitor checkpoint contains unknown or missing keys.", path)] };
+	const diagnostics: RunDiagnostic[] = [];
+	if (!canonicalTimestamp(value.observedAt) || value.observedAt < run.createdAt || value.observedAt > run.updatedAt) diagnostics.push(diagnostic("invalid-run", "Monitor observedAt must be a canonical timestamp within the Run lifetime.", `${path}.observedAt`));
+	if (!safeIdentifier(value.taskId) || !safeIdentifier(value.attemptId) || (value.role !== "builder" && value.role !== "reviewer")) diagnostics.push(diagnostic("invalid-run", "Monitor checkpoint identity fields are invalid.", path));
+	const agent = value.agent;
+	if (!isRecord(agent) || !exactKeys(agent, ["name", "workspaceId", "paneId", "terminalId", "lifecycle", "stateChangeSequence"]) || !herdrName(agent.name) || !trimmedString(agent.workspaceId) || !trimmedString(agent.paneId) || !trimmedString(agent.terminalId) || !["working", "blocked", "idle", "done", "unknown", "unavailable"].includes(agent.lifecycle as string) || (agent.stateChangeSequence !== null && (typeof agent.stateChangeSequence !== "number" || !Number.isSafeInteger(agent.stateChangeSequence) || agent.stateChangeSequence < 0))) diagnostics.push(diagnostic("invalid-run", "Monitor agent identity or lifecycle has invalid exact fields.", `${path}.agent`));
+	const terminal = validateMonitorDigest(value.terminal, `${path}.terminal`);
+	const worktree = validateMonitorDigest(value.worktree, `${path}.worktree`);
+	const report = validateMonitorReport(value.report, `${path}.report`);
+	diagnostics.push(...terminal.diagnostics, ...worktree.diagnostics, ...report.diagnostics);
+	const git = value.git;
+	if (!isRecord(git) || !exactKeys(git, Object.prototype.hasOwnProperty.call(git, "diagnostic") ? ["head", "digest", "diagnostic"] : ["head", "digest"]) || (git.head !== null && (typeof git.head !== "string" || !/^[0-9a-f]{40}$/.test(git.head))) || (git.digest !== null && !monitorHash(git.digest)) || (Object.prototype.hasOwnProperty.call(git, "diagnostic") && !monitorDiagnostic(git.diagnostic))) diagnostics.push(diagnostic("invalid-run", "Monitor Git observation has invalid exact fields.", `${path}.git`));
+	const task = run.tasks.find((candidate) => candidate.contract.id === value.taskId);
+	const attempt = task?.attempts.find((candidate) => candidate.id === value.attemptId);
+	const latest = task?.attempts.at(-1);
+	const dispatch = attempt?.dispatch;
+	if (!task || !attempt || !latest || latest.id !== attempt.id || attempt.role !== value.role || dispatch?.phase !== "prompted" || !isRecord(agent) || agent.name !== dispatch.agentName || agent.workspaceId !== dispatch.workspaceId || agent.paneId !== dispatch.paneId || agent.terminalId !== dispatch.terminalId) diagnostics.push(diagnostic("invalid-run", "Monitor checkpoint must identify the current prompted Attempt and its exact recorded Herdr resource.", path));
+	if (diagnostics.length > 0 || !isRecord(agent) || !terminal.value || !worktree.value || !report.value || !isRecord(git)) return { diagnostics };
+	return { value: { observedAt: value.observedAt as string, taskId: value.taskId as string, attemptId: value.attemptId as string, role: value.role as "builder" | "reviewer", agent: { name: agent.name as string, workspaceId: agent.workspaceId as string, paneId: agent.paneId as string, terminalId: agent.terminalId as string, lifecycle: agent.lifecycle as MonitorLifecycle, stateChangeSequence: agent.stateChangeSequence as number | null }, terminal: terminal.value, worktree: worktree.value, git: { head: git.head as string | null, digest: git.digest as string | null, ...(Object.prototype.hasOwnProperty.call(git, "diagnostic") ? { diagnostic: git.diagnostic as string } : {}) }, report: report.value }, diagnostics: [] };
+}
+
 function validateRunRecord(value: unknown, path: string, options: { atActivePath: boolean } = { atActivePath: false }): { value?: RunRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) {
 		return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	}
 	const hasFinalVerificationExecution = Object.prototype.hasOwnProperty.call(value, "finalVerificationExecution");
 	const hasCompletion = Object.prototype.hasOwnProperty.call(value, "completion");
-	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
+	const hasMonitor = Object.prototype.hasOwnProperty.call(value, "monitor");
+	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	const diagnostics: RunDiagnostic[] = [];
 	if (!safeIdentifier(value.id) || !String(value.id).startsWith("run-")) diagnostics.push(diagnostic("invalid-run", "Run id must be a filesystem-safe run identifier.", `${path}.id`));
 	if (value.status !== "active" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "Run status must be active, completing, or completed.", `${path}.status`));
@@ -1474,7 +1570,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		const settingsLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.reworkCycleLimit) ? value.effectiveSettings.reworkCycleLimit as number : 5;
 		if (!["pending", "building", "reviewing", "reworking", "approved", "integrating", "completed"].includes(task.phase as string) || !["none", "blocked", "needs-user"].includes(task.attention as string) || !Array.isArray(task.attempts) || !Number.isSafeInteger(task.reworkCycles) || (task.reworkCycles as number) < 0 || (task.reworkCycles as number) > 5 || (task.reworkCycles as number) > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Task has an invalid phase, attention, Attempt sequence, or bounded rework counter.", taskPath));
 		if (hasAttentionDiagnostic && (!boundedText(task.attentionDiagnostic, 2_000) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionDiagnostic must be bounded and accompany durable attention.", `${taskPath}.attentionDiagnostic`));
-		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted", "integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
+		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted", "review-approval-required", "integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
 		const attempts: AttemptRecord[] = [];
 		if (Array.isArray(task.attempts)) {
 			if (task.attempts.length > 12) taskDiagnostics.push(diagnostic("invalid-task", "A Task allows at most the initial pair plus five rework/review cycles.", `${taskPath}.attempts`));
@@ -1545,6 +1641,8 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	diagnostics.push(...finalVerificationExecution.diagnostics);
 	const completion = hasCompletion ? validateCompletion(value.completion, `${path}.completion`) : { diagnostics: [] };
 	diagnostics.push(...completion.diagnostics);
+	const monitor = hasMonitor ? validateMonitorCheckpoint(value.monitor, `${path}.monitor`, { createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, tasks }) : { diagnostics: [] };
+	diagnostics.push(...monitor.diagnostics);
 	if (completion.value) {
 		const prompted = new Set<string>();
 		const promptedInOrder: string[] = [];
@@ -1605,6 +1703,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			finalVerification: finalVerification.value,
 			...(finalVerificationExecution.value ? { finalVerificationExecution: finalVerificationExecution.value } : {}),
 			...(completion.value ? { completion: completion.value } : {}),
+			...(monitor.value ? { monitor: monitor.value } : {}),
 		},
 		diagnostics: [],
 	};
@@ -1818,6 +1917,7 @@ export function cloneRunJournal(journal: RunJournal): RunJournal {
 			finalVerification: cloneVerification(journal.run.finalVerification),
 			...(journal.run.finalVerificationExecution ? { finalVerificationExecution: cloneVerificationExecution(journal.run.finalVerificationExecution) } : {}),
 			...(journal.run.completion ? { completion: cloneCompletion(journal.run.completion) } : {}),
+			...(journal.run.monitor ? { monitor: cloneMonitorCheckpoint(journal.run.monitor) } : {}),
 		},
 	};
 }
