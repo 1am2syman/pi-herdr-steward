@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
-import { createAttemptEvidenceStore, type BuilderEvidenceInputRequest, type BuilderEvidenceInputs, type FinalizeBuilderEvidenceRequest, type FinalizeBuilderEvidenceResult, type ReferencedEvidenceRequest, type ReferencedEvidenceResult } from "./attempt-evidence-store.ts";
+import { createAttemptEvidenceStore, type BuilderEvidenceInputRequest, type BuilderEvidenceInputs, type FinalizeBuilderEvidenceRequest, type FinalizeBuilderEvidenceResult, type ReferencedEvidenceRequest, type ReferencedEvidenceResult, type ReviewerEvidenceInputRequest, type ReviewerEvidenceInputs, type ReferencedReviewerEvidenceRequest, type ReferencedReviewerEvidenceResult, type FinalizeReviewerEvidenceRequest, type FinalizeReviewerEvidenceResult, type FinalizedManifestLoadResult } from "./attempt-evidence-store.ts";
 import {
 	ensureProjectStateDirectory,
 	ensureOwnedDirectory,
@@ -60,10 +60,14 @@ export interface RunJournalStore {
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: ActivityEntry): Promise<ActivityAppendResult>;
 	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
-	createAssignment(repositoryRoot: string, document: import("./run.ts").BuilderAssignmentDocument): Promise<AssignmentCreateResult>;
+	createAssignment(repositoryRoot: string, document: import("./run.ts").AssignmentDocument): Promise<AssignmentCreateResult>;
 	loadBuilderEvidenceInputs(input: BuilderEvidenceInputRequest): Promise<BuilderEvidenceInputs>;
+	loadReviewerEvidenceInputs(input: ReviewerEvidenceInputRequest): Promise<ReviewerEvidenceInputs>;
+	loadFinalizedEvidenceManifest(input: { manifestPath: string; manifestSha256: string }): Promise<FinalizedManifestLoadResult>;
 	inspectReferencedEvidence(input: ReferencedEvidenceRequest): Promise<ReferencedEvidenceResult>;
+	inspectReferencedReviewerEvidence(input: ReferencedReviewerEvidenceRequest): Promise<ReferencedReviewerEvidenceResult>;
 	finalizeBuilderEvidence(input: FinalizeBuilderEvidenceRequest): Promise<FinalizeBuilderEvidenceResult>;
+	finalizeReviewerEvidence(input: FinalizeReviewerEvidenceRequest): Promise<FinalizeReviewerEvidenceResult>;
 }
 
 const ACTIVE_NAME = "active-run.json";
@@ -315,8 +319,12 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		resolveAssignmentPaths: (repositoryRoot, runId, taskId, attemptId) => resolveAssignmentPaths(repositoryRoot, runId, taskId, attemptId, configDirName),
 		createAssignment: assignmentStore.createAssignment,
 		loadBuilderEvidenceInputs: evidenceStore.loadBuilderEvidenceInputs,
+		loadReviewerEvidenceInputs: evidenceStore.loadReviewerEvidenceInputs,
+		loadFinalizedEvidenceManifest: evidenceStore.loadFinalizedEvidenceManifest,
 		inspectReferencedEvidence: evidenceStore.inspectReferencedEvidence,
+		inspectReferencedReviewerEvidence: evidenceStore.inspectReferencedReviewerEvidence,
 		finalizeBuilderEvidence: evidenceStore.finalizeBuilderEvidence,
+		finalizeReviewerEvidence: evidenceStore.finalizeReviewerEvidence,
 	};
 }
 

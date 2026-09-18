@@ -13,12 +13,14 @@ import {
 	type ModelChoice,
 	type RecoveryDefaults,
 } from "./config.ts";
+import type { ReviewSubject, ReviewerIndependence } from "./review.ts";
+import { serializeReviewerAssignment as serializeReviewerAssignmentDocument, validateReviewerAssignment as validateReviewerAssignmentDocument, deserializeReviewerAssignment as deserializeReviewerAssignmentDocument, type ReviewerAssignmentDocument } from "./review.ts";
 
 export const RUN_JOURNAL_SCHEMA_VERSION = 1 as const;
 
 export type RunStatus = "active";
-export type TaskPhase = "pending" | "building";
-export type TaskAttention = "none";
+export type TaskPhase = "pending" | "building" | "reviewing";
+export type TaskAttention = "none" | "needs-user";
 
 export type Verification =
 	| { kind: "command"; command: string }
@@ -69,9 +71,15 @@ export type DispatchRecord =
 			terminalId: string;
 			assignmentSha256: string;
 			promptedAt: string;
-		};
+	};
 
-export interface AttemptRecord {
+export type ReviewerDispatchRecord =
+	| { phase: "pane-intended"; sourcePaneId: string; worktreePath: string; agentName: string; branch: string; workspaceId?: string; paneId?: string; terminalId?: string }
+	| { phase: "agent-intended"; agentName: string; worktreePath: string; workspaceId: string; paneId: string; terminalId: string; branch: string }
+	| { phase: "prompt-intended"; agentName: string; worktreePath: string; workspaceId: string; paneId: string; terminalId: string; assignmentSha256: string; branch: string }
+	| { phase: "prompted"; agentName: string; worktreePath: string; workspaceId: string; paneId: string; terminalId: string; assignmentSha256: string; promptedAt: string; branch: string };
+
+export interface BuilderAttemptRecord {
 	id: string;
 	role: "builder";
 	state: "prepared" | "active" | "reported";
@@ -86,6 +94,38 @@ export interface AttemptRecord {
 	dispatch: DispatchRecord;
 	evidence?: BuilderEvidenceRecord;
 }
+
+export interface ReviewWorktreeSnapshot {
+	head: string;
+	dirtyStateFingerprint: string;
+	dirtyPaths: string[];
+	operationMarkers: string[];
+}
+
+export type ReviewerEvidenceRecord =
+	| { phase: "finalization-intended"; checkedAt: string; reportSha256: string; manifestPath: string; manifestSha256: string; subject: ReviewSubject; status?: "completed" | "blocked" | "failed"; producedRevision?: string | null }
+	| { phase: "finalized"; finalizedAt: string; verdict: "approved" | "changes-required"; reportSha256: string; manifestPath: string; manifestSha256: string; subject: ReviewSubject; status?: "completed" | "blocked" | "failed"; producedRevision?: string | null };
+
+export interface ReviewerAttemptRecord {
+	id: string;
+	role: "reviewer";
+	state: "prepared" | "active" | "reported";
+	preparedAt: string;
+	activatedAt?: string;
+	actualModel: ModelChoice;
+	specificationHash: string;
+	assignmentPath: string;
+	reportPath: string;
+	evidenceDirectory: string;
+	subject: ReviewSubject;
+	independence: ReviewerIndependence;
+	worktree: { path: string; baseline: ReviewWorktreeSnapshot };
+	dispatch: ReviewerDispatchRecord;
+	integrity?: { kind: "preserved"; after: ReviewWorktreeSnapshot } | { kind: "violated"; detectedAt: string; before: ReviewWorktreeSnapshot; after: ReviewWorktreeSnapshot; code: "reviewer-modified-worktree" };
+	evidence?: ReviewerEvidenceRecord;
+}
+
+export type AttemptRecord = BuilderAttemptRecord | ReviewerAttemptRecord;
 
 export type EvidenceRejectionCode =
 	| "assignment-changed"
@@ -185,6 +225,8 @@ export interface BuilderAssignmentDocument {
 		herdr: { workspaceId: string; paneId: string; terminalId: string; agentName: string };
 	};
 }
+
+export type AssignmentDocument = BuilderAssignmentDocument | ReviewerAssignmentDocument;
 
 export interface TaskRecord {
 	specificationVersion: 1;
@@ -363,6 +405,91 @@ function validateDispatch(value: unknown, path: string): { value?: DispatchRecor
 	return { value: { phase: "prompted", branch: value.branch, agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, assignmentSha256: value.assignmentSha256, promptedAt: value.promptedAt }, diagnostics: [] };
 }
 
+function validateReviewSnapshot(value: unknown, path: string): { value?: ReviewWorktreeSnapshot; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["head", "dirtyStateFingerprint", "dirtyPaths", "operationMarkers"]) || typeof value.head !== "string" || !/^[0-9a-f]{40}$/.test(value.head) || typeof value.dirtyStateFingerprint !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.dirtyStateFingerprint) || !Array.isArray(value.dirtyPaths) || value.dirtyPaths.length > 100 || value.dirtyPaths.some((item) => !pathValue(item)) || !Array.isArray(value.operationMarkers) || value.operationMarkers.length > 10 || value.operationMarkers.some((item) => !safeIdentifier(item))) return { diagnostics: [diagnostic("invalid-task", "Review worktree snapshot is invalid.", path)] };
+	return { value: { head: value.head, dirtyStateFingerprint: value.dirtyStateFingerprint, dirtyPaths: [...value.dirtyPaths] as string[], operationMarkers: [...value.operationMarkers] as string[] }, diagnostics: [] };
+}
+
+function validateReviewerDispatch(value: unknown, path: string): { value?: ReviewerDispatchRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Reviewer dispatch intent must be a recognized object.", path)] };
+	const required = value.phase === "pane-intended"
+		? ["phase", "sourcePaneId", "worktreePath", "agentName"]
+		: value.phase === "agent-intended"
+			? ["phase", "agentName", "worktreePath", "workspaceId", "paneId", "terminalId"]
+			: value.phase === "prompt-intended"
+				? ["phase", "agentName", "worktreePath", "workspaceId", "paneId", "terminalId", "assignmentSha256"]
+				: value.phase === "prompted"
+					? ["phase", "agentName", "worktreePath", "workspaceId", "paneId", "terminalId", "assignmentSha256", "promptedAt"]
+					: undefined;
+	if (!required || !exactKeys(value, required)) return { diagnostics: [diagnostic("invalid-task", "Reviewer dispatch intent has unknown or missing keys.", path)] };
+	if (!herdrName(value.agentName) || !absolutePathValue(value.worktreePath)) return { diagnostics: [diagnostic("invalid-task", "Reviewer dispatch requires a safe name and absolute worktree path.", path)] };
+	if (value.phase === "pane-intended") {
+		if (!trimmedString(value.sourcePaneId)) return { diagnostics: [diagnostic("invalid-task", "Reviewer pane intent requires a source pane identity.", path)] };
+		return { value: { phase: "pane-intended", sourcePaneId: value.sourcePaneId, worktreePath: value.worktreePath, agentName: value.agentName } as ReviewerDispatchRecord, diagnostics: [] };
+	}
+	if (!trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId)) return { diagnostics: [diagnostic("invalid-task", "Reviewer dispatch identities must be non-empty.", path)] };
+	if (value.phase === "agent-intended") return { value: { phase: "agent-intended", agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId } as ReviewerDispatchRecord, diagnostics: [] };
+	if (typeof value.assignmentSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.assignmentSha256)) return { diagnostics: [diagnostic("invalid-task", "Reviewer prompt intent requires a lowercase Assignment hash.", path)] };
+	if (value.phase === "prompt-intended") return { value: { phase: "prompt-intended", agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, assignmentSha256: value.assignmentSha256 } as ReviewerDispatchRecord, diagnostics: [] };
+	if (!canonicalTimestamp(value.promptedAt)) return { diagnostics: [diagnostic("invalid-task", "Reviewer prompted dispatch requires a canonical timestamp.", path)] };
+	return { value: { phase: "prompted", agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, assignmentSha256: value.assignmentSha256, promptedAt: value.promptedAt } as ReviewerDispatchRecord, diagnostics: [] };
+}
+
+function validateReviewerEvidence(value: unknown, path: string): { value?: ReviewerEvidenceRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Reviewer evidence must be a recognized phase record.", path)] };
+	if (value.phase === "finalization-intended" && exactKeys(value, ["phase", "checkedAt", "reportSha256", "manifestPath", "manifestSha256", "subject"]) && canonicalTimestamp(value.checkedAt) && typeof value.reportSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.reportSha256) && absolutePathValue(value.manifestPath) && typeof value.manifestSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.manifestSha256)) { const subject = validateReviewSubject(value.subject, `${path}.subject`); return subject.value ? { value: { phase: value.phase, checkedAt: value.checkedAt, reportSha256: value.reportSha256, manifestPath: value.manifestPath, manifestSha256: value.manifestSha256, subject: subject.value }, diagnostics: subject.diagnostics } : { diagnostics: subject.diagnostics }; }
+	if (value.phase === "finalized" && exactKeys(value, ["phase", "finalizedAt", "verdict", "reportSha256", "manifestPath", "manifestSha256", "subject"]) && canonicalTimestamp(value.finalizedAt) && (value.verdict === "approved" || value.verdict === "changes-required") && typeof value.reportSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.reportSha256) && absolutePathValue(value.manifestPath) && typeof value.manifestSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.manifestSha256)) { const subject = validateReviewSubject(value.subject, `${path}.subject`); return subject.value ? { value: { phase: value.phase, finalizedAt: value.finalizedAt, verdict: value.verdict, reportSha256: value.reportSha256, manifestPath: value.manifestPath, manifestSha256: value.manifestSha256, subject: subject.value }, diagnostics: subject.diagnostics } : { diagnostics: subject.diagnostics }; }
+	return { diagnostics: [diagnostic("invalid-task", "Reviewer evidence has invalid exact fields.", path)] };
+}
+
+function validateReviewerAttempt(value: Record<string, unknown>, path: string, task: TaskContract, base: IntegrationBase): { value?: ReviewerAttemptRecord; diagnostics: RunDiagnostic[] } {
+	const hasActivatedAt = Object.prototype.hasOwnProperty.call(value, "activatedAt");
+	const hasIntegrity = Object.prototype.hasOwnProperty.call(value, "integrity");
+	const hasEvidence = Object.prototype.hasOwnProperty.call(value, "evidence");
+	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", "specificationHash", "assignmentPath", "reportPath", "evidenceDirectory", "subject", "independence", "worktree", "dispatch", ...(hasIntegrity ? ["integrity"] : []), ...(hasEvidence ? ["evidence"] : [])];
+	if (!exactKeys(value, keys) || value.role !== "reviewer" || !safeIdentifier(value.id) || !["prepared", "active", "reported"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || hasIntegrity || hasEvidence)) || (value.state === "active" && !hasActivatedAt) || (value.state === "reported" && (!hasEvidence || !hasIntegrity))) return { diagnostics: [diagnostic("invalid-task", "Reviewer Attempt has invalid lifecycle fields.", path)] };
+	const model = modelChoiceValue(value.actualModel, `${path}.actualModel`);
+	const dispatch = validateReviewerDispatch(value.dispatch, `${path}.dispatch`);
+	const snapshot = isRecord(value.worktree) && exactKeys(value.worktree, ["path", "baseline"]) && absolutePathValue(value.worktree.path) ? validateReviewSnapshot(value.worktree.baseline, `${path}.worktree.baseline`) : { diagnostics: [diagnostic("invalid-task", "Reviewer worktree is invalid.", `${path}.worktree`)] };
+	const subjectResult = validateReviewSubject(value.subject, `${path}.subject`);
+	const independence = validateReviewerIndependence(value.independence, `${path}.independence`);
+	const evidence = hasEvidence ? validateReviewerEvidence(value.evidence, `${path}.evidence`) : { diagnostics: [] };
+	const integrity = hasIntegrity ? validateReviewerIntegrity(value.integrity, `${path}.integrity`) : { diagnostics: [] };
+	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics, ...snapshot.diagnostics, ...subjectResult.diagnostics, ...independence.diagnostics, ...evidence.diagnostics, ...integrity.diagnostics];
+	if (typeof value.specificationHash !== "string" || value.specificationHash !== specificationHash(task)) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt specificationHash must match its Task contract.", `${path}.specificationHash`));
+	if (base.kind !== "git") diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt requires the Builder Git integration base in this slice.", path));
+	if (!absolutePathValue(value.assignmentPath) || !absolutePathValue(value.reportPath) || !absolutePathValue(value.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt paths must be absolute.", path));
+	if (dispatch.value && ((value.state === "active" || value.state === "reported") && (dispatch.value.phase !== "prompted" || value.activatedAt !== dispatch.value.promptedAt) || (value.state === "prepared" && dispatch.value.phase === "prompted"))) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt state and dispatch phase disagree.", path));
+	if (value.state === "reported" && evidence.value?.phase !== "finalized") diagnostics.push(diagnostic("invalid-task", "Reported Reviewer Attempts require finalized evidence.", `${path}.evidence`));
+	if (value.state === "reported" && integrity.value?.kind !== "preserved" && integrity.value?.kind !== "violated") diagnostics.push(diagnostic("invalid-task", "Reported Reviewer Attempts require an integrity result.", `${path}.integrity`));
+	if (diagnostics.length > 0 || !model.value || !dispatch.value || !snapshot.value || !subjectResult.value || !independence.value || (hasEvidence && !evidence.value) || (hasIntegrity && !integrity.value) || !isRecord(value.worktree) || typeof value.worktree.path !== "string") return { diagnostics };
+	return { value: { id: value.id as string, role: "reviewer", state: value.state as ReviewerAttemptRecord["state"], preparedAt: value.preparedAt as string, ...(value.state === "active" || value.state === "reported" ? { activatedAt: value.activatedAt as string } : {}), actualModel: model.value, specificationHash: value.specificationHash as string, assignmentPath: value.assignmentPath as string, reportPath: value.reportPath as string, evidenceDirectory: value.evidenceDirectory as string, subject: subjectResult.value, independence: independence.value, worktree: { path: value.worktree.path, baseline: snapshot.value }, dispatch: dispatch.value, ...(integrity.value ? { integrity: integrity.value } : {}), ...(evidence.value ? { evidence: evidence.value } : {}) }, diagnostics: [] };
+}
+
+function validateReviewerIndependence(value: unknown, path: string): { value?: ReviewerIndependence; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.kind !== "string") return { diagnostics: [diagnostic("invalid-task", "Reviewer independence is invalid.", path)] };
+	if (value.kind === "different-provider-family" && exactKeys(value, ["kind", "builderProvider", "reviewerProvider"]) && trimmedString(value.builderProvider) && trimmedString(value.reviewerProvider) && value.builderProvider !== value.reviewerProvider) return { value: { kind: value.kind, builderProvider: value.builderProvider, reviewerProvider: value.reviewerProvider }, diagnostics: [] };
+	if (value.kind === "same-provider-family-approved" && exactKeys(value, ["kind", "provider", "approvedAt", "controllerSessionId"]) && trimmedString(value.provider) && canonicalTimestamp(value.approvedAt) && trimmedString(value.controllerSessionId)) return { value: { kind: value.kind, provider: value.provider, approvedAt: value.approvedAt, controllerSessionId: value.controllerSessionId }, diagnostics: [] };
+	return { diagnostics: [diagnostic("invalid-task", "Reviewer independence has invalid exact fields.", path)] };
+}
+
+function validateReviewSubject(value: unknown, path: string): { value?: ReviewSubject; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.kind !== "string") return { diagnostics: [diagnostic("invalid-task", "Reviewer subject is invalid.", path)] };
+	if (value.kind === "git" && exactKeys(value, ["kind", "baseRevision", "headRevision", "commits", "builderManifestSha256"]) && typeof value.baseRevision === "string" && /^[0-9a-f]{40}$/.test(value.baseRevision) && typeof value.headRevision === "string" && /^[0-9a-f]{40}$/.test(value.headRevision) && Array.isArray(value.commits) && value.commits.length > 0 && value.commits.every((commit) => typeof commit === "string" && /^[0-9a-f]{40}$/.test(commit)) && new Set(value.commits).size === value.commits.length && typeof value.builderManifestSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.builderManifestSha256)) return { value: { kind: "git", baseRevision: value.baseRevision, headRevision: value.headRevision, commits: [...value.commits] as string[], builderManifestSha256: value.builderManifestSha256 }, diagnostics: [] };
+	if (value.kind === "non-git" && exactKeys(value, ["kind", "artifacts", "builderManifestSha256"]) && Array.isArray(value.artifacts) && value.artifacts.length > 0 && typeof value.builderManifestSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.builderManifestSha256)) {
+		const artifacts = value.artifacts;
+		if (artifacts.every((item) => isRecord(item) && exactKeys(item, ["kind", "identity", "size", "sha256", "finalizedPath"]) && (item.kind === "file" || item.kind === "evidence") && trimmedString(item.identity) && typeof item.size === "number" && Number.isSafeInteger(item.size) && item.size >= 0 && typeof item.sha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(item.sha256) && absolutePathValue(item.finalizedPath))) return { value: { kind: "non-git", artifacts: artifacts.map((item) => ({ kind: item.kind as "file" | "evidence", identity: item.identity as string, size: item.size as number, sha256: item.sha256 as string, finalizedPath: item.finalizedPath as string })), builderManifestSha256: value.builderManifestSha256 }, diagnostics: [] };
+	}
+	return { diagnostics: [diagnostic("invalid-task", "Reviewer subject has invalid exact fields.", path)] };
+}
+
+function validateReviewerIntegrity(value: unknown, path: string): { value?: ReviewerAttemptRecord["integrity"]; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.kind !== "string") return { diagnostics: [diagnostic("invalid-task", "Reviewer integrity is invalid.", path)] };
+	if (value.kind === "preserved" && exactKeys(value, ["kind", "after"])) { const after = validateReviewSnapshot(value.after, `${path}.after`); return after.value ? { value: { kind: "preserved", after: after.value }, diagnostics: after.diagnostics } : { diagnostics: after.diagnostics }; }
+	if (value.kind === "violated" && exactKeys(value, ["kind", "detectedAt", "before", "after", "code"]) && canonicalTimestamp(value.detectedAt) && value.code === "reviewer-modified-worktree") { const before = validateReviewSnapshot(value.before, `${path}.before`); const after = validateReviewSnapshot(value.after, `${path}.after`); return before.value && after.value ? { value: { kind: "violated", detectedAt: value.detectedAt, before: before.value, after: after.value, code: value.code }, diagnostics: [...before.diagnostics, ...after.diagnostics] } : { diagnostics: [...before.diagnostics, ...after.diagnostics] }; }
+	return { diagnostics: [diagnostic("invalid-task", "Reviewer integrity has invalid exact fields.", path)] };
+}
+
 function validateAttempt(value: unknown, path: string, task: TaskContract, base: IntegrationBase): { value?: AttemptRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) return { diagnostics: [diagnostic("invalid-task", "Attempt must be an object.", path)] };
 	const hasActivatedAt = Object.prototype.hasOwnProperty.call(value, "activatedAt");
@@ -467,6 +594,18 @@ function cloneDispatch(dispatch: DispatchRecord): DispatchRecord {
 }
 
 function cloneAttempt(attempt: AttemptRecord): AttemptRecord {
+	if (attempt.role === "reviewer") {
+		return {
+			...attempt,
+			actualModel: { ...attempt.actualModel },
+			subject: attempt.subject.kind === "git" ? { ...attempt.subject, commits: [...attempt.subject.commits] } : { ...attempt.subject, artifacts: attempt.subject.artifacts.map((artifact) => ({ ...artifact })) },
+			independence: { ...attempt.independence },
+			worktree: { path: attempt.worktree.path, baseline: { ...attempt.worktree.baseline, dirtyPaths: [...attempt.worktree.baseline.dirtyPaths], operationMarkers: [...attempt.worktree.baseline.operationMarkers] } },
+			dispatch: { ...attempt.dispatch },
+			...(attempt.integrity ? { integrity: attempt.integrity.kind === "preserved" ? { kind: "preserved", after: { ...attempt.integrity.after, dirtyPaths: [...attempt.integrity.after.dirtyPaths], operationMarkers: [...attempt.integrity.after.operationMarkers] } } : { ...attempt.integrity, before: { ...attempt.integrity.before, dirtyPaths: [...attempt.integrity.before.dirtyPaths], operationMarkers: [...attempt.integrity.before.operationMarkers] }, after: { ...attempt.integrity.after, dirtyPaths: [...attempt.integrity.after.dirtyPaths], operationMarkers: [...attempt.integrity.after.operationMarkers] } } } : {}),
+			...(attempt.evidence ? { evidence: { ...attempt.evidence, subject: attempt.evidence.subject.kind === "git" ? { ...attempt.evidence.subject, commits: [...attempt.evidence.subject.commits] } : { ...attempt.evidence.subject, artifacts: attempt.evidence.subject.artifacts.map((artifact) => ({ ...artifact })) } } } : {}),
+		};
+	}
 	return {
 		...attempt,
 		actualModel: { ...attempt.actualModel },
@@ -638,22 +777,35 @@ function validateRunRecord(value: unknown, path: string): { value?: RunRecord; d
 		const taskDiagnostics = [...contractResult.diagnostics];
 		if (task.specificationVersion !== 1) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationVersion must be 1.", `${taskPath}.specificationVersion`));
 		if (typeof task.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(task.specificationHash) || (contractResult.value && specificationHash(contractResult.value) !== task.specificationHash)) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationHash does not match its exact contract.", `${taskPath}.specificationHash`));
-		if ((task.phase !== "pending" && task.phase !== "building") || task.attention !== "none" || !Array.isArray(task.attempts) || task.reworkCycles !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Tasks must be pending or building with no attention or rework cycles.", taskPath));
+		if ((task.phase !== "pending" && task.phase !== "building" && task.phase !== "reviewing") || (task.attention !== "none" && task.attention !== "needs-user") || !Array.isArray(task.attempts) || task.reworkCycles !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Tasks must be pending, building, or reviewing with valid attention and no rework cycles.", taskPath));
 		const attempts: AttemptRecord[] = [];
 		if (Array.isArray(task.attempts)) {
-			if (task.attempts.length > 1) taskDiagnostics.push(diagnostic("invalid-task", "This schema allows at most one Builder Attempt per Task.", `${taskPath}.attempts`));
+			if (task.attempts.length > 2) taskDiagnostics.push(diagnostic("invalid-task", "This schema allows at most one Builder Attempt and one Reviewer Attempt per Task.", `${taskPath}.attempts`));
 			for (let attemptIndex = 0; attemptIndex < task.attempts.length; attemptIndex += 1) {
-				const attemptResult = contractResult.value && base.value ? validateAttempt(task.attempts[attemptIndex], `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value) : { diagnostics: [diagnostic("invalid-task", "Attempt cannot be validated without a valid Task and integration base.", `${taskPath}.attempts[${attemptIndex}]`)] };
+				const rawAttempt = task.attempts[attemptIndex];
+				const attemptResult = contractResult.value && base.value
+					? isRecord(rawAttempt) && rawAttempt.role === "reviewer"
+						? validateReviewerAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value)
+						: validateAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value)
+					: { diagnostics: [diagnostic("invalid-task", "Attempt cannot be validated without a valid Task and integration base.", `${taskPath}.attempts[${attemptIndex}]`)] };
 				if (attemptResult.value) attempts.push(attemptResult.value);
 				taskDiagnostics.push(...attemptResult.diagnostics);
 			}
 		}
 		if (task.phase === "pending" && attempts.length !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Pending Tasks must not have Attempts.", taskPath));
 		if (task.phase === "building" && (attempts.length !== 1 || attempts[0]?.role !== "builder")) taskDiagnostics.push(diagnostic("invalid-task", "Building Tasks require exactly one Builder Attempt.", taskPath));
+		if (task.phase === "reviewing") {
+			const builders = attempts.filter((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder");
+			const reviewers = attempts.filter((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+			if (builders.length !== 1 || builders[0]?.state !== "reported" || builders[0].evidence?.phase !== "finalized" || builders[0].evidence.status !== "completed") taskDiagnostics.push(diagnostic("invalid-task", "Reviewing Tasks require one finalized completed Builder Attempt.", taskPath));
+			if (reviewers.length > 1 || (reviewers.length === 1 && reviewers[0]?.state === "prepared" && task.attention !== "none")) taskDiagnostics.push(diagnostic("invalid-task", "Reviewing Tasks allow at most one valid Reviewer Attempt.", taskPath));
+			if (task.attention === "none" && reviewers.length === 0) taskDiagnostics.push(diagnostic("invalid-task", "A reviewing Task without a Reviewer Attempt must be paused with needs-user attention.", taskPath));
+			if (reviewers.length === 1 && reviewers[0]?.state === "reported" && task.attention !== "none" && reviewers[0].integrity?.kind !== "violated") taskDiagnostics.push(diagnostic("invalid-task", "Reported Reviewer evidence can be attention-paused only for a recorded integrity violation.", taskPath));
+		}
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
 		if (contractResult.value) taskIds.add(contractResult.value.id);
 		if (taskDiagnostics.length > 0 || !contractResult.value || typeof task.specificationHash !== "string") diagnostics.push(...taskDiagnostics);
-		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase === "building" ? "building" : "pending", attention: "none", attempts, reworkCycles: 0 });
+		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase === "building" ? "building" : task.phase === "reviewing" ? "reviewing" : "pending", attention: task.attention as TaskAttention, attempts, reworkCycles: 0 });
 	}
 	const plans = validateProjectModelPlans(value.modelPlan, `${path}.modelPlan`);
 	if (!plans.value || plans.diagnostics.length > 0) diagnostics.push(...plans.diagnostics.map((item: ConfigDiagnostic) => diagnostic("invalid-config", item.message, item.path)));
@@ -710,9 +862,13 @@ export function deserializeRunJournal(content: string, path?: string): { value?:
 	}
 }
 
-function validateAssignment(value: unknown, path = "assignment.json"): { value?: BuilderAssignmentDocument; diagnostics: RunDiagnostic[] } {
+function validateAssignment(value: unknown, path = "assignment.json"): { value?: AssignmentDocument; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || !exactKeys(value, ["schemaVersion", "assignment"]) || value.schemaVersion !== 1 || !isRecord(value.assignment)) return { diagnostics: [diagnostic("invalid-task", "Assignment must contain exactly schemaVersion 1 and assignment.", path)] };
 	const assignment = value.assignment;
+	if (assignment.role === "reviewer") {
+		const reviewer = validateReviewerAssignmentDocument(value, path);
+		return reviewer.value ? { value: reviewer.value, diagnostics: [] } : { diagnostics: reviewer.diagnostics.map((item) => diagnostic("invalid-task", item.message, item.path)) };
+	}
 	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "allowedScope", "expectedArtifacts", "reportPath", "evidenceDirectory", "verification", "actualModel", "specificationHash", "baseRevision", "worktree", "herdr"];
 	if (!exactKeys(assignment, keys)) return { diagnostics: [diagnostic("invalid-task", "Assignment contains unknown or missing keys.", path)] };
 	const diagnostics: RunDiagnostic[] = [];
@@ -759,20 +915,38 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 }
 
 export function decodeBuilderAssignment(value: unknown, path?: string): { value?: BuilderAssignmentDocument; diagnostics: RunDiagnostic[] } {
-	return validateAssignment(value, path);
+	const result = validateAssignment(value, path);
+	return result.value && result.value.assignment.role === "builder" ? { value: result.value as BuilderAssignmentDocument, diagnostics: result.diagnostics } : { diagnostics: result.diagnostics.length > 0 ? result.diagnostics : [diagnostic("invalid-task", "Assignment is not a Builder Assignment.", path)] };
 }
 
 export function serializeBuilderAssignment(document: BuilderAssignmentDocument): string {
-	const validated = validateAssignment(document).value;
+	const validated = decodeBuilderAssignment(document).value;
 	if (!validated) throw new Error("Cannot serialize an invalid Builder Assignment.");
 	return `${JSON.stringify(validated, null, 2)}\n`;
 }
 
 export function deserializeBuilderAssignment(content: string, path?: string): { value?: BuilderAssignmentDocument; diagnostics: RunDiagnostic[] } {
 	try {
-		return validateAssignment(JSON.parse(content) as unknown, path);
+		return decodeBuilderAssignment(JSON.parse(content) as unknown, path);
 	} catch {
 		return { diagnostics: [diagnostic("invalid-task", "Assignment contains malformed JSON.", path)] };
+	}
+}
+
+export function decodeReviewerAssignment(value: unknown, path?: string): { value?: ReviewerAssignmentDocument; diagnostics: RunDiagnostic[] } {
+	const result = validateAssignment(value, path);
+	return result.value && result.value.assignment.role === "reviewer" ? { value: result.value as ReviewerAssignmentDocument, diagnostics: result.diagnostics } : { diagnostics: result.diagnostics.length > 0 ? result.diagnostics : [diagnostic("invalid-task", "Assignment is not a Reviewer Assignment.", path)] };
+}
+
+export function serializeReviewerAssignment(document: ReviewerAssignmentDocument): string {
+	return serializeReviewerAssignmentDocument(document);
+}
+
+export function deserializeReviewerAssignment(content: string, path?: string): { value?: ReviewerAssignmentDocument; diagnostics: RunDiagnostic[] } {
+	try {
+		return decodeReviewerAssignment(JSON.parse(content) as unknown, path);
+	} catch {
+		return { diagnostics: [diagnostic("invalid-task", "Reviewer Assignment contains malformed JSON.", path)] };
 	}
 }
 
@@ -783,7 +957,7 @@ export function builderAssignmentSha256(content: string): string {
 export function buildBuilderAssignment(input: {
 	run: RunRecord;
 	task: TaskRecord;
-	attempt: AttemptRecord;
+	attempt: BuilderAttemptRecord;
 	worktreePath: string;
 	branch: string;
 	workspaceId: string;
@@ -816,7 +990,7 @@ export function buildBuilderAssignment(input: {
 	};
 	const validated = validateAssignment(document);
 	if (!validated.value || validated.diagnostics.length > 0) throw new Error(`Cannot build Builder Assignment: ${validated.diagnostics.map((item) => item.message).join("; ")}`);
-	return validated.value;
+	return validated.value as BuilderAssignmentDocument;
 }
 
 export function formatBuilderPrompt(document: BuilderAssignmentDocument): string {

@@ -27,6 +27,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test:evidence": "vitest run test/evidence.functional.test.ts",
+    "test:review": "vitest run test/review.functional.test.ts",
     "test:git": "vitest run test/git-evidence.contract.test.ts",
     "test:dispatch": "vitest run test/dispatch.functional.test.ts",
     "test:herdr": "vitest run test/herdr-adapter.contract.test.ts",

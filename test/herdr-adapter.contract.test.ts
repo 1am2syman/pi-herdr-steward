@@ -45,6 +45,10 @@ function agentEnvelope(type: "agent_started" | "agent_prompted", name = "steward
 	});
 }
 
+function reviewerPaneEnvelope() {
+	return JSON.stringify({ id: "cli:pane:split", result: { type: "pane_split", pane: { workspace_id: "workspace-1", tab_id: "tab-2", pane_id: "pane-reviewer", terminal_id: "terminal-reviewer", source_pane_id: "pane-1", cwd: "/tmp/builder" } } });
+}
+
 it.sequential("translates worktree create, exact Pi start, and one-argv prompt", async () => {
 	const calls: Array<{ command: string; args: string[]; options?: { cwd?: string; timeout?: number } }> = [];
 	const adapter = createHerdrAdapter(async (command, args, options) => {
@@ -132,4 +136,28 @@ it.sequential("rejects malformed, wrong-type, killed, and contradictory Herdr en
 		ok(value.kind === "failed", item.name);
 		if (value.kind === "failed") equal(value.code, item.expected, item.name);
 	}
+});
+
+it.sequential("translates and rejects the exact Reviewer pane/start/prompt contract", async () => {
+	const calls: Array<{ command: string; args: string[] }> = [];
+	const adapter = createHerdrAdapter(async (command, args) => {
+		calls.push({ command, args });
+		if (args[0] === "pane") return result(reviewerPaneEnvelope());
+		if (args[1] === "start") return result(agentEnvelope("agent_started", "steward-r-abcdef12-01-02", { workspace_id: "workspace-1", tab_id: "tab-2", pane_id: "pane-reviewer", terminal_id: "terminal-reviewer" }));
+		return result(agentEnvelope("agent_prompted", "steward-r-abcdef12-01-02", { workspace_id: "workspace-1", tab_id: "tab-2", pane_id: "pane-reviewer", terminal_id: "terminal-reviewer" }));
+	});
+	const pane = await adapter.createReviewerPane!({ repositoryRoot: "/repo", sourcePaneId: "pane-1", worktreePath: "/tmp/builder", branch: "branch", agentName: "steward-r-abcdef12-01-02", workspaceId: "workspace-1" });
+	deepStrictEqual(pane, { kind: "created", workspaceId: "workspace-1", tabId: "tab-2", paneId: "pane-reviewer", terminalId: "terminal-reviewer", sourcePaneId: "pane-1", worktreePath: "/tmp/builder" });
+	const started = await adapter.startReviewer!({ repositoryRoot: "/repo", name: "steward-r-abcdef12-01-02", paneId: "pane-reviewer", model });
+	deepStrictEqual(started, { kind: "started", name: "steward-r-abcdef12-01-02", agentKind: "pi", workspaceId: "workspace-1", tabId: "tab-2", paneId: "pane-reviewer", terminalId: "terminal-reviewer" });
+	const prompt = await adapter.promptReviewer!({ repositoryRoot: "/repo", name: "steward-r-abcdef12-01-02", assignmentPrompt: "review assignment" });
+	deepStrictEqual(prompt, { kind: "prompted", name: "steward-r-abcdef12-01-02", workspaceId: "workspace-1", tabId: "tab-2", paneId: "pane-reviewer", terminalId: "terminal-reviewer" });
+	deepStrictEqual(calls, [
+		{ command: "herdr", args: ["pane", "split", "--pane", "pane-1", "--direction", "right", "--cwd", "/tmp/builder", "--no-focus"] },
+		{ command: "herdr", args: ["agent", "start", "steward-r-abcdef12-01-02", "--kind", "pi", "--pane", "pane-reviewer", "--timeout", "30000", "--", "--model", model.model, "--thinking", model.thinkingLevel] },
+		{ command: "herdr", args: ["agent", "prompt", "steward-r-abcdef12-01-02", "review assignment"] },
+	]);
+	const rejectedPane = createHerdrAdapter(async () => result(JSON.stringify({ result: { type: "pane_split", pane: { workspace_id: "workspace-2", tab_id: "tab-2", pane_id: "pane-reviewer", terminal_id: "terminal-reviewer", source_pane_id: "pane-1", cwd: "/tmp/builder" } } })));
+	const rejected = await rejectedPane.createReviewerPane!({ repositoryRoot: "/repo", sourcePaneId: "pane-1", worktreePath: "/tmp/builder", branch: "branch", agentName: "steward-r-abcdef12-01-02", workspaceId: "workspace-1" });
+	deepStrictEqual(rejected, { kind: "failed", stage: "pane-split", code: "malformed-response", message: "Herdr returned no valid pane_split envelope." });
 });

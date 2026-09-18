@@ -13,10 +13,13 @@ import {
 } from "./project-state.ts";
 import {
 	deserializeBuilderAssignment,
+	deserializeReviewerAssignment,
 	serializeBuilderAssignment,
-	type BuilderAssignmentDocument,
+	serializeReviewerAssignment,
+	type AssignmentDocument,
 	type RunDiagnostic,
 } from "./run.ts";
+import type { ReviewerAssignmentDocument } from "./review.ts";
 
 export interface AssignmentPaths {
 	attemptDirectory: string;
@@ -76,7 +79,7 @@ async function readExisting(path: string): Promise<{ kind: "missing" } | { kind:
 		if (!info.isFile()) return { kind: "invalid", diagnostics: [diagnostic("Assignment path is not a regular file.", path)] };
 		if ((info.mode & 0o777) !== 0o600) return { kind: "invalid", diagnostics: [diagnostic("Assignment file must be protected with mode 0600.", path)] };
 		const bytes = await readFile(path, "utf8");
-		const decoded = deserializeBuilderAssignment(bytes, path);
+		const decoded = bytes.includes('"role": "reviewer"') ? deserializeReviewerAssignment(bytes, path) : deserializeBuilderAssignment(bytes, path);
 		return decoded.value ? { kind: "invalid", diagnostics: [], bytes } : { kind: "invalid", diagnostics: decoded.diagnostics, bytes };
 	} catch (error: unknown) {
 		if (missing(error)) return { kind: "missing" };
@@ -91,7 +94,7 @@ export function resolveAssignmentPaths(repositoryRoot: string, runId: string, ta
 export function createAssignmentStore(options: { configDirName?: string } = {}) {
 	const configDirName = options.configDirName ?? CONFIG_DIR_NAME;
 
-	async function createAssignment(repositoryRoot: string, document: BuilderAssignmentDocument): Promise<AssignmentCreateResult> {
+	async function createAssignment(repositoryRoot: string, document: AssignmentDocument): Promise<AssignmentCreateResult> {
 		let paths: AssignmentPaths;
 		try {
 			paths = pathsFor(repositoryRoot, document.assignment.runId, document.assignment.taskId, document.assignment.attemptId, configDirName);
@@ -103,7 +106,7 @@ export function createAssignmentStore(options: { configDirName?: string } = {}) 
 		if (document.assignment.reportPath !== expected.reportPath || document.assignment.evidenceDirectory !== expected.evidenceDirectory) return { kind: "conflict", paths, diagnostics: [diagnostic("Assignment evidence paths do not match their deterministic Attempt directory.", paths.assignmentPath)] };
 		let bytes: string;
 		try {
-			bytes = serializeBuilderAssignment(document);
+			bytes = document.assignment.role === "reviewer" ? serializeReviewerAssignment(document as ReviewerAssignmentDocument) : serializeBuilderAssignment(document as Extract<AssignmentDocument, { assignment: { role: "builder" } }>);
 			await ensureProjectStateDirectory(repositoryRoot, configDirName);
 			await ensureAttemptDirectories(paths, resolveProjectStatePaths(repositoryRoot, configDirName).stewardDirectory);
 			const current = await readExisting(paths.assignmentPath);
@@ -114,7 +117,8 @@ export function createAssignmentStore(options: { configDirName?: string } = {}) 
 			const temporaryPath = await createOwnedTemporaryFile(paths.attemptDirectory, "assignment", bytes);
 			try {
 				const reread = await readFile(temporaryPath, "utf8");
-				if (reread !== bytes || !deserializeBuilderAssignment(reread, paths.assignmentPath).value) throw new Error("Validated Assignment bytes changed before commit.");
+				const rereadDecoded = document.assignment.role === "reviewer" ? deserializeReviewerAssignment(reread, paths.assignmentPath) : deserializeBuilderAssignment(reread, paths.assignmentPath);
+				if (reread !== bytes || !rereadDecoded.value) throw new Error("Validated Assignment bytes changed before commit.");
 				try {
 					await link(temporaryPath, paths.assignmentPath);
 				} catch (error: unknown) {

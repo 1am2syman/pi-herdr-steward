@@ -5,7 +5,7 @@ import {
 } from "./config.ts";
 import {
 	specificationHash,
-	type AttemptRecord,
+	type BuilderAttemptRecord,
 	type BuilderAssignmentDocument,
 	type ExpectedArtifact,
 	type TaskContract,
@@ -337,7 +337,7 @@ export function validateBuilderReportAgainstAssignment(input: {
 	assignmentSha256: string;
 	runId: string;
 	task: TaskContract;
-	attempt: AttemptRecord;
+	attempt: BuilderAttemptRecord;
 	baseRevision: string;
 }): { value?: NormalizedBuilderEvidence; diagnostics: ReportDiagnostic[] } {
 	const { report, assignment, task, attempt } = input;

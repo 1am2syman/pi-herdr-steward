@@ -36,6 +36,8 @@ import type {
 	StewardUiAdapter,
 	StewardUiSurface,
 } from "./steward.ts";
+import type { ReviewerChoiceInspection } from "./review.ts";
+import { createHash } from "node:crypto";
 
 const STATUS_KEY = "pi-herdr-steward";
 
@@ -70,8 +72,12 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		resolveAssignmentPaths: runStore.resolveAssignmentPaths,
 		createAssignment: runStore.createAssignment,
 		loadBuilderEvidenceInputs: runStore.loadBuilderEvidenceInputs,
+		loadReviewerEvidenceInputs: runStore.loadReviewerEvidenceInputs,
+		loadFinalizedEvidenceManifest: runStore.loadFinalizedEvidenceManifest,
 		inspectReferencedEvidence: runStore.inspectReferencedEvidence,
+		inspectReferencedReviewerEvidence: runStore.inspectReferencedReviewerEvidence,
 		finalizeBuilderEvidence: runStore.finalizeBuilderEvidence,
+		finalizeReviewerEvidence: runStore.finalizeReviewerEvidence,
 		loadRecoveryDefaults: () => configStore.loadRecoveryDefaults(),
 		loadModelPlans: (repositoryRoot) => configStore.loadModelPlans(repositoryRoot),
 		saveRecoveryDefaults: (recovery) => configStore.saveRecoveryDefaults(recovery),
@@ -117,61 +123,34 @@ export function createPiModelAdapter(
 		return modelRegistry.getAvailable().map((model) => ({ reference: exactReference(model), name: model.name }));
 	}
 
+	async function inspectModelChoice(choice: ModelChoice, role: ModelRole, index: number): Promise<ReviewerChoiceInspection> {
+		const parsed = parseCanonicalModelReference(choice.model);
+		if (!parsed) return { choice: { ...choice }, available: false, diagnostics: [modelDiagnostic("invalid-model", role, index, choice.model, "Model reference is not an exact provider/model-id value.")] };
+		const model = modelRegistry.find(parsed.provider, parsed.modelId);
+		if (!model) return { choice: { ...choice }, available: false, diagnostics: [modelDiagnostic("invalid-model", role, index, choice.model, "Exact model reference was not found in the host registry.")] };
+		let auth: Awaited<ReturnType<HostModelRegistry["getApiKeyAndHeaders"]>>;
+		try { auth = await modelRegistry.getApiKeyAndHeaders(model); } catch (error: unknown) { return { choice: { ...choice }, available: false, diagnostics: [modelDiagnostic("unauthenticated-model", role, index, choice.model, safeErrorText(error))] }; }
+		if (!auth.ok) return { choice: { ...choice }, available: false, diagnostics: [modelDiagnostic("unauthenticated-model", role, index, choice.model, auth.error)] };
+		const availableToSession = exactModelInList(modelRegistry.getAvailable(), choice.model);
+		const scopedToSession = scopedModels.length === 0 || exactModelInScope(scopedModels, choice.model);
+		if (!availableToSession || !scopedToSession) return { choice: { ...choice }, available: false, diagnostics: [modelDiagnostic("unavailable-model", role, index, choice.model, "Model is not available in the current host catalogue or session scope.")] };
+		if (unsupportedThinking(model, choice.thinkingLevel)) return { choice: { ...choice }, available: false, diagnostics: [modelDiagnostic("unsupported-thinking-level", role, index, choice.model, `Thinking level ${choice.thinkingLevel} is not supported by the exact model.`)] };
+		return { choice: { ...choice }, available: true, diagnostics: [] };
+	}
+
 	async function validateModelPlans(modelPlans: ProjectModelPlans): Promise<ConfigDiagnostic[]> {
 		const diagnostics: ConfigDiagnostic[] = [];
-		const available = modelRegistry.getAvailable();
 		for (const role of ["builder", "reviewer"] as const) {
 			const choices = [modelPlans[role].primary, ...modelPlans[role].fallbacks];
 			for (let index = 0; index < choices.length; index += 1) {
-				const choice = choices[index];
-				const parsed = parseCanonicalModelReference(choice.model);
-				if (!parsed) {
-					diagnostics.push(modelDiagnostic("invalid-model", role, index, choice.model, "Model reference is not an exact provider/model-id value."));
-					continue;
-				}
-
-				const model = modelRegistry.find(parsed.provider, parsed.modelId);
-				if (!model) {
-					diagnostics.push(modelDiagnostic("invalid-model", role, index, choice.model, "Exact model reference was not found in the host registry."));
-					continue;
-				}
-
-				let auth: Awaited<ReturnType<HostModelRegistry["getApiKeyAndHeaders"]>>;
-				try {
-					auth = await modelRegistry.getApiKeyAndHeaders(model);
-				} catch (error: unknown) {
-					diagnostics.push(modelDiagnostic("unauthenticated-model", role, index, choice.model, safeErrorText(error)));
-					continue;
-				}
-				if (!auth.ok) {
-					diagnostics.push(modelDiagnostic("unauthenticated-model", role, index, choice.model, auth.error));
-					continue;
-				}
-
-				const availableToSession = exactModelInList(available, choice.model);
-				const scopedToSession = scopedModels.length === 0 || exactModelInScope(scopedModels, choice.model);
-				if (!availableToSession || !scopedToSession) {
-					diagnostics.push(modelDiagnostic("unavailable-model", role, index, choice.model, "Model is not available in the current host catalogue or session scope."));
-					continue;
-				}
-
-				if (unsupportedThinking(model, choice.thinkingLevel)) {
-					diagnostics.push(
-						modelDiagnostic(
-							"unsupported-thinking-level",
-							role,
-							index,
-							choice.model,
-							`Thinking level ${choice.thinkingLevel} is not supported by the exact model.`,
-						),
-					);
-				}
+				const inspection = await inspectModelChoice(choices[index]!, role, index);
+				if (!inspection.available) diagnostics.push(...inspection.diagnostics);
 			}
 		}
 		return diagnostics;
 	}
 
-	return { listModelChoices, validateModelPlans };
+	return { listModelChoices, validateModelPlans, inspectModelChoice };
 }
 
 function getDialogSurface(ui: PiStatusUi & Partial<PiConfigUi>): PiConfigUi {
@@ -496,6 +475,45 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			const error = safeErrorEnvelope(result);
 			return { kind: "failed", stage: "agent-prompt", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid agent_prompted envelope." };
 		},
+		async createReviewerPane(input) {
+			if (!exec) return { kind: "failed", stage: "pane-split", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			let result: ExecResult;
+			try {
+				result = await exec("herdr", ["pane", "split", "--pane", input.sourcePaneId, "--direction", "right", "--cwd", input.worktreePath, "--no-focus"], { cwd: input.repositoryRoot, timeout: 30000 });
+			} catch (error: unknown) {
+				return { kind: "failed", stage: "pane-split", code: "runner-error", message: error instanceof Error ? error.message : "Herdr pane split failed." };
+			}
+			const envelope = safeEnvelope(result);
+			const resultValue = resultObject(envelope);
+			const pane = objectValue(resultValue?.pane);
+			if (resultValue?.type === "pane_split" && pane && safeIdentity(pane.workspace_id) && safeIdentity(pane.tab_id) && safeIdentity(pane.pane_id) && safeIdentity(pane.terminal_id) && pane.workspace_id === input.workspaceId && pane.source_pane_id === input.sourcePaneId && pane.cwd === input.worktreePath) return { kind: "created", workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, sourcePaneId: input.sourcePaneId, worktreePath: input.worktreePath };
+			const error = safeErrorEnvelope(result);
+			return { kind: "failed", stage: "pane-split", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid pane_split envelope." };
+		},
+		async startReviewer(input) {
+			if (!exec) return { kind: "failed", stage: "agent-start", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			let result: ExecResult;
+			try { result = await exec("herdr", ["agent", "start", input.name, "--kind", "pi", "--pane", input.paneId, "--timeout", "30000", "--", "--model", input.model.model, "--thinking", input.model.thinkingLevel], { cwd: input.repositoryRoot, timeout: 30000 }); }
+			catch (error: unknown) { return { kind: "failed", stage: "agent-start", code: "runner-error", message: error instanceof Error ? error.message : "Herdr Reviewer start failed." }; }
+			const collision = safeErrorEnvelope(result);
+			if (collision?.id === "cli:agent:start" && collision.code === "agent_name_taken") return { kind: "name-collision", code: "agent_name_taken", message: collision.message };
+			const value = resultObject(safeEnvelope(result));
+			const agent = objectValue(value?.agent);
+			const identity = identityFields(agent);
+			if (value?.type === "agent_started" && identity && identity.name === input.name && identity.paneId === input.paneId && agent?.agent === "pi" && agent.agent_status === "idle" && agent.interactive_ready === true && exactPiArgv(agent.argv, input.model)) return { kind: "started", agentKind: "pi", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+			return { kind: "failed", stage: "agent-start", code: collision?.code ?? (result.killed ? "killed" : "malformed-response"), message: collision?.message ?? "Herdr returned no valid Reviewer agent_started envelope." };
+		},
+		async promptReviewer(input) {
+			if (!exec) return { kind: "failed", stage: "agent-prompt", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			let result: ExecResult;
+			try { result = await exec("herdr", ["agent", "prompt", input.name, input.assignmentPrompt], { cwd: input.repositoryRoot, timeout: 30000 }); }
+			catch (error: unknown) { return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Herdr Reviewer prompt failed." }; }
+			const value = resultObject(safeEnvelope(result));
+			const identity = identityFields(objectValue(value?.agent));
+			if (value?.type === "agent_prompted" && identity && identity.name === input.name) return { kind: "prompted", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+			const error = safeErrorEnvelope(result);
+			return { kind: "failed", stage: "agent-prompt", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid Reviewer agent_prompted envelope." };
+		},
 	};
 }
 
@@ -555,6 +573,24 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 			} catch (error: unknown) {
 				return { kind: "unavailable", message: error instanceof Error ? error.message : "Builder worktree inspection failed." };
 			}
+		},
+		async inspectReviewWorktree(worktreePath) {
+			try {
+				const head = await execCommand(worktreePath, ["rev-parse", "--verify", "HEAD"]);
+				if (head.code !== 0 || head.killed || !/^[0-9a-f]{40}\n?$/.test(head.stdout)) return { kind: "unavailable", message: "Review worktree HEAD could not be inspected." };
+				const status = await execCommand(worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+				const dirtyPaths = parsePorcelainPaths(status.stdout, status.code, status.killed, status.stderr);
+				if (!dirtyPaths) return { kind: "unavailable", message: "Review worktree dirty-state inspection returned malformed output." };
+				const markerRoot = await operationMarkerRoot(worktreePath);
+				const operationMarkers: string[] = [];
+				for (const marker of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"]) {
+					try { lstatSync(join(markerRoot, marker)); operationMarkers.push(marker); } catch (error: unknown) { if (!isMissing(error)) return { kind: "unavailable", message: `Git operation state could not be inspected (${marker}).` }; }
+				}
+				operationMarkers.sort();
+				const statusBytes = Buffer.from(status.stdout, "utf8");
+				const framing = Buffer.concat([Buffer.from("steward-review-worktree-v1\0", "utf8"), Buffer.from(`${statusBytes.length}\0`, "utf8"), statusBytes, Buffer.from("\0", "utf8"), Buffer.from(operationMarkers.join("\0"), "utf8")]);
+				return { head: head.stdout.trim(), dirtyStateFingerprint: `sha256:${createHash("sha256").update(framing).digest("hex")}`, dirtyPaths, operationMarkers };
+			} catch (error: unknown) { return { kind: "unavailable", message: error instanceof Error ? error.message : "Review worktree inspection failed." }; }
 		},
 		async inspectProducedCodeArtifact(input) {
 			if (!/^[0-9a-f]{40}$/.test(input.approvedBase) || !/^[0-9a-f]{40}$/.test(input.producedHead)) return { kind: "invalid", code: "missing-revision", message: "Git Artifact requires full lowercase base and head revisions." };
@@ -757,12 +793,19 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		ui.notify(result.message, result.kind === "started" || result.kind === "started-and-dispatched" ? "info" : result.kind === "started-with-warning" || result.kind === "started-and-dispatched-with-warning" || result.kind === "started-dispatch-pending" ? "warning" : result.kind === "cancelled" ? "info" : "error");
 	}
 
+	async function confirmSameFamilyReview(input: { builderModel: ModelChoice; reviewerModel: ModelChoice; subject: import("./review.ts").ReviewSubject; provider: string }): Promise<boolean> {
+		const dialogs = getDialogSurface(ui);
+		const subject = input.subject.kind === "git" ? `Git ${input.subject.baseRevision}..${input.subject.headRevision} (${input.subject.commits.length} commit(s))` : `non-Git artifacts: ${input.subject.artifacts.map((artifact) => artifact.identity).join(", ")}`;
+		return dialogs.confirm("Confirm same-provider Review", `Independent provider-family Review is unavailable. Builder: ${input.builderModel.model} [thinking=${input.builderModel.thinkingLevel}]\nReviewer: ${input.reviewerModel.model} [thinking=${input.reviewerModel.thinkingLevel}]\nProvider: ${input.provider}\nSubject: ${subject}\nConfirm this exact Reviewer for this exact subject?`);
+	}
+
 	return {
 		presentStatus,
 		editConfiguration: (input) => editConfiguration(ui, input),
 		presentConfigurationResult,
-		draftRun: (input) => draftRun(ui, input),
+		 draftRun: (input) => draftRun(ui, input),
 		confirmRun: (summary) => ui.confirm!("Confirm Steward Run", summary.markdown),
+		confirmSameFamilyReview,
 		presentStartResult,
 	};
 }

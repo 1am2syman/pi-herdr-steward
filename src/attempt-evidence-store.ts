@@ -23,6 +23,8 @@ export interface BuilderEvidenceInputRequest {
 	assignmentSha256: string;
 }
 
+export type ReviewerEvidenceInputRequest = BuilderEvidenceInputRequest;
+
 export type BuilderEvidenceInputs =
 	| { kind: "report-missing"; paths: EvidencePaths }
 	| {
@@ -35,11 +37,19 @@ export type BuilderEvidenceInputs =
 		}
 	| { kind: "unsafe"; paths: EvidencePaths; code: string; message: string; reportSha256?: string };
 
+export type ReviewerEvidenceInputs = BuilderEvidenceInputs;
+
 export interface ReferencedEvidenceRequest {
 	repositoryRoot: string;
 	paths: EvidencePaths;
 	report: BuilderAttemptReport;
 	worktreePath: string;
+}
+
+export interface ReferencedReviewerEvidenceRequest {
+	repositoryRoot: string;
+	paths: EvidencePaths;
+	logReferences: ReportedLogReference[];
 }
 
 export interface ValidatedEvidenceFile {
@@ -52,6 +62,8 @@ export interface ValidatedEvidenceFile {
 export type ReferencedEvidenceResult =
 	| { kind: "inspected"; files: ValidatedEvidenceFile[] }
 	| { kind: "invalid"; code: string; message: string; files: ValidatedEvidenceFile[] };
+
+export type ReferencedReviewerEvidenceResult = ReferencedEvidenceResult;
 
 export interface FinalizationCopy {
 	relativePath: string;
@@ -73,6 +85,13 @@ export interface FinalizeBuilderEvidenceRequest {
 export type FinalizeBuilderEvidenceResult =
 	| { kind: "created" | "existing-match"; manifestPath: string; manifestSha256: string }
 	| { kind: "conflict" | "storage-error"; message: string };
+
+export type FinalizeReviewerEvidenceRequest = FinalizeBuilderEvidenceRequest;
+export type FinalizeReviewerEvidenceResult = FinalizeBuilderEvidenceResult;
+
+export type FinalizedManifestLoadResult =
+	| { kind: "loaded"; path: string; bytes: Buffer; sha256: string }
+	| { kind: "missing" | "invalid"; path: string; message: string };
 
 function missing(error: unknown): boolean {
 	return error instanceof Error && "code" in error && error.code === "ENOENT";
@@ -180,6 +199,15 @@ export function createAttemptEvidenceStore() {
 		return { kind: "loaded", paths, assignmentBytes: assignment.bytes, reportBytes: report.bytes, assignmentSha256, reportSha256: report.sha256 };
 	}
 
+	async function loadFinalizedEvidenceManifest(input: { manifestPath: string; manifestSha256: string }): Promise<FinalizedManifestLoadResult> {
+		if (!safeAbsolute(input.manifestPath) || !/^sha256:[0-9a-f]{64}$/.test(input.manifestSha256)) return { kind: "invalid", path: input.manifestPath, message: "Finalized manifest path or hash is invalid." };
+		const manifest = await stableFile(input.manifestPath, MAX_EVIDENCE_BYTES, 0o400);
+		if (manifest.kind === "missing") return { kind: "missing", path: input.manifestPath, message: "Finalized Builder manifest is missing." };
+		if (manifest.kind === "invalid") return { kind: "invalid", path: input.manifestPath, message: manifest.message };
+		if (manifest.sha256 !== input.manifestSha256 || !validUtf8(manifest.bytes)) return { kind: "invalid", path: input.manifestPath, message: "Finalized Builder manifest bytes or hash changed." };
+		return { kind: "loaded", path: input.manifestPath, bytes: manifest.bytes, sha256: manifest.sha256 };
+	}
+
 	async function inspectReferencedEvidence(input: ReferencedEvidenceRequest): Promise<ReferencedEvidenceResult> {
 		const files: ValidatedEvidenceFile[] = [];
 		const errors: string[] = [];
@@ -205,6 +233,20 @@ export function createAttemptEvidenceStore() {
 			if (result.file) {
 				files.push(result.file);
 				if (result.file.size !== log.size || result.file.sha256 !== log.sha256) errors.push(`Log size or SHA-256 does not match the report: ${log.path}`);
+			} else if (result.message) errors.push(result.message);
+		}
+		return errors.length > 0 ? { kind: "invalid", code: errors.some((error) => error.includes("Unsafe")) ? "unsafe-path" : errors.some((error) => error.includes("missing")) ? "missing-evidence" : "hash-mismatch", message: errors.join(" ").slice(0, 4_000), files } : { kind: "inspected", files };
+	}
+
+	async function inspectReferencedReviewerEvidence(input: ReferencedReviewerEvidenceRequest): Promise<ReferencedReviewerEvidenceResult> {
+		const files: ValidatedEvidenceFile[] = [];
+		const errors: string[] = [];
+		if (!(await validateNoSymlinkRoot(input.paths.evidenceDirectory))) errors.push(`Reviewer evidence directory is not a real directory: ${input.paths.evidenceDirectory}`);
+		for (const log of input.logReferences) {
+			const result = await inspectOne(log.path, input.paths.evidenceDirectory, MAX_LOG_BYTES);
+			if (result.file) {
+				files.push(result.file);
+				if (result.file.size !== log.size || result.file.sha256 !== log.sha256) errors.push(`Reviewer log size or SHA-256 does not match the report: ${log.path}`);
 			} else if (result.message) errors.push(result.message);
 		}
 		return errors.length > 0 ? { kind: "invalid", code: errors.some((error) => error.includes("Unsafe")) ? "unsafe-path" : errors.some((error) => error.includes("missing")) ? "missing-evidence" : "hash-mismatch", message: errors.join(" ").slice(0, 4_000), files } : { kind: "inspected", files };
@@ -242,7 +284,15 @@ export function createAttemptEvidenceStore() {
 		}
 	}
 
-	return { loadBuilderEvidenceInputs, inspectReferencedEvidence, finalizeBuilderEvidence };
+	return {
+		loadBuilderEvidenceInputs,
+		loadFinalizedEvidenceManifest,
+		loadReviewerEvidenceInputs: loadBuilderEvidenceInputs,
+		inspectReferencedEvidence,
+		inspectReferencedReviewerEvidence,
+		finalizeBuilderEvidence,
+		finalizeReviewerEvidence: finalizeBuilderEvidence,
+	};
 }
 
 async function writeCopy(path: string, bytes: Buffer): Promise<void> {

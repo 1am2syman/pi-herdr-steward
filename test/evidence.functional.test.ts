@@ -168,7 +168,7 @@ async function invokeStatus(root: string, dependencies: StewardDependencies, ses
 
 const cleanGit: ProducedCodeArtifactInspection = { kind: "inspected", base: baseRevision, head: headRevision, commits, changedPaths: [{ status: "M", paths: ["src/change.ts"] }], clean: true };
 
-it.sequential("registered status finalizes valid Builder evidence and remains before Review", async () => {
+it.sequential("registered status finalizes valid Builder evidence and keeps Review dispatch pending when Reviewer adapters are absent", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-evidence-"));
 	roots.push(root);
 	const statusResult: { value?: StatusView } = {};
@@ -179,7 +179,7 @@ it.sequential("registered status finalizes valid Builder evidence and remains be
 	equal(existsSync(join(attempt.assignmentPath, "..", "finalized")), false);
 	const beforeRevision = (await dependencies.runJournal.loadActive(root)).kind === "loaded" ? ((await dependencies.runJournal.loadActive(root)) as { kind: "loaded"; journal: RunJournal }).journal.journalRevision : 0;
 	const view = await invokeStatus(root, dependencies);
-	match(view.markdown, /Review: required but not started by ticket 05\./);
+	match(view.markdown, /Review dispatch pending\./);
 	const accepted = await dependencies.runJournal.loadActive(root);
 	if (accepted.kind !== "loaded") throw new Error("accepted Journal missing");
 	const acceptedAttempt = accepted.journal.run.tasks[0]!.attempts[0]!;
