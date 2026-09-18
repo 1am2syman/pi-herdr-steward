@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { deepStrictEqual, equal, match, ok } from "node:assert/strict";
 import { afterEach, it } from "vitest";
 
@@ -9,9 +9,9 @@ import { createRunJournalAdapter } from "../src/adapters.ts";
 import { createSteward } from "../src/steward.ts";
 import { registerStewardExtension, type StewardCommandContext, type StewardCommandHandler, type StewardRegistrationSurface } from "../src/extension.ts";
 import { serializeBuilderAttemptReport, type BuilderAttemptReport } from "../src/attempt-report.ts";
-import { buildReviewerAssignment, deserializeReviewerAssignment, serializeReviewerAttemptReport } from "../src/review.ts";
+import { buildReviewerAssignment, deserializeReviewerAssignment, reviewerAssignmentSha256, serializeReviewerAssignment, serializeReviewerAttemptReport, type ReviewerAttemptReport } from "../src/review.ts";
 import { builderAssignmentSha256, specificationHash, type ReviewerAttemptRecord, type RunDraft, type RunJournal, type TaskContract } from "../src/run.ts";
-import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
+import type { ModelChoice, ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 import type { StewardDependencies, StewardUiAdapter, StatusView } from "../src/steward.ts";
 
 const roots: string[] = [];
@@ -25,9 +25,15 @@ afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { rec
 
 function digest(bytes: Buffer): string { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
 
-function draft(): RunDraft {
+type ReviewHooks = {
+	onPane?: (journal: RunJournal, input: { sourcePaneId: string; worktreePath: string; agentName: string; workspaceId: string }) => Promise<void>;
+	onStart?: (journal: RunJournal, input: { name: string; paneId: string; model: ModelChoice }) => Promise<void>;
+	onPrompt?: (journal: RunJournal, input: { name: string; assignmentPrompt: string; assignmentBytes: string }) => Promise<void>;
+};
+
+function draft(builderPrimaryModel = "builder/builder"): RunDraft {
 	const modelPlan: ProjectModelPlans = {
-		builder: { primary: { model: "builder/builder", thinkingLevel: "high" }, fallbacks: [] },
+		builder: { primary: { model: builderPrimaryModel, thinkingLevel: "high" }, fallbacks: [] },
 		reviewer: { primary: { model: "builder/reviewer", thinkingLevel: "high" }, fallbacks: [{ model: "other/unavailable", thinkingLevel: "medium" }, { model: "other/reviewer", thinkingLevel: "medium" }] },
 	};
 	return { declaredOutcome: "Build and independently review", tasks: [{ requiredOutcome: "Implement the change", allowedScope: ["src"], expectedArtifacts: [{ kind: "git-commit" }, { kind: "file", path: "src/change.ts" }], verification: { kind: "command", command: "npm test" }, reviewRequired: true }], modelPlan, effectiveSettings: recovery, finalVerification: { kind: "command", command: "npm test" } };
@@ -51,8 +57,25 @@ async function invoke(root: string, dependencies: StewardDependencies, command: 
 	return view;
 }
 
-function makeDependencies(root: string, options: { snapshots?: Array<{ head: string; dirtyStateFingerprint: string; dirtyPaths: string[]; operationMarkers: string[] }>; confirmSameFamily?: boolean; sameFamilyOnly?: boolean; noReviewerModels?: boolean; inspectionCalls?: string[]; confirmationCalls?: number[] } = {}): StewardDependencies {
-	const runJournal = createRunJournalAdapter();
+function makeDependencies(root: string, options: { snapshots?: Array<{ head: string; dirtyStateFingerprint: string; dirtyPaths: string[]; operationMarkers: string[] }>; confirmSameFamily?: boolean; sameFamilyOnly?: boolean; noReviewerModels?: boolean; inspectionCalls?: string[]; confirmationCalls?: number[]; builderPrimaryModel?: string; builderActualModel?: ModelChoice; reviewFailure?: "pane" | "agent" | "prompt"; reviewHooks?: ReviewHooks } = {}): StewardDependencies {
+	const productionRunJournal = createRunJournalAdapter();
+	let builderActualModelStarted = false;
+	const runJournal: StewardDependencies["runJournal"] = {
+		...productionRunJournal,
+		async replaceActive(repositoryRoot, journal) {
+			if (builderActualModelStarted && options.builderActualModel) {
+				const builder = journal.run.tasks[0]?.attempts[0];
+				if (builder?.role === "builder") builder.actualModel = { ...options.builderActualModel };
+			}
+			return productionRunJournal.replaceActive(repositoryRoot, journal);
+		},
+		async createAssignment(repositoryRoot, document) {
+			if (builderActualModelStarted && options.builderActualModel && document.assignment.role === "builder") {
+				return productionRunJournal.createAssignment(repositoryRoot, { ...document, assignment: { ...document.assignment, actualModel: { ...options.builderActualModel } } });
+			}
+			return productionRunJournal.createAssignment(repositoryRoot, document);
+		},
+	};
 	let uuid = 0;
 	let snapshotIndex = 0;
 	const builderPath = join(root, "builder-worktree");
@@ -61,7 +84,7 @@ function makeDependencies(root: string, options: { snapshots?: Array<{ head: str
 		presentStatus() {},
 		async editConfiguration() { return { kind: "cancelled" }; },
 		presentConfigurationResult() {},
-		async draftRun() { return { kind: "drafted" as const, draft: draft() }; },
+		async draftRun() { return { kind: "drafted" as const, draft: draft(options.builderPrimaryModel) }; },
 		async confirmRun() { return true; },
 		async confirmSameFamilyReview() { if (options.confirmationCalls) options.confirmationCalls[0] = (options.confirmationCalls[0] ?? 0) + 1; return options.confirmSameFamily ?? false; },
 		presentStartResult() {},
@@ -71,11 +94,32 @@ function makeDependencies(root: string, options: { snapshots?: Array<{ head: str
 		herdr: {
 			async checkAvailability() { return { kind: "available", status: "running", running: true, compatible: true, endpointCompatible: true }; },
 			async createBuilderWorktree(input) { return { kind: "created", branch: input.branch, path: builderPath, workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
-			async startBuilder() { const active = await runJournal.loadActive(root); if (active.kind !== "loaded") throw new Error("missing journal"); const attempt = active.journal.run.tasks[0]!.attempts[0]!; return { kind: "started", name: attempt.role === "builder" ? attempt.dispatch.agentName : "builder", agentKind: "pi", workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
+			async startBuilder() { const active = await runJournal.loadActive(root); if (active.kind !== "loaded") throw new Error("missing journal"); const attempt = active.journal.run.tasks[0]!.attempts[0]!; builderActualModelStarted = Boolean(options.builderActualModel); return { kind: "started", name: attempt.role === "builder" ? attempt.dispatch.agentName : "builder", agentKind: "pi", workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
 			async promptBuilder(input) { return { kind: "prompted", name: input.name, workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
-			async createReviewerPane(input) { return { kind: "created", workspaceId: input.workspaceId, tabId: "tab-2", paneId: "reviewer-pane", terminalId: "reviewer-terminal", sourcePaneId: input.sourcePaneId, worktreePath: input.worktreePath }; },
-			async startReviewer(input) { return { kind: "started", name: input.name, agentKind: "pi", workspaceId: "workspace-1", tabId: "tab-2", paneId: "reviewer-pane", terminalId: "reviewer-terminal" }; },
-			async promptReviewer(input) { return { kind: "prompted", name: input.name, workspaceId: "workspace-1", tabId: "tab-2", paneId: "reviewer-pane", terminalId: "reviewer-terminal" }; },
+			async createReviewerPane(input) {
+				const active = await runJournal.loadActive(root);
+				if (active.kind !== "loaded") throw new Error("missing Journal before Reviewer pane split");
+				await options.reviewHooks?.onPane?.(active.journal, input);
+				if (options.reviewFailure === "pane") return { kind: "failed", stage: "pane-split", code: "pane-split-failed", message: "Reviewer pane split failed" };
+				return { kind: "created", workspaceId: input.workspaceId, tabId: "tab-2", paneId: "reviewer-pane", terminalId: "reviewer-terminal", sourcePaneId: input.sourcePaneId, worktreePath: input.worktreePath };
+			},
+			async startReviewer(input) {
+				const active = await runJournal.loadActive(root);
+				if (active.kind !== "loaded") throw new Error("missing Journal before Reviewer start");
+				await options.reviewHooks?.onStart?.(active.journal, input);
+				if (options.reviewFailure === "agent") return { kind: "failed", stage: "agent-start", code: "provider-start-failed", message: "Reviewer provider failed to start" };
+				return { kind: "started", name: input.name, agentKind: "pi", workspaceId: "workspace-1", tabId: "tab-2", paneId: "reviewer-pane", terminalId: "reviewer-terminal" };
+			},
+			async promptReviewer(input) {
+				const active = await runJournal.loadActive(root);
+				if (active.kind !== "loaded") throw new Error("missing Journal before Reviewer prompt");
+				const reviewer = active.journal.run.tasks[0]!.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+				if (!reviewer) throw new Error("missing Reviewer before prompt");
+				const assignmentBytes = await readFile(reviewer.assignmentPath, "utf8");
+				await options.reviewHooks?.onPrompt?.(active.journal, { ...input, assignmentBytes });
+				if (options.reviewFailure === "prompt") return { kind: "failed", stage: "agent-prompt", code: "prompt-failed", message: "Reviewer prompt failed" };
+				return { kind: "prompted", name: input.name, workspaceId: "workspace-1", tabId: "tab-2", paneId: "reviewer-pane", terminalId: "reviewer-terminal" };
+			},
 		},
 		git: {
 			async inspectIntegrationBase() { return { kind: "ready", branch: "main", revision: baseRevision }; },
@@ -122,20 +166,94 @@ async function writeBuilderReport(root: string, journal: RunJournal): Promise<vo
 
 function builderPathFor(root: string): string { return join(root, "builder-worktree"); }
 
-async function writeReviewerReport(journal: RunJournal): Promise<void> {
+async function writeReviewerReport(journal: RunJournal, verdict: ReviewerAttemptReport["verdict"] = "approved"): Promise<void> {
 	const task = journal.run.tasks[0]!;
 	const reviewer = task.attempts.find((attempt) => attempt.role === "reviewer");
 	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing");
 	const assignment = deserializeReviewerAssignment(await readFile(reviewer.assignmentPath, "utf8"));
 	if (!assignment.value) throw new Error("Reviewer assignment invalid");
-	await writeFile(reviewer.reportPath, serializeReviewerAttemptReport({ schemaVersion: 1, identity: { runId: journal.run.id, taskId: task.contract.id, attemptId: reviewer.id, role: "reviewer", specificationHash: reviewer.specificationHash, assignmentSha256: digest(Buffer.from(await readFile(reviewer.assignmentPath, "utf8"))) }, status: "completed", summary: "Review completed.", blockers: [], actualModel: reviewer.actualModel, reviewedSubject: assignment.value.assignment.subject, verdict: "approved", findings: [], checks: [], logReferences: [] }));
+	await writeFile(reviewer.reportPath, serializeReviewerAttemptReport({ schemaVersion: 1, identity: { runId: journal.run.id, taskId: task.contract.id, attemptId: reviewer.id, role: "reviewer", specificationHash: reviewer.specificationHash, assignmentSha256: digest(Buffer.from(await readFile(reviewer.assignmentPath, "utf8"))) }, status: "completed", summary: "Review completed.", blockers: [], actualModel: reviewer.actualModel, reviewedSubject: assignment.value.assignment.subject, verdict, findings: verdict === "changes-required" ? [{ id: "finding-1", severity: "major", summary: "The changed behavior needs correction.", detail: "Correct the changed behavior before relying on the result." }] : [], checks: [], logReferences: [] }));
+}
+
+function assertReviewerFacts(journal: RunJournal): ReviewerAttemptRecord {
+	const task = journal.run.tasks[0]!;
+	const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	if (!reviewer) throw new Error("Reviewer missing at effect hook");
+	equal(reviewer.id, "attempt-02");
+	equal(reviewer.subject.kind, "git");
+	if (reviewer.subject.kind !== "git") throw new Error("Git subject missing at effect hook");
+	deepStrictEqual([reviewer.subject.baseRevision, reviewer.subject.headRevision, reviewer.subject.commits], [baseRevision, headRevision, commits]);
+	deepStrictEqual(reviewer.worktree.baseline, { head: headRevision, dirtyStateFingerprint: fingerprint, dirtyPaths: [], operationMarkers: [] });
+	deepStrictEqual(reviewer.independence, { kind: "different-provider-family", builderProvider: "builder", reviewerProvider: "other" });
+	ok(reviewer.assignmentPath.endsWith("/assignment.json"));
+	ok(reviewer.reportPath.endsWith("/report.md"));
+	ok(reviewer.evidenceDirectory.endsWith("/evidence"));
+	return reviewer;
+}
+
+function throwOnNonDispatchReads(dependencies: StewardDependencies, calls: string[]): void {
+	dependencies.process = new Proxy({}, { get(_target, property) { calls.push(`process.${String(property)}`); throw new Error("process lifecycle must not be consulted"); } });
+	const reviewerDispatchProperties = new Set(["createReviewerPane", "startReviewer", "promptReviewer"]);
+	dependencies.herdr = new Proxy(dependencies.herdr, {
+		get(target, property, receiver) {
+			if (typeof property === "string" && !reviewerDispatchProperties.has(property)) {
+				calls.push(`herdr.${property}`);
+				throw new Error("Herdr lifecycle must not be consulted");
+			}
+			return Reflect.get(target, property, receiver);
+		},
+	}) as StewardDependencies["herdr"];
 }
 
 it.sequential("registered status selects the first available independent Reviewer and finalizes an explicit report", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-"));
 	roots.push(root);
-	const dependencies = makeDependencies(root);
+	const inspections: string[] = [];
+	let promptText = "";
+	const dependencies = makeDependencies(root, {
+		builderPrimaryModel: "planned/builder",
+		builderActualModel: { model: "builder/fallback", thinkingLevel: "medium" },
+		inspectionCalls: inspections,
+		reviewHooks: {
+			async onPane(journal, input) {
+				const task = journal.run.tasks[0]!;
+				const reviewer = assertReviewerFacts(journal);
+				equal(task.phase, "reviewing");
+				equal(reviewer.state, "prepared");
+				equal(reviewer.dispatch.phase, "pane-intended");
+				equal(reviewer.dispatch.sourcePaneId, input.sourcePaneId);
+				equal(reviewer.dispatch.worktreePath, input.worktreePath);
+			},
+			async onStart(journal, input) {
+				const reviewer = assertReviewerFacts(journal);
+				equal(reviewer.state, "prepared");
+				equal(reviewer.dispatch.phase, "agent-intended");
+				equal(reviewer.dispatch.workspaceId, "workspace-1");
+				equal(reviewer.dispatch.paneId, input.paneId);
+				equal(reviewer.actualModel.model, "other/reviewer");
+			},
+			async onPrompt(journal, input) {
+				const reviewer = assertReviewerFacts(journal);
+				equal(reviewer.state, "prepared");
+				equal(reviewer.dispatch.phase, "prompt-intended");
+				if (reviewer.dispatch.phase !== "prompt-intended") throw new Error("Reviewer prompt intent missing");
+				const decoded = deserializeReviewerAssignment(input.assignmentBytes);
+				if (!decoded.value) throw new Error("Reviewer Assignment did not decode at prompt hook");
+				equal(serializeReviewerAssignment(decoded.value), input.assignmentBytes);
+				equal(reviewer.dispatch.assignmentSha256, reviewerAssignmentSha256(input.assignmentBytes));
+				equal(decoded.value.assignment.attemptId, "attempt-02");
+				equal(decoded.value.assignment.subject.kind, "git");
+				if (decoded.value.assignment.subject.kind !== "git") throw new Error("Assignment Git subject missing");
+				deepStrictEqual([decoded.value.assignment.subject.baseRevision, decoded.value.assignment.subject.headRevision, decoded.value.assignment.subject.commits], [baseRevision, headRevision, commits]);
+				deepStrictEqual(decoded.value.assignment.worktree.baseline, reviewer.worktree.baseline);
+				promptText = input.assignmentPrompt;
+			},
+		},
+	});
 	const journal = await startRun(root, dependencies);
+	equal(journal.run.modelPlan.builder.primary.model, "planned/builder");
+	equal(journal.run.tasks[0]!.attempts[0]!.role, "builder");
+	equal(journal.run.tasks[0]!.attempts[0]!.actualModel.model, "builder/fallback");
 	await writeBuilderReport(root, journal);
 	const dispatchedView = await invoke(root, dependencies, "status");
 	match(dispatchedView?.markdown ?? "", /Reviewer Attempt attempt-02: active/);
@@ -143,9 +261,15 @@ it.sequential("registered status selects the first available independent Reviewe
 	if (afterDispatch.kind !== "loaded") throw new Error("missing dispatched journal");
 	const dispatchedReviewer = afterDispatch.journal.run.tasks[0]!.attempts.find((attempt) => attempt.role === "reviewer");
 	if (!dispatchedReviewer || dispatchedReviewer.role !== "reviewer") throw new Error("Reviewer was not dispatched");
+	deepStrictEqual(inspections, ["builder/reviewer", "other/unavailable", "other/reviewer"]);
 	equal(dispatchedReviewer.actualModel.model, "other/reviewer");
 	equal(dispatchedReviewer.dispatch.phase, "prompted");
+	deepStrictEqual(dispatchedReviewer.independence, { kind: "different-provider-family", builderProvider: "builder", reviewerProvider: "other" });
 	match(await readFile(dispatchedReviewer.assignmentPath, "utf8"), /"builderManifestSha256"/);
+	match(promptText, /Treat the worktree as read-only: do not edit, commit, reset, stash, clean, revert, or delete files\./);
+	match(promptText, new RegExp(`Write the Reviewer Attempt Report to ${dispatchedReviewer.reportPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`));
+	match(promptText, /verdict approved or changes-required only/);
+	match(promptText, /lifecycle state is not a verdict/);
 	await writeReviewerReport(afterDispatch.journal);
 	const finalizedView = await invoke(root, dependencies, "status");
 	match(finalizedView?.markdown ?? "", /Reviewer verdict recorded: approved/);
@@ -158,25 +282,167 @@ it.sequential("registered status selects the first available independent Reviewe
 	equal(reviewer.evidence?.phase, "finalized");
 }, 60_000);
 
-it.sequential("registered status preserves a read-only violation and never accepts the report", async () => {
+it.sequential.each([
+	{ label: "dirty fingerprint", changed: { head: headRevision, dirtyStateFingerprint: "sha256:" + "b".repeat(64), dirtyPaths: ["src/change.ts"], operationMarkers: [] } },
+	{ label: "changed HEAD", changed: { head: "3333333333333333333333333333333333333333", dirtyStateFingerprint: fingerprint, dirtyPaths: [], operationMarkers: [] } },
+])("registered status preserves a $label read-only violation and never accepts the report", async ({ changed }) => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-violation-"));
 	roots.push(root);
-	const dependencies = makeDependencies(root, { snapshots: [{ head: headRevision, dirtyStateFingerprint: fingerprint, dirtyPaths: [], operationMarkers: [] }, { head: headRevision, dirtyStateFingerprint: "sha256:" + "b".repeat(64), dirtyPaths: ["src/change.ts"], operationMarkers: [] }] });
+	const baseline = { head: headRevision, dirtyStateFingerprint: fingerprint, dirtyPaths: [], operationMarkers: [] };
+	const dependencies = makeDependencies(root, { snapshots: [baseline, changed] });
 	const journal = await startRun(root, dependencies);
 	await writeBuilderReport(root, journal);
 	await invoke(root, dependencies, "status");
 	const dispatched = await dependencies.runJournal.loadActive(root);
 	if (dispatched.kind !== "loaded") throw new Error("missing dispatched journal");
+	const dispatchedReviewer = dispatched.journal.run.tasks[0]!.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	if (!dispatchedReviewer) throw new Error("Reviewer missing before violation");
 	await writeReviewerReport(dispatched.journal);
+	const acceptedReportBytes = await readFile(dispatchedReviewer.reportPath, "utf8");
+	const sourcePath = join(builderPathFor(root), "src", "change.ts");
+	const sourceBytes = await readFile(sourcePath, "utf8");
 	const view = await invoke(root, dependencies, "status");
 	match(view?.markdown ?? "", /read-only violation/);
 	const violated = await dependencies.runJournal.loadActive(root);
 	if (violated.kind !== "loaded") throw new Error("missing violated journal");
 	const reviewer = violated.journal.run.tasks[0]!.attempts.find((attempt) => attempt.role === "reviewer");
 	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing");
+	const task = violated.journal.run.tasks[0]!;
+	equal(task.phase, "reviewing");
 	equal(violated.journal.run.tasks[0]!.attention, "needs-user");
+	equal(reviewer.state, "active");
+	equal(reviewer.dispatch.phase, "prompted");
 	equal(reviewer.integrity?.kind, "violated");
+	deepStrictEqual(reviewer.integrity?.before, baseline);
+	deepStrictEqual(reviewer.integrity?.after, changed);
 	equal(reviewer.evidence, undefined);
+	equal(await readFile(dispatchedReviewer.reportPath, "utf8"), acceptedReportBytes);
+	equal(await readFile(sourcePath, "utf8"), sourceBytes);
+}, 60_000);
+
+it.sequential.each([
+	{ verdict: "approved" as const, hasFinding: false },
+	{ verdict: "changes-required" as const, hasFinding: true },
+])("registered status finalizes $verdict while Task stays reviewing", async ({ verdict, hasFinding }) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-changes-required-"));
+	roots.push(root);
+	const dependencies = makeDependencies(root);
+	const journal = await startRun(root, dependencies);
+	await writeBuilderReport(root, journal);
+	await invoke(root, dependencies, "status");
+	const dispatched = await dependencies.runJournal.loadActive(root);
+	if (dispatched.kind !== "loaded") throw new Error("missing dispatched journal");
+	await writeReviewerReport(dispatched.journal, verdict);
+	const view = await invoke(root, dependencies, "status");
+	match(view?.markdown ?? "", /Reviewer evidence finalized/);
+	const finalized = await dependencies.runJournal.loadActive(root);
+	if (finalized.kind !== "loaded") throw new Error("missing finalized journal");
+	const task = finalized.journal.run.tasks[0]!;
+	const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing after changes-required finalization");
+	equal(task.phase, "reviewing");
+	equal(task.attention, "none");
+	equal(reviewer.state, "reported");
+	equal(reviewer.evidence?.phase, "finalized");
+	if (!reviewer.evidence || reviewer.evidence.phase !== "finalized") throw new Error("Reviewer evidence was not finalized");
+	equal(reviewer.evidence.verdict, verdict);
+	const manifest = JSON.parse(await readFile(reviewer.evidence.manifestPath, "utf8")) as { verdict: string; findings: unknown[] };
+	equal(manifest.verdict, verdict);
+	equal(manifest.findings.length > 0, hasFinding);
+}, 60_000);
+
+it.sequential("registered status invalidates a finalized Reviewer verdict after a later worktree change and remains idempotent", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-late-violation-"));
+	roots.push(root);
+	const changed = { head: headRevision, dirtyStateFingerprint: "sha256:" + "c".repeat(64), dirtyPaths: ["src/late-change.ts"], operationMarkers: [] };
+	const baseline = { head: headRevision, dirtyStateFingerprint: fingerprint, dirtyPaths: [], operationMarkers: [] };
+	const dependencies = makeDependencies(root, { snapshots: [baseline, baseline, baseline, changed] });
+	const journal = await startRun(root, dependencies);
+	await writeBuilderReport(root, journal);
+	await invoke(root, dependencies, "status");
+	const dispatched = await dependencies.runJournal.loadActive(root);
+	if (dispatched.kind !== "loaded") throw new Error("missing dispatched journal");
+	await writeReviewerReport(dispatched.journal, "approved");
+	await invoke(root, dependencies, "status");
+	const accepted = await dependencies.runJournal.loadActive(root);
+	if (accepted.kind !== "loaded") throw new Error("missing accepted journal");
+	const acceptedReviewer = accepted.journal.run.tasks[0]!.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	if (!acceptedReviewer || acceptedReviewer.role !== "reviewer" || !acceptedReviewer.evidence || acceptedReviewer.evidence.phase !== "finalized") throw new Error("Reviewer was not finalized");
+	const evidenceBefore = JSON.parse(JSON.stringify(acceptedReviewer.evidence)) as typeof acceptedReviewer.evidence;
+	const manifestPath = acceptedReviewer.evidence.manifestPath;
+	const finalizedDirectory = dirname(manifestPath);
+	const finalizedReportPath = join(finalizedDirectory, "report.md");
+	const manifestBytes = await readFile(manifestPath);
+	const finalizedReportBytes = await readFile(finalizedReportPath);
+	const lateView = await invoke(root, dependencies, "status");
+	match(lateView?.markdown ?? "", /no verdict was accepted|no verdict is eligible/);
+	const violated = await dependencies.runJournal.loadActive(root);
+	if (violated.kind !== "loaded") throw new Error("missing violated journal");
+	const task = violated.journal.run.tasks[0]!;
+	const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing after late violation");
+	equal(task.phase, "reviewing");
+	equal(task.attention, "needs-user");
+	equal(reviewer.state, "reported");
+	equal(reviewer.integrity?.kind, "violated");
+	deepStrictEqual(reviewer.evidence, evidenceBefore);
+	equal(reviewer.evidence?.manifestPath, manifestPath);
+	equal(dirname(reviewer.evidence?.manifestPath ?? ""), finalizedDirectory);
+	deepStrictEqual(await readFile(manifestPath), manifestBytes);
+	deepStrictEqual(await readFile(finalizedReportPath), finalizedReportBytes);
+	const revision = violated.journal.journalRevision;
+	const repeatedView = await invoke(root, dependencies, "status");
+	match(repeatedView?.markdown ?? "", /no verdict was accepted|no verdict is eligible/);
+	const repeated = await dependencies.runJournal.loadActive(root);
+	if (repeated.kind !== "loaded") throw new Error("missing repeated violated journal");
+	equal(repeated.journal.journalRevision, revision);
+	const repeatedReviewer = repeated.journal.run.tasks[0]!.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	if (!repeatedReviewer || repeatedReviewer.role !== "reviewer") throw new Error("Reviewer missing after repeated status");
+	deepStrictEqual(repeatedReviewer.evidence, evidenceBefore);
+}, 60_000);
+
+it.sequential("registered status retains the last durable Reviewer phase for every non-verdict failure", async () => {
+	type FailureCase = { name: string; failure?: "pane" | "agent" | "prompt"; phase: "pane-intended" | "agent-intended" | "prompt-intended" | "prompted"; state: "prepared" | "active"; report: "missing" | "malformed" | "none" };
+	const lifecycleStates = ["process exit", "silence", "idle", "done", "blocked", "unknown", "disappearance"];
+	const cases: FailureCase[] = [
+		{ name: "pane split failure", failure: "pane", phase: "pane-intended", state: "prepared", report: "none" },
+		{ name: "agent-start provider failure", failure: "agent", phase: "agent-intended", state: "prepared", report: "none" },
+		{ name: "prompt failure", failure: "prompt", phase: "prompt-intended", state: "prepared", report: "none" },
+		...lifecycleStates.map((state) => ({ name: `missing report after active Attempt (${state})`, phase: "prompted" as const, state: "active" as const, report: "missing" as const })),
+		{ name: "malformed report", phase: "prompted", state: "active", report: "malformed" },
+	];
+	for (const testCase of cases) {
+		const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-failure-"));
+		roots.push(root);
+		const dependencies = makeDependencies(root, { reviewFailure: testCase.failure });
+		const journal = await startRun(root, dependencies);
+		await writeBuilderReport(root, journal);
+		const forbiddenReads: string[] = [];
+		throwOnNonDispatchReads(dependencies, forbiddenReads);
+		let view = await invoke(root, dependencies, "status");
+		if (testCase.report === "missing" || testCase.report === "malformed") {
+			const dispatched = await dependencies.runJournal.loadActive(root);
+			if (dispatched.kind !== "loaded") throw new Error(`${testCase.name}: missing dispatched Journal`);
+			if (testCase.report === "malformed") {
+				const reviewer = dispatched.journal.run.tasks[0]!.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+				if (!reviewer) throw new Error(`${testCase.name}: missing Reviewer`);
+				await writeFile(reviewer.reportPath, "---\n{\"malformed\":true}\n---\n");
+			}
+			view = await invoke(root, dependencies, "status");
+			if (testCase.report === "missing") match(view?.markdown ?? "", /Herdr lifecycle is not a verdict/);
+		}
+		const loaded = await dependencies.runJournal.loadActive(root);
+		if (loaded.kind !== "loaded") throw new Error(`${testCase.name}: missing final Journal`);
+		const task = loaded.journal.run.tasks[0]!;
+		const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+		if (!reviewer) throw new Error(`${testCase.name}: Reviewer Attempt was not durable`);
+		equal(task.phase, "reviewing");
+		equal(reviewer.dispatch.phase, testCase.phase);
+		equal(reviewer.state, testCase.state);
+		equal(reviewer.evidence, undefined);
+		ok(!((view?.markdown ?? "").includes("Reviewer verdict recorded")));
+		equal(forbiddenReads.length, 0, `${testCase.name} consulted process or non-dispatch Herdr lifecycle`);
+	}
 }, 60_000);
 
 it.sequential("same-family Review pauses durably until exact Controller confirmation", async () => {
@@ -255,4 +521,4 @@ it.sequential("production Assignment storage preserves an ordered non-Git Review
 	deepStrictEqual(decoded.value.assignment.subject, subject);
 	const existing = await runJournal.createAssignment(root, assignment);
 	equal(existing.kind, "existing-match");
-});
+}, 60_000);
