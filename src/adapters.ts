@@ -69,6 +69,9 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		appendActivity: runStore.appendActivity,
 		resolveAssignmentPaths: runStore.resolveAssignmentPaths,
 		createAssignment: runStore.createAssignment,
+		loadBuilderEvidenceInputs: runStore.loadBuilderEvidenceInputs,
+		inspectReferencedEvidence: runStore.inspectReferencedEvidence,
+		finalizeBuilderEvidence: runStore.finalizeBuilderEvidence,
 		loadRecoveryDefaults: () => configStore.loadRecoveryDefaults(),
 		loadModelPlans: (repositoryRoot) => configStore.loadModelPlans(repositoryRoot),
 		saveRecoveryDefaults: (recovery) => configStore.saveRecoveryDefaults(recovery),
@@ -496,7 +499,7 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 	};
 }
 
-function createGitAdapter(exec: CommandRunner | undefined): StewardGitAdapter {
+export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAdapter {
 	function isMissing(error: unknown): boolean {
 		return error instanceof Error && "code" in error && error.code === "ENOENT";
 	}
@@ -553,7 +556,98 @@ function createGitAdapter(exec: CommandRunner | undefined): StewardGitAdapter {
 				return { kind: "unavailable", message: error instanceof Error ? error.message : "Builder worktree inspection failed." };
 			}
 		},
+		async inspectProducedCodeArtifact(input) {
+			if (!/^[0-9a-f]{40}$/.test(input.approvedBase) || !/^[0-9a-f]{40}$/.test(input.producedHead)) return { kind: "invalid", code: "missing-revision", message: "Git Artifact requires full lowercase base and head revisions." };
+			try {
+				const base = await execCommand(input.worktreePath, ["rev-parse", "--verify", `${input.approvedBase}^{commit}`]);
+				const head = await execCommand(input.worktreePath, ["rev-parse", "--verify", `${input.producedHead}^{commit}`]);
+				if (base.code !== 0 || head.code !== 0 || base.killed || head.killed || !/^[0-9a-f]{40}\n?$/.test(base.stdout) || !/^[0-9a-f]{40}\n?$/.test(head.stdout)) return { kind: "invalid", code: "missing-revision", message: "Git base or produced head is not a resolvable full revision." };
+				const ancestor = await execCommand(input.worktreePath, ["merge-base", "--is-ancestor", input.approvedBase, input.producedHead]);
+				if (ancestor.code !== 0 || ancestor.killed) return { kind: "invalid", code: "base-not-ancestor", message: "Approved Git base is not an ancestor of the produced head." };
+				const currentHead = await execCommand(input.worktreePath, ["rev-parse", "--verify", "HEAD"]);
+				if (currentHead.code !== 0 || currentHead.killed || currentHead.stdout.trim() !== input.producedHead) return { kind: "invalid", code: "head-mismatch", message: "Builder worktree HEAD does not equal the reported produced head." };
+				const commitsResult = await execCommand(input.worktreePath, ["rev-list", "--reverse", `${input.approvedBase}..${input.producedHead}`]);
+				if (commitsResult.code !== 0 || commitsResult.killed || commitsResult.stderr.length > 0) return { kind: "invalid", code: "git-inspection-failed", message: "Git commit range could not be inspected." };
+				const commits = commitsResult.stdout.endsWith("\n") ? commitsResult.stdout.slice(0, -1).split("\n") : commitsResult.stdout.length === 0 ? [] : commitsResult.stdout.split("\n");
+				if (commits.length === 0) return { kind: "invalid", code: "empty-range", message: "Produced Git Artifact has an empty base..head range." };
+				if (commits.some((commit) => !/^[0-9a-f]{40}$/.test(commit)) || new Set(commits).size !== commits.length || commits[commits.length - 1] !== input.producedHead) return { kind: "invalid", code: "malformed-git-output", message: "Git returned a malformed or contradictory full commit range." };
+				const changesResult = await execCommand(input.worktreePath, ["diff", "--name-status", "-z", "--find-renames", "--find-copies", input.approvedBase, input.producedHead]);
+				const changedPaths = parseNameStatus(changesResult.stdout, changesResult.code, changesResult.killed, changesResult.stderr);
+				if (!changedPaths) return { kind: "invalid", code: "malformed-git-output", message: "Git returned malformed name-status output." };
+				const markerRoot = await operationMarkerRoot(input.worktreePath);
+				for (const marker of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"]) {
+					try {
+						await lstatSync(join(markerRoot, marker));
+						return { kind: "invalid", code: "git-operation-in-progress", message: `Git operation is in progress (${marker}).` };
+					} catch (error: unknown) {
+						if (!isMissing(error)) return { kind: "invalid", code: "git-inspection-failed", message: `Git operation state could not be inspected (${marker}).` };
+					}
+				}
+				const dirtyResult = await execCommand(input.worktreePath, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+				const dirtyPaths = parsePorcelainPaths(dirtyResult.stdout, dirtyResult.code, dirtyResult.killed, dirtyResult.stderr);
+				if (!dirtyPaths) return { kind: "invalid", code: "git-inspection-failed", message: "Git dirty-state inspection failed." };
+				if (dirtyPaths.length > 0) return { kind: "invalid", code: "dirty-worktree", message: "Builder worktree contains tracked, staged, or untracked changes.", dirtyPaths };
+				return { kind: "inspected", base: input.approvedBase, head: input.producedHead, commits, changedPaths, clean: true };
+			} catch (error: unknown) {
+				return { kind: "invalid", code: "git-inspection-failed", message: error instanceof Error ? error.message : "Git Artifact inspection failed." };
+			}
+		},
 	};
+
+	async function execCommand(cwd: string, args: string[]): Promise<ExecResult> {
+		if (!exec) throw new Error("The Pi command runner is unavailable.");
+		return exec("git", args, { cwd, timeout: 5000 });
+	}
+
+	async function operationMarkerRoot(cwd: string): Promise<string> {
+		const result = await execCommand(cwd, ["rev-parse", "--git-dir"]);
+		if (result.code !== 0 || result.killed || result.stderr.length > 0 || result.stdout.trim() === "") throw new Error("Git metadata could not be located.");
+		return resolve(cwd, result.stdout.trim());
+	}
+}
+
+function validGitPath(path: string): boolean {
+	if (path.length === 0 || path.includes("\\") || path.startsWith("/") || path.includes("\u0000")) return false;
+	const parts = path.split("/");
+	return parts.every((part) => part.length > 0 && part !== "." && part !== "..");
+}
+
+function parseNameStatus(stdout: string, code: number, killed: boolean, stderr: string): Array<{ status: string; paths: string[] }> | undefined {
+	if (code !== 0 || killed || stderr.length > 0 || (stdout.length > 0 && !stdout.endsWith("\u0000"))) return undefined;
+	if (stdout.length === 0) return [];
+	const values = stdout.slice(0, -1).split("\u0000");
+	const changes: Array<{ status: string; paths: string[] }> = [];
+	for (let index = 0; index < values.length;) {
+		const status = values[index++];
+		if (!status || !/^[A-Z][0-9]{0,3}$/.test(status)) return undefined;
+		const count = status[0] === "R" || status[0] === "C" ? 2 : 1;
+		const paths = values.slice(index, index + count);
+		if (paths.length !== count || paths.some((path) => !validGitPath(path))) return undefined;
+		index += count;
+		changes.push({ status, paths });
+	}
+	return changes;
+}
+
+function parsePorcelainPaths(stdout: string, code: number, killed: boolean, stderr: string): string[] | undefined {
+	if (code !== 0 || killed || stderr.length > 0 || (stdout.length > 0 && !stdout.endsWith("\u0000"))) return undefined;
+	if (stdout.length === 0) return [];
+	const values = stdout.slice(0, -1).split("\u0000");
+	const paths: string[] = [];
+	for (let index = 0; index < values.length;) {
+		const entry = values[index++];
+		if (!entry || entry.length < 4 || entry[2] !== " ") return undefined;
+		const status = entry.slice(0, 2);
+		if (!/^[ MADRCU?!]{2}$/.test(status)) return undefined;
+		if (!validGitPath(entry.slice(3))) return undefined;
+		paths.push(entry.slice(3));
+		if (status[0] === "R" || status[0] === "C") {
+			const next = values[index++];
+			if (!next || !validGitPath(next)) return undefined;
+			paths.push(next);
+		}
+	}
+	return paths;
 }
 
 function createClockAdapter(): StewardClockAdapter {

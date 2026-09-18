@@ -1,0 +1,67 @@
+
+> pi-herdr-steward@0.1.0 test
+> vitest run --maxWorkers=1
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+ ❯ test/evidence.functional.test.ts (4 tests | 4 failed) 20228ms
+   × registered status finalizes valid Builder evidence and remains before Review 5018ms
+   × registered status rejects assignment, report, scope, and dirty evidence without partial acceptance 5007ms
+   × blocked Builder evidence is finalized and retained without Review eligibility 5004ms
+   × footer and non-controller status stay read-only 5196ms
+
+⎯⎯⎯⎯⎯⎯⎯ Failed Tests 4 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  test/evidence.functional.test.ts > registered status finalizes valid Builder evidence and remains before Review
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/evidence.functional.test.ts:171:4
+    169| const cleanGit: ProducedCodeArtifactInspection = { kind: "inspected", …
+    170|
+    171| it.sequential("registered status finalizes valid Builder evidence and …
+       |    ^
+    172|  const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-evidence-…
+    173|  roots.push(root);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/4]⎯
+
+ FAIL  test/evidence.functional.test.ts > registered status rejects assignment, report, scope, and dirty evidence without partial acceptance
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/evidence.functional.test.ts:201:4
+
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[2/4]⎯
+
+ FAIL  test/evidence.functional.test.ts > blocked Builder evidence is finalized and retained without Review eligibility
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/evidence.functional.test.ts:237:4
+    235| let rootForCurrent = "";
+    236|
+    237| it.sequential("blocked Builder evidence is finalized and retained with…
+       |    ^
+    238|  const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-blocked-"…
+    239|  roots.push(root);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[3/4]⎯
+
+ FAIL  test/evidence.functional.test.ts > footer and non-controller status stay read-only
+Error: Test timed out in 5000ms.
+If this is a long-running test, pass a timeout value as the last argument or configure it globally with "testTimeout".
+ ❯ test/evidence.functional.test.ts:253:4
+    251| });
+    252|
+    253| it.sequential("footer and non-controller status stay read-only", async…
+       |    ^
+    254|  const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-authority…
+    255|  roots.push(root);
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[4/4]⎯
+
+
+ Test Files  1 failed | 7 passed (8)
+      Tests  4 failed | 32 passed (36)
+   Start at  00:30:03
+   Duration  41.44s (transform 530ms, setup 0ms, import 11.94s, tests 27.57s, environment 2ms)

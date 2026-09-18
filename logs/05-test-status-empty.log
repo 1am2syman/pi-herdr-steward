@@ -1,0 +1,8 @@
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  1 passed (1)
+   Start at  00:29:49
+   Duration  1.98s (transform 351ms, setup 0ms, import 1.71s, tests 33ms, environment 0ms)

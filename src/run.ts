@@ -74,7 +74,7 @@ export type DispatchRecord =
 export interface AttemptRecord {
 	id: string;
 	role: "builder";
-	state: "prepared" | "active";
+	state: "prepared" | "active" | "reported";
 	preparedAt: string;
 	activatedAt?: string;
 	actualModel: ModelChoice;
@@ -84,6 +84,85 @@ export interface AttemptRecord {
 	reportPath: string;
 	evidenceDirectory: string;
 	dispatch: DispatchRecord;
+	evidence?: BuilderEvidenceRecord;
+}
+
+export type EvidenceRejectionCode =
+	| "assignment-changed"
+	| "report-or-evidence-invalid"
+	| "scope-violation"
+	| "dirty-worktree"
+	| "missing-assignment"
+	| "assignment-hash-mismatch"
+	| "assignment-invalid"
+	| "report-invalid"
+	| "report-identity-mismatch"
+	| "report-model-mismatch"
+	| "report-specification-mismatch"
+	| "report-check-mismatch"
+	| "report-artifact-mismatch"
+	| "missing-evidence"
+	| "unsafe-path"
+	| "size-mismatch"
+	| "hash-mismatch"
+	| "commit-range-mismatch"
+	| "finalization-conflict"
+	| "storage-error";
+
+export type BuilderEvidenceRecord =
+	| {
+			phase: "rejected";
+			checkedAt: string;
+			reportSha256?: string;
+			codes: EvidenceRejectionCode[];
+			summary: string;
+	  }
+	| {
+			phase: "finalization-intended";
+			checkedAt: string;
+			reportSha256: string;
+			manifestPath: string;
+			manifestSha256: string;
+	  }
+	| {
+			phase: "finalized";
+			finalizedAt: string;
+			status: "completed" | "blocked" | "failed";
+			reportSha256: string;
+			manifestPath: string;
+			manifestSha256: string;
+			producedRevision: string | null;
+	  };
+
+export type FinalizedCheckFact =
+	| { kind: "command"; command: string; exitCode: number; summary: string; logId: string }
+	| { kind: "criteria"; criteria: string; result: "met" | "not-met"; summary: string; logId: string };
+
+export interface FinalizedArtifactFact {
+	kind: ExpectedArtifact["kind"];
+	identity: string;
+	originalPath: string | null;
+	evidencePath: string | null;
+	finalizedPath: string | null;
+	size: number | null;
+	sha256: string | null;
+}
+
+export interface FinalizedEvidenceManifest {
+	schemaVersion: 1;
+	identity: { runId: string; taskId: string; attemptId: string; role: "builder" };
+	status: "completed" | "blocked" | "failed";
+	summary: string;
+	blockers: string[];
+	actualModel: ModelChoice;
+	specificationHash: string;
+	assignmentSha256: string;
+	report: { originalPath: string; finalizedPath: string; size: number; sha256: string };
+	checks: FinalizedCheckFact[];
+	logs: Array<{ id: string; originalPath: string; finalizedPath: string; size: number; sha256: string }>;
+	artifacts: FinalizedArtifactFact[];
+	producedRevision: string | null;
+	code?: { approvedBase: string; producedHead: string; commits: string[]; changedPaths: Array<{ status: string; paths: string[] }> };
 }
 
 export interface BuilderAssignmentDocument {
@@ -245,8 +324,8 @@ function canonicalTimestamp(value: unknown): value is string {
 }
 
 function pathValue(value: unknown): value is string {
-	if (!trimmedString(value) || isAbsolute(value) || /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\")) return false;
-	const segments = value.split(/[\\/]/);
+	if (!trimmedString(value) || isAbsolute(value) || value.includes("\\") || /^[A-Za-z]:[\\/]/.test(value)) return false;
+	const segments = value.split("/");
 	return segments.every((segment) => segment.length > 0 && segment !== ".." && segment !== ".");
 }
 
@@ -286,30 +365,34 @@ function validateDispatch(value: unknown, path: string): { value?: DispatchRecor
 
 function validateAttempt(value: unknown, path: string, task: TaskContract, base: IntegrationBase): { value?: AttemptRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) return { diagnostics: [diagnostic("invalid-task", "Attempt must be an object.", path)] };
-	const keys = Object.prototype.hasOwnProperty.call(value, "activatedAt")
-		? ["id", "role", "state", "preparedAt", "activatedAt", "actualModel", "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch"]
-		: ["id", "role", "state", "preparedAt", "actualModel", "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch"];
-	if (!exactKeys(value, keys) || !safeIdentifier(value.id) || value.role !== "builder" || (value.state !== "prepared" && value.state !== "active") || !canonicalTimestamp(value.preparedAt) || (value.state === "active" && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && Object.prototype.hasOwnProperty.call(value, "activatedAt"))) {
+	const hasActivatedAt = Object.prototype.hasOwnProperty.call(value, "activatedAt");
+	const hasEvidence = Object.prototype.hasOwnProperty.call(value, "evidence");
+	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch", ...(hasEvidence ? ["evidence"] : [])];
+	if (!exactKeys(value, keys) || !safeIdentifier(value.id) || value.role !== "builder" || (value.state !== "prepared" && value.state !== "active" && value.state !== "reported") || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && hasActivatedAt) || (value.state === "prepared" && hasEvidence) || (value.state === "active" && !hasActivatedAt) || (value.state === "reported" && !hasEvidence)) {
 		return { diagnostics: [diagnostic("invalid-task", "Attempt has invalid lifecycle fields.", path)] };
 	}
 	const model = modelChoiceValue(value.actualModel, `${path}.actualModel`);
 	const dispatch = validateDispatch(value.dispatch, `${path}.dispatch`);
-	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics];
+	const evidence = hasEvidence ? validateEvidenceRecord(value.evidence, `${path}.evidence`) : { diagnostics: [] };
+	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics, ...evidence.diagnostics];
 	if (typeof value.specificationHash !== "string" || value.specificationHash !== specificationHash(task)) diagnostics.push(diagnostic("invalid-task", "Attempt specificationHash must match its Task contract.", `${path}.specificationHash`));
 	if (typeof value.baseRevision !== "string" || base.kind !== "git" || value.baseRevision !== base.revision) diagnostics.push(diagnostic("invalid-task", "Attempt baseRevision must match the Run integration base.", `${path}.baseRevision`));
 	if (!absolutePathValue(value.assignmentPath) || !absolutePathValue(value.reportPath) || !absolutePathValue(value.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Attempt evidence paths must be absolute and safe.", path));
 	if (dispatch.value) {
-		if (value.state === "active" && (dispatch.value.phase !== "prompted" || value.activatedAt !== dispatch.value.promptedAt)) diagnostics.push(diagnostic("invalid-task", "Active Attempts require a prompted dispatch and matching activation timestamp.", path));
+		if ((value.state === "active" || value.state === "reported") && (dispatch.value.phase !== "prompted" || value.activatedAt !== dispatch.value.promptedAt)) diagnostics.push(diagnostic("invalid-task", "Active or reported Attempts require a prompted dispatch and matching activation timestamp.", path));
 		if (value.state === "prepared" && dispatch.value.phase === "prompted") diagnostics.push(diagnostic("invalid-task", "Prepared Attempts cannot have a prompted dispatch.", path));
 	}
-	if (diagnostics.length > 0 || !model.value || !dispatch.value || typeof value.id !== "string" || typeof value.preparedAt !== "string" || typeof value.specificationHash !== "string" || typeof value.baseRevision !== "string" || typeof value.assignmentPath !== "string" || typeof value.reportPath !== "string" || typeof value.evidenceDirectory !== "string") return { diagnostics };
+	if (value.state === "reported" && evidence.value?.phase !== "finalized") diagnostics.push(diagnostic("invalid-task", "Reported Attempts require finalized Builder evidence.", `${path}.evidence`));
+	if (value.state === "active" && evidence.value?.phase === "finalized") diagnostics.push(diagnostic("invalid-task", "Active Attempts cannot contain finalized Builder evidence.", `${path}.evidence`));
+	if (evidence.value?.phase === "finalized" && evidence.value.status === "completed" && task.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") && evidence.value.producedRevision === null) diagnostics.push(diagnostic("invalid-task", "Completed code-changing Attempts require a produced revision in finalized evidence.", `${path}.evidence.producedRevision`));
+	if (diagnostics.length > 0 || !model.value || !dispatch.value || (hasEvidence && !evidence.value) || typeof value.id !== "string" || typeof value.preparedAt !== "string" || typeof value.specificationHash !== "string" || typeof value.baseRevision !== "string" || typeof value.assignmentPath !== "string" || typeof value.reportPath !== "string" || typeof value.evidenceDirectory !== "string") return { diagnostics };
 	return {
 		value: {
 			id: value.id,
 			role: "builder",
 			state: value.state,
 			preparedAt: value.preparedAt,
-			...(value.state === "active" ? { activatedAt: value.activatedAt as string } : {}),
+			...(value.state === "active" || value.state === "reported" ? { activatedAt: value.activatedAt as string } : {}),
 			actualModel: model.value,
 			specificationHash: value.specificationHash,
 			baseRevision: value.baseRevision,
@@ -317,9 +400,33 @@ function validateAttempt(value: unknown, path: string, task: TaskContract, base:
 			reportPath: value.reportPath,
 			evidenceDirectory: value.evidenceDirectory,
 			dispatch: dispatch.value,
+			...(evidence.value ? { evidence: evidence.value } : {}),
 		},
 		diagnostics: [],
 	};
+}
+
+function validateEvidenceRecord(value: unknown, path: string): { value?: BuilderEvidenceRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Builder evidence must be a recognized phase record.", path)] };
+	if (value.phase === "rejected") {
+		const hasReportHash = Object.prototype.hasOwnProperty.call(value, "reportSha256");
+		const keys = hasReportHash ? ["phase", "checkedAt", "reportSha256", "codes", "summary"] : ["phase", "checkedAt", "codes", "summary"];
+		if (!exactKeys(value, keys) || !canonicalTimestamp(value.checkedAt) || (hasReportHash && (typeof value.reportSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reportSha256))) || !Array.isArray(value.codes) || value.codes.length === 0 || value.codes.length > 32 || value.codes.some((code) => typeof code !== "string" || !safeIdentifier(code)) || new Set(value.codes).size !== value.codes.length || !boundedText(value.summary, 2000)) return { diagnostics: [diagnostic("invalid-task", "Rejected Builder evidence has invalid bounded fields.", path)] };
+		return { value: { phase: "rejected", checkedAt: value.checkedAt, ...(hasReportHash ? { reportSha256: value.reportSha256 as string } : {}), codes: [...value.codes] as EvidenceRejectionCode[], summary: value.summary }, diagnostics: [] };
+	}
+	if (value.phase === "finalization-intended") {
+		if (!exactKeys(value, ["phase", "checkedAt", "reportSha256", "manifestPath", "manifestSha256"]) || !canonicalTimestamp(value.checkedAt) || typeof value.reportSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reportSha256) || !absolutePathValue(value.manifestPath) || typeof value.manifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.manifestSha256)) return { diagnostics: [diagnostic("invalid-task", "Finalization intent has invalid paths, hashes, or timestamp.", path)] };
+		return { value: { phase: "finalization-intended", checkedAt: value.checkedAt, reportSha256: value.reportSha256, manifestPath: value.manifestPath, manifestSha256: value.manifestSha256 }, diagnostics: [] };
+	}
+	if (value.phase === "finalized") {
+		if (!exactKeys(value, ["phase", "finalizedAt", "status", "reportSha256", "manifestPath", "manifestSha256", "producedRevision"]) || !canonicalTimestamp(value.finalizedAt) || (value.status !== "completed" && value.status !== "blocked" && value.status !== "failed") || typeof value.reportSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reportSha256) || !absolutePathValue(value.manifestPath) || typeof value.manifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.manifestSha256) || (value.producedRevision !== null && (typeof value.producedRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.producedRevision)))) return { diagnostics: [diagnostic("invalid-task", "Finalized Builder evidence has invalid paths, hashes, status, or revision.", path)] };
+		return { value: { phase: "finalized", finalizedAt: value.finalizedAt, status: value.status, reportSha256: value.reportSha256, manifestPath: value.manifestPath, manifestSha256: value.manifestSha256, producedRevision: value.producedRevision }, diagnostics: [] };
+	}
+	return { diagnostics: [diagnostic("invalid-task", "Unknown Builder evidence phase.", path)] };
+}
+
+function boundedText(value: unknown, maximumBytes: number): value is string {
+	return trimmedString(value) && Buffer.byteLength(value, "utf8") <= maximumBytes;
 }
 
 function herdrName(value: unknown): value is string {
@@ -364,7 +471,14 @@ function cloneAttempt(attempt: AttemptRecord): AttemptRecord {
 		...attempt,
 		actualModel: { ...attempt.actualModel },
 		dispatch: cloneDispatch(attempt.dispatch),
+		...(attempt.evidence ? { evidence: cloneEvidence(attempt.evidence) } : {}),
 	};
+}
+
+function cloneEvidence(evidence: BuilderEvidenceRecord): BuilderEvidenceRecord {
+	return evidence.phase === "rejected"
+		? { ...evidence, codes: [...evidence.codes] }
+		: { ...evidence };
 }
 
 function canonicalContract(contract: TaskContract): TaskContract {
@@ -377,6 +491,14 @@ export function serializeTaskContract(contract: TaskContract): string {
 
 export function specificationHash(contract: TaskContract): string {
 	return `sha256:${createHash("sha256").update(serializeTaskContract(contract), "utf8").digest("hex")}`;
+}
+
+export function serializeFinalizedEvidenceManifest(manifest: FinalizedEvidenceManifest): string {
+	return `${JSON.stringify(manifest, null, 2)}\n`;
+}
+
+export function finalizedEvidenceManifestSha256(manifest: FinalizedEvidenceManifest): string {
+	return `sha256:${createHash("sha256").update(serializeFinalizedEvidenceManifest(manifest), "utf8").digest("hex")}`;
 }
 
 function validateVerification(value: unknown, path: string, requiresWaiver: boolean): { value?: Verification; diagnostics: RunDiagnostic[] } {

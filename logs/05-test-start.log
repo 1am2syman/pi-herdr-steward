@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test:start
+> vitest run test/start.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  10 passed (10)
+   Start at  00:28:57
+   Duration  2.38s (transform 354ms, setup 0ms, import 1.67s, tests 488ms, environment 0ms)

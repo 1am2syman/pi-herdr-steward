@@ -1,0 +1,81 @@
+
+> pi-herdr-steward@0.1.0 typecheck
+> tsc --noEmit -p tsconfig.json
+
+
+> pi-herdr-steward@0.1.0 test:evidence
+> vitest run test/evidence.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  4 passed (4)
+   Start at  01:00:37
+   Duration  33.88s (transform 397ms, setup 0ms, import 1.89s, tests 31.75s, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test:git
+> vitest run test/git-evidence.contract.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  2 passed (2)
+   Start at  01:01:11
+   Duration  2.32s (transform 284ms, setup 0ms, import 1.81s, tests 290ms, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test:dispatch
+> vitest run test/dispatch.functional.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  5 passed (5)
+   Start at  01:01:15
+   Duration  4.97s (transform 421ms, setup 0ms, import 1.88s, tests 2.87s, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test:herdr
+> vitest run test/herdr-adapter.contract.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  3 passed (3)
+   Start at  01:01:20
+   Duration  2.00s (transform 271ms, setup 0ms, import 1.76s, tests 11ms, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test:storage
+> vitest run test/run-journal.storage.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  7 passed (7)
+   Start at  01:01:23
+   Duration  2.80s (transform 221ms, setup 0ms, import 1.64s, tests 930ms, environment 0ms)
+
+
+> pi-herdr-steward@0.1.0 test
+> vitest run --maxWorkers=1
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  8 passed (8)
+      Tests  36 passed (36)
+   Start at  01:01:27
+   Duration  22.58s (transform 514ms, setup 0ms, import 12.27s, tests 8.48s, environment 2ms)

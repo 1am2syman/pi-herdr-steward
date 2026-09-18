@@ -24,6 +24,9 @@ import {
 	buildBuilderAssignment,
 	builderAssignmentSha256,
 	formatBuilderPrompt,
+	deserializeBuilderAssignment,
+	serializeFinalizedEvidenceManifest,
+	finalizedEvidenceManifestSha256,
 	validateRunJournal,
 	validateRunDraft,
 	type IntegrationBase,
@@ -36,7 +39,21 @@ import {
 	type BuilderAssignmentDocument,
 	type DispatchRecord,
 	type TaskRecord,
+	type BuilderEvidenceRecord,
 } from "./run.ts";
+import { join, resolve } from "node:path";
+import {
+	changedPathsInAllowedScope,
+	parseBuilderAttemptReport,
+	validateBuilderReportAgainstAssignment,
+	validateReportedGitFacts,
+	type BuilderAttemptReport,
+} from "./attempt-report.ts";
+import {
+	finalizationCopyForArtifact,
+	finalizationCopyForLog,
+	type EvidencePaths,
+} from "./attempt-evidence-store.ts";
 
 /** The two presentation contexts supported by this slice. */
 export type StatusTarget = "command" | "footer";
@@ -53,6 +70,9 @@ export interface RunJournalAdapter {
 	appendActivity(repositoryRoot: string, entry: import("./run.ts").ActivityEntry): Promise<ActivityAppendResult>;
 	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
 	createAssignment(repositoryRoot: string, document: BuilderAssignmentDocument): Promise<AssignmentCreateResult>;
+	loadBuilderEvidenceInputs?(input: import("./attempt-evidence-store.ts").BuilderEvidenceInputRequest): Promise<import("./attempt-evidence-store.ts").BuilderEvidenceInputs>;
+	inspectReferencedEvidence?(input: import("./attempt-evidence-store.ts").ReferencedEvidenceRequest): Promise<import("./attempt-evidence-store.ts").ReferencedEvidenceResult>;
+	finalizeBuilderEvidence?(input: import("./attempt-evidence-store.ts").FinalizeBuilderEvidenceRequest): Promise<import("./attempt-evidence-store.ts").FinalizeBuilderEvidenceResult>;
 	loadRecoveryDefaults(): Promise<ConfigLoadResult<RecoveryDefaults>>;
 	loadModelPlans(repositoryRoot: string): Promise<ConfigLoadResult<ProjectModelPlans>>;
 	saveRecoveryDefaults(recovery: RecoveryDefaults): Promise<ConfigSaveResult>;
@@ -133,6 +153,7 @@ export interface StewardGitAdapter {
 	inspectIntegrationBase(repositoryRoot: string): Promise<IntegrationBaseInspection>;
 	branchExists?(repositoryRoot: string, branch: string): Promise<boolean>;
 	inspectBuilderWorktree?(worktreePath: string, expectedRevision: string): Promise<BuilderWorktreeInspection>;
+	inspectProducedCodeArtifact?(input: { worktreePath: string; approvedBase: string; producedHead: string }): Promise<ProducedCodeArtifactInspection>;
 }
 
 export type IntegrationBaseInspection =
@@ -142,6 +163,10 @@ export type IntegrationBaseInspection =
 export type BuilderWorktreeInspection =
 	| { kind: "ready"; head: string; clean: true }
 	| { kind: "unavailable"; message: string };
+
+export type ProducedCodeArtifactInspection =
+	| { kind: "inspected"; base: string; head: string; commits: string[]; changedPaths: Array<{ status: string; paths: string[] }>; clean: true }
+	| { kind: "invalid"; code: "missing-revision" | "base-not-ancestor" | "head-mismatch" | "empty-range" | "dirty-worktree" | "git-operation-in-progress" | "malformed-git-output" | "git-inspection-failed"; message: string; dirtyPaths?: string[] };
 
 export interface StewardClockAdapter {
 	now(): Date;
@@ -182,7 +207,7 @@ export interface ActiveAttemptStatusView {
 	taskPhase: "building";
 	attemptId: string;
 	role: "builder";
-	attemptState: "prepared" | "active";
+	attemptState: "prepared" | "active" | "reported";
 	assignmentPath?: string;
 	assignmentHash?: string;
 	actualModel?: import("./config.ts").ModelChoice;
@@ -194,6 +219,7 @@ export interface ActiveAttemptStatusView {
 	reportPath: string;
 	attention: "none";
 	dispatchPhase: DispatchRecord["phase"];
+	evidence?: BuilderEvidenceRecord;
 }
 
 export interface ActiveStatusView {
@@ -224,7 +250,7 @@ export type StartResult =
 
 /** The ticket-01 and ticket-02 orchestration operations. */
 export interface Steward {
-	status(repositoryRoot: string, target: StatusTarget): Promise<StatusView>;
+	status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView>;
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
 	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
 }
@@ -239,7 +265,7 @@ const EMPTY_STATUS: EmptyStatusView = {
 	},
 };
 
-function presentStatusForJournal(journal: RunJournal): ActiveStatusView {
+function presentStatusForJournal(journal: RunJournal, note?: string): ActiveStatusView {
 	const task = journal.run.tasks.find((candidate) => candidate.phase === "building" && candidate.attempts.length === 1);
 	const attempt = task?.attempts[0];
 	if (!task || !attempt) {
@@ -271,7 +297,16 @@ function presentStatusForJournal(journal: RunJournal): ActiveStatusView {
 		attention: task.attention,
 		dispatchPhase: dispatch.phase,
 		...actual,
+		...(attempt.evidence ? { evidence: { ...attempt.evidence, ...(attempt.evidence.phase === "rejected" ? { codes: [...attempt.evidence.codes] } : {}) } } : {}),
 	};
+	const evidence = attempt.evidence;
+	const evidenceLines = evidence?.phase === "rejected"
+		? [`Evidence: rejected (${evidence.codes.join(", ")})`, `Evidence detail: ${evidence.summary}`, "Review: blocked; evidence is not valid."]
+		: evidence?.phase === "finalization-intended"
+			? [`Evidence: finalization intended (${evidence.manifestPath})`, "Evidence snapshot is not yet accepted; retry the matching Controller status."]
+			: evidence?.phase === "finalized"
+				? [`Evidence: finalized (${evidence.status})`, `Manifest: ${evidence.manifestPath} (${evidence.manifestSha256})`, `Report hash: ${evidence.reportSha256}`, ...(evidence.producedRevision ? [`Produced revision: ${evidence.producedRevision}`] : []), evidence.status === "completed" ? "Review: required but not started by ticket 05." : "Review: blocked; retained Builder outcome is not Review-eligible."]
+				: [];
 	const lines = [
 		`Run ${journal.run.id}: active`,
 		`Task ${task.contract.id}: building`,
@@ -283,7 +318,8 @@ function presentStatusForJournal(journal: RunJournal): ActiveStatusView {
 		...(activeAttempt.worktreeBranch ? [`Worktree: ${activeAttempt.worktreeBranch} @ ${activeAttempt.worktreePath}`] : []),
 		...(activeAttempt.agentName ? [`Herdr Builder: ${activeAttempt.agentName} (pane=${activeAttempt.paneId}, workspace=${activeAttempt.workspaceId})`] : []),
 		`Attention: ${task.attention}`,
-		"Completion: not inferred from Herdr activity; awaiting a validated Attempt Report.",
+		...(evidenceLines.length > 0 ? evidenceLines : ["Completion: not inferred from Herdr activity; awaiting a validated Attempt Report."]),
+		...(note ? [note] : []),
 	];
 	return {
 		kind: "present",
@@ -306,6 +342,206 @@ function resultForSaveFailure(scope: ConfigurationScope, save: ConfigSaveResult)
 type DispatchOutcome =
 	| { kind: "dispatched"; journal: RunJournal; message: string; warnings: string[] }
 	| { kind: "pending"; journal: RunJournal; message: string; warnings: string[] };
+
+type EvidenceDecision =
+	| { kind: "waiting"; journal: RunJournal; note: string }
+	| { kind: "rejected"; journal: RunJournal; note: string }
+	| { kind: "finalized"; journal: RunJournal; note: string }
+	| { kind: "unaccepted"; journal: RunJournal; note: string };
+
+function evidencePathsFor(attempt: AttemptRecord): EvidencePaths {
+	const attemptDirectory = resolve(attempt.assignmentPath, "..");
+	return {
+		attemptDirectory,
+		assignmentPath: attempt.assignmentPath,
+		reportPath: attempt.reportPath,
+		evidenceDirectory: attempt.evidenceDirectory,
+		finalizedDirectory: join(attemptDirectory, "finalized"),
+	};
+}
+
+function rejectionCode(value: string): import("./run.ts").EvidenceRejectionCode {
+	const allowed: readonly import("./run.ts").EvidenceRejectionCode[] = ["assignment-changed", "report-or-evidence-invalid", "scope-violation", "dirty-worktree", "missing-assignment", "assignment-hash-mismatch", "assignment-invalid", "report-invalid", "report-identity-mismatch", "report-model-mismatch", "report-specification-mismatch", "report-check-mismatch", "report-artifact-mismatch", "missing-evidence", "unsafe-path", "size-mismatch", "hash-mismatch", "commit-range-mismatch", "finalization-conflict", "storage-error"];
+	return allowed.includes(value as import("./run.ts").EvidenceRejectionCode) ? value as import("./run.ts").EvidenceRejectionCode : "report-invalid";
+}
+
+function expectedArtifactIdentity(artifact: import("./attempt-report.ts").ReportedArtifact): string {
+	return artifact.kind === "git-commit" ? "git-commit" : artifact.kind === "file" ? `file:${artifact.path}` : `evidence:${artifact.description}`;
+}
+
+function buildEvidenceManifest(input: {
+	journal: RunJournal;
+	task: TaskRecord;
+	attempt: AttemptRecord;
+	report: BuilderAttemptReport;
+	reportSize: number;
+	reportSha256: string;
+	assignmentSha256: string;
+	paths: EvidencePaths;
+	files: import("./attempt-evidence-store.ts").ValidatedEvidenceFile[];
+	gitFacts?: ProducedCodeArtifactInspection & { kind: "inspected" };
+}): import("./run.ts").FinalizedEvidenceManifest {
+	const fileFor = (path: string) => input.files.find((file) => file.path === path);
+	const artifactFacts = input.report.producedArtifacts.map((artifact, index) => {
+		if (artifact.kind === "git-commit") return { kind: "git-commit" as const, identity: "git-commit", originalPath: null, evidencePath: null, finalizedPath: null, size: null, sha256: null };
+		const sourcePath = artifact.kind === "file" ? join(input.attempt.dispatch.phase === "worktree-intended" ? "/" : input.attempt.dispatch.worktreePath, ...artifact.path.split("/")) : null;
+		const evidencePath = artifact.kind === "file" ? artifact.evidencePath : artifact.path;
+		const copied = fileFor(evidencePath);
+		return { kind: artifact.kind, identity: expectedArtifactIdentity(artifact), originalPath: sourcePath, evidencePath, finalizedPath: join(input.paths.finalizedDirectory, "artifacts", String(index).padStart(4, "0")), size: copied?.size ?? artifact.size, sha256: copied?.sha256 ?? artifact.sha256 };
+	});
+	const logs = input.report.logReferences.map((log) => {
+		const copied = fileFor(log.path);
+		return { id: log.id, originalPath: log.path, finalizedPath: join(input.paths.finalizedDirectory, "logs", `${log.id}.log`), size: copied?.size ?? log.size, sha256: copied?.sha256 ?? log.sha256 };
+	});
+	return {
+		schemaVersion: 1,
+		identity: { runId: input.journal.run.id, taskId: input.task.contract.id, attemptId: input.attempt.id, role: "builder" },
+		status: input.report.status,
+		summary: input.report.summary,
+		blockers: [...input.report.blockers],
+		actualModel: { ...input.report.actualModel },
+		specificationHash: input.task.specificationHash,
+		assignmentSha256: input.assignmentSha256,
+		report: { originalPath: input.attempt.reportPath, finalizedPath: join(input.paths.finalizedDirectory, "report.md"), size: input.reportSize, sha256: input.reportSha256 },
+		checks: input.report.checks.map((check) => ({ ...check })),
+		logs,
+		artifacts: artifactFacts,
+		producedRevision: input.report.producedRevision,
+		...(input.gitFacts ? { code: { approvedBase: input.gitFacts.base, producedHead: input.gitFacts.head, commits: [...input.gitFacts.commits], changedPaths: input.gitFacts.changedPaths.map((change) => ({ status: change.status, paths: [...change.paths] })) } } : {}),
+	};
+}
+
+function activeBuilder(journal: RunJournal): { task: TaskRecord; attempt: AttemptRecord } | undefined {
+	const candidates = journal.run.tasks.flatMap((task) => task.phase === "building" && task.attempts.length === 1 ? [{ task, attempt: task.attempts[0]! }] : []);
+	return candidates.length === 1 && candidates[0]!.attempt.state === "active" && candidates[0]!.attempt.dispatch.phase === "prompted" ? candidates[0] : undefined;
+}
+
+function rejectionSummary(codes: readonly string[], details: readonly string[]): string {
+	const suffix = details.length > 0 ? ` ${details.join(" ")}` : "";
+	return `${codes.join(", ")}.${suffix}`.slice(0, 2_000);
+}
+
+function rejectionEquivalent(left: BuilderEvidenceRecord | undefined, right: BuilderEvidenceRecord): boolean {
+	return Boolean(left?.phase === "rejected" && right.phase === "rejected" && left.reportSha256 === right.reportSha256 && JSON.stringify(left.codes) === JSON.stringify(right.codes) && left.summary === right.summary);
+}
+
+function intentEquivalent(left: BuilderEvidenceRecord | undefined, right: BuilderEvidenceRecord): boolean {
+	return Boolean(left?.phase === "finalization-intended" && right.phase === "finalization-intended" && left.reportSha256 === right.reportSha256 && left.manifestPath === right.manifestPath && left.manifestSha256 === right.manifestSha256);
+}
+
+async function validateActiveBuilderEvidence(repositoryRoot: string, controllerSessionId: string, loadedJournal: RunJournal, dependencies: StewardDependencies): Promise<EvidenceDecision> {
+	const selected = activeBuilder(loadedJournal);
+	if (!selected) return { kind: "waiting", journal: loadedJournal, note: "Evidence validation is waiting for exactly one active prompted Builder Attempt." };
+	const { task, attempt } = selected;
+	const paths = evidencePathsFor(attempt);
+	let deterministic: AssignmentPaths;
+	try {
+		deterministic = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, loadedJournal.run.id, task.contract.id, attempt.id);
+	} catch (error: unknown) {
+		return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["assignment-changed"], [error instanceof Error ? error.message : "Assignment path derivation failed."]);
+	}
+	if (deterministic.assignmentPath !== attempt.assignmentPath || deterministic.reportPath !== attempt.reportPath || deterministic.evidenceDirectory !== attempt.evidenceDirectory || loadedJournal.run.controllerSessionId !== controllerSessionId) return { kind: "waiting", journal: loadedJournal, note: "Controller authority or deterministic Assignment paths do not match; status is read-only." };
+	if (!dependencies.runJournal.loadBuilderEvidenceInputs || !dependencies.runJournal.inspectReferencedEvidence || !dependencies.runJournal.finalizeBuilderEvidence) return { kind: "waiting", journal: loadedJournal, note: "Builder evidence adapters are unavailable; evidence remains unaccepted." };
+	let inputs: import("./attempt-evidence-store.ts").BuilderEvidenceInputs;
+	try {
+		inputs = await dependencies.runJournal.loadBuilderEvidenceInputs({ repositoryRoot, paths, assignmentSha256: attempt.dispatch.phase === "prompted" ? attempt.dispatch.assignmentSha256 : "" });
+	} catch (error: unknown) {
+		return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], [error instanceof Error ? error.message : "Evidence input loading failed."]);
+	}
+	if (inputs.kind === "report-missing") return { kind: "waiting", journal: loadedJournal, note: `Attempt Report is not present yet at ${attempt.reportPath}; completion is not inferred from Herdr activity.` };
+	if (inputs.kind === "unsafe") {
+		const top = inputs.code === "assignment-hash-mismatch" ? "assignment-changed" : "report-or-evidence-invalid";
+		return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, [top], [inputs.code, inputs.message], inputs.reportSha256);
+	}
+	const reportContent = inputs.reportBytes.toString("utf8");
+	if (attempt.evidence?.phase === "rejected" && attempt.evidence.reportSha256 === inputs.reportSha256) return { kind: "rejected", journal: loadedJournal, note: `Evidence rejected (${attempt.evidence.codes.join(", ")}) for unchanged report hash; preserved evidence was not rewritten.` };
+	if (attempt.evidence?.phase === "finalization-intended" && attempt.evidence.reportSha256 !== inputs.reportSha256) return { kind: "unaccepted", journal: loadedJournal, note: "A finalization was intended for different report bytes; the preserved snapshot remains unaccepted and no changed report was reparsed." };
+	const parsed = parseBuilderAttemptReport(reportContent);
+	if (!parsed.value || parsed.diagnostics.length > 0) return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], parsed.diagnostics.map((item) => `${item.code}: ${item.message}`), inputs.reportSha256);
+	const assignmentDecoded = deserializeBuilderAssignment(inputs.assignmentBytes.toString("utf8"), attempt.assignmentPath);
+	if (!assignmentDecoded.value || assignmentDecoded.diagnostics.length > 0) return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], assignmentDecoded.diagnostics.map((item) => item.message), inputs.reportSha256);
+	const cross = validateBuilderReportAgainstAssignment({ report: parsed.value, assignment: assignmentDecoded.value, assignmentSha256: inputs.assignmentSha256, runId: loadedJournal.run.id, task: task.contract, attempt, baseRevision: attempt.baseRevision });
+	if (!cross.value || cross.diagnostics.length > 0) {
+		const assignmentChanged = cross.diagnostics.some((item) => item.code === "assignment-changed");
+		const scopeViolation = cross.diagnostics.some((item) => item.code === "scope-violation");
+		return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, [assignmentChanged ? "assignment-changed" : scopeViolation ? "scope-violation" : "report-or-evidence-invalid"], cross.diagnostics.map((item) => `${item.code}: ${item.message}`), inputs.reportSha256);
+	}
+	let referenced: import("./attempt-evidence-store.ts").ReferencedEvidenceResult;
+	try {
+		referenced = await dependencies.runJournal.inspectReferencedEvidence({ repositoryRoot, paths, report: parsed.value, worktreePath: assignmentDecoded.value.assignment.worktree.path });
+	} catch (error: unknown) {
+		return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], [error instanceof Error ? error.message : "Referenced evidence inspection failed."], inputs.reportSha256);
+	}
+	if (referenced.kind !== "inspected") return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], [referenced.code, referenced.message], inputs.reportSha256);
+	let gitFacts: Extract<ProducedCodeArtifactInspection, { kind: "inspected" }> | undefined;
+	const gitArtifact = parsed.value.producedArtifacts.find((artifact): artifact is import("./attempt-report.ts").ReportedArtifactGitCommit => artifact.kind === "git-commit");
+	if (gitArtifact) {
+		if (!dependencies.git.inspectProducedCodeArtifact) return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], ["git-inspection-unavailable"], inputs.reportSha256);
+		let inspected: ProducedCodeArtifactInspection;
+		try { inspected = await dependencies.git.inspectProducedCodeArtifact({ worktreePath: assignmentDecoded.value.assignment.worktree.path, approvedBase: attempt.baseRevision, producedHead: gitArtifact.headRevision }); } catch (error: unknown) { return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], [error instanceof Error ? error.message : "Git Artifact inspection failed."], inputs.reportSha256); }
+		if (inspected.kind === "invalid") {
+			if (inspected.code === "dirty-worktree" || inspected.code === "git-operation-in-progress") return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["dirty-worktree"], [inspected.message, ...(inspected.dirtyPaths ?? [])], inputs.reportSha256);
+			return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], [inspected.code, inspected.message], inputs.reportSha256);
+		}
+		const gitDiagnostics = validateReportedGitFacts(gitArtifact, inspected);
+		if (gitDiagnostics.length > 0) return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], gitDiagnostics.map((item) => item.message), inputs.reportSha256);
+		if (!changedPathsInAllowedScope(inspected, task.contract.allowedScope)) return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["scope-violation"], ["Git Artifact changed a path outside allowedScope."], inputs.reportSha256);
+		gitFacts = inspected;
+	}
+	const manifest = buildEvidenceManifest({ journal: loadedJournal, task, attempt, report: parsed.value, reportSize: inputs.reportBytes.length, reportSha256: inputs.reportSha256, assignmentSha256: inputs.assignmentSha256, paths, files: referenced.files, ...(gitFacts ? { gitFacts } : {}) });
+	const manifestBytes = Buffer.from(serializeFinalizedEvidenceManifest(manifest), "utf8");
+	const manifestSha256 = finalizedEvidenceManifestSha256(manifest);
+	const intent: BuilderEvidenceRecord = { phase: "finalization-intended", checkedAt: transitionTimestamp(loadedJournal, dependencies.clock.now()), reportSha256: inputs.reportSha256, manifestPath: join(paths.finalizedDirectory, "manifest.json"), manifestSha256 };
+	let journal = loadedJournal;
+	if (!intentEquivalent(attempt.evidence, intent)) {
+		const candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const nextAttempt = next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts[0];
+			if (!nextAttempt) throw new Error("Builder Attempt disappeared before finalization intent.");
+			nextAttempt.evidence = intent;
+		});
+		const persisted = await dependencies.runJournal.replaceActive(repositoryRoot, candidate);
+		if (persisted.kind !== "replaced") return { kind: "unaccepted", journal, note: "Finalization intent could not be persisted; no evidence was accepted." };
+		journal = persisted.journal;
+	}
+	const copies = referenced.files.filter((file) => parsed.value!.logReferences.some((log) => log.path === file.path)).map((file, index) => finalizationCopyForLog(parsed.value!.logReferences.find((log) => log.path === file.path)!, file.bytes, index));
+	for (let index = 0; index < parsed.value.producedArtifacts.length; index += 1) {
+		const artifact = parsed.value.producedArtifacts[index]!;
+		if (artifact.kind === "git-commit") continue;
+		const file = referenced.files.find((candidate) => candidate.path === (artifact.kind === "file" ? artifact.evidencePath : artifact.path));
+		if (file) copies.push(finalizationCopyForArtifact(artifact, file.bytes, index));
+	}
+	const finalization = await dependencies.runJournal.finalizeBuilderEvidence({ paths, assignmentBytes: inputs.assignmentBytes, reportBytes: inputs.reportBytes, manifestBytes, manifestSha256, copies, originalPaths: [attempt.assignmentPath, attempt.reportPath, ...referenced.files.map((file) => file.path)] });
+	if (finalization.kind === "conflict") return persistEvidenceRejection(repositoryRoot, journal, task, attempt, dependencies, ["report-or-evidence-invalid"], ["finalization-conflict", finalization.message], inputs.reportSha256);
+	if (finalization.kind === "storage-error") return { kind: "unaccepted", journal, note: `Evidence snapshot could not be completed: ${finalization.message}` };
+	if (finalization.kind !== "created" && finalization.kind !== "existing-match") return { kind: "unaccepted", journal, note: "Evidence snapshot could not be completed." };
+	const finalized: BuilderEvidenceRecord = { phase: "finalized", finalizedAt: transitionTimestamp(journal, dependencies.clock.now()), status: parsed.value.status, reportSha256: inputs.reportSha256, manifestPath: finalization.manifestPath, manifestSha256: finalization.manifestSha256, producedRevision: parsed.value.producedRevision };
+	const reportedJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+		const nextAttempt = next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts[0];
+		if (!nextAttempt) throw new Error("Builder Attempt disappeared before finalization.");
+		nextAttempt.state = "reported";
+		nextAttempt.evidence = finalized;
+	});
+	const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, reportedJournal);
+	if (replaced.kind !== "replaced") return { kind: "unaccepted", journal, note: "Evidence snapshot was created but the Run Journal was not updated to reported/finalized." };
+	await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: replaced.journal.run.updatedAt, runId: replaced.journal.run.id, event: "builder-evidence-finalized", message: `Builder Attempt ${attempt.id} evidence finalized; Review is required but not started by ticket 05.` }).catch(() => undefined);
+	return { kind: "finalized", journal: replaced.journal, note: "" };
+}
+
+async function persistEvidenceRejection(repositoryRoot: string, journal: RunJournal, task: TaskRecord, attempt: AttemptRecord, dependencies: StewardDependencies, topCodes: string[], details: string[], reportSha256?: string): Promise<EvidenceDecision> {
+	const codes = [...new Set(topCodes.concat(details.map((detail) => detail.split(":")[0] ?? "").map(rejectionCode)))].map(rejectionCode);
+	const rejection: BuilderEvidenceRecord = { phase: "rejected", checkedAt: transitionTimestamp(journal, dependencies.clock.now()), ...(reportSha256 ? { reportSha256 } : {}), codes: codes.length > 0 ? codes : ["report-or-evidence-invalid"], summary: rejectionSummary(codes, details) };
+	const currentAttempt = journal.run.tasks.find((candidate) => candidate.contract.id === task.contract.id)?.attempts[0];
+	if (currentAttempt && rejectionEquivalent(currentAttempt.evidence, rejection)) return { kind: "rejected", journal, note: `Evidence rejected (${rejection.codes.join(", ")}); preserved bytes were not rewritten.` };
+	const candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+		const nextAttempt = next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts[0];
+		if (!nextAttempt) throw new Error("Builder Attempt disappeared while retaining evidence rejection.");
+		nextAttempt.evidence = rejection;
+	});
+	const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate);
+	if (replaced.kind !== "replaced") return { kind: "rejected", journal, note: `Evidence rejected (${rejection.codes.join(", ")}); durable rejection write failed and original evidence was preserved.` };
+	await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: replaced.journal.run.updatedAt, runId: replaced.journal.run.id, event: "builder-evidence-rejected", message: `Builder Attempt ${attempt.id} evidence rejected: ${rejection.codes.join(", ")}.` }).catch(() => undefined);
+	return { kind: "rejected", journal: replaced.journal, note: `Evidence rejected (${rejection.codes.join(", ")}); Review is blocked and original evidence is preserved.` };
+}
 
 function compactUuid(clock: StewardClockAdapter): string {
 	const value = clock.randomUUID().replace(/[^a-z0-9]/gi, "").toLowerCase().slice(0, 8);
@@ -534,9 +770,9 @@ function isAbsolutePath(value: string): boolean {
 /** Assemble the plain-function orchestration seam without adding lifecycle machinery. */
 export function createSteward({ runJournal, herdr, git, process, model, clock, ui }: StewardDependencies): Steward {
 	void process;
-	async function status(repositoryRoot: string, target: StatusTarget): Promise<StatusView> {
+	async function status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
-		const statusView = loaded.kind === "missing"
+		let statusView: StatusView = loaded.kind === "missing"
 			? EMPTY_STATUS
 			: loaded.kind === "invalid"
 				? {
@@ -545,6 +781,15 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 					footer: { run: "active" as const, attentionCount: 0 as const, text: "steward: active Run needs recovery" },
 				}
 				: presentStatusForJournal(loaded.journal);
+		if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && loaded.journal.run.controllerSessionId === controllerSessionId) {
+			const candidate = activeBuilder(loaded.journal);
+			if (candidate) {
+				const decision = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, loaded.journal, { runJournal, herdr, git, process, model, clock, ui });
+				statusView = presentStatusForJournal(decision.journal, decision.note);
+			}
+		} else if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && loaded.journal.run.controllerSessionId !== controllerSessionId) {
+			statusView = presentStatusForJournal(loaded.journal, "Controller Session does not match; evidence validation is read-only until the authorized Controller returns.");
+		}
 		ui.presentStatus(statusView, target);
 		return statusView;
 	}

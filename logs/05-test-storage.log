@@ -1,0 +1,12 @@
+
+> pi-herdr-steward@0.1.0 test:storage
+> vitest run test/run-journal.storage.test.ts
+
+
+ RUN  v4.1.11 /root/.herdr/worktrees/pi-herdr-steward/steward-t05-validate-evidence
+
+
+ Test Files  1 passed (1)
+      Tests  7 passed (7)
+   Start at  00:29:11
+   Duration  2.49s (transform 251ms, setup 0ms, import 1.66s, tests 599ms, environment 0ms)

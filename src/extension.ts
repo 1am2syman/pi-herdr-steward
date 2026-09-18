@@ -70,7 +70,8 @@ async function runStatus(
 	adapterFactory: StewardAdapterFactory,
 	exec?: ExtensionAPI["exec"],
 ): Promise<void> {
-	await createSteward(adapterFactory(requestFromContext(ctx, exec))).status(ctx.cwd, target);
+	const controllerSessionId = target === "command" && "sessionManager" in ctx ? ctx.sessionManager.getSessionId() : undefined;
+	await createSteward(adapterFactory(requestFromContext(ctx, exec))).status(ctx.cwd, target, controllerSessionId);
 }
 
 /** Register Steward's TUI-only session footer and status/configuration commands. */

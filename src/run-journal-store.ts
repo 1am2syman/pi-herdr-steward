@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
+import { createAttemptEvidenceStore, type BuilderEvidenceInputRequest, type BuilderEvidenceInputs, type FinalizeBuilderEvidenceRequest, type FinalizeBuilderEvidenceResult, type ReferencedEvidenceRequest, type ReferencedEvidenceResult } from "./attempt-evidence-store.ts";
 import {
 	ensureProjectStateDirectory,
 	ensureOwnedDirectory,
@@ -60,6 +61,9 @@ export interface RunJournalStore {
 	appendActivity(repositoryRoot: string, entry: ActivityEntry): Promise<ActivityAppendResult>;
 	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
 	createAssignment(repositoryRoot: string, document: import("./run.ts").BuilderAssignmentDocument): Promise<AssignmentCreateResult>;
+	loadBuilderEvidenceInputs(input: BuilderEvidenceInputRequest): Promise<BuilderEvidenceInputs>;
+	inspectReferencedEvidence(input: ReferencedEvidenceRequest): Promise<ReferencedEvidenceResult>;
+	finalizeBuilderEvidence(input: FinalizeBuilderEvidenceRequest): Promise<FinalizeBuilderEvidenceResult>;
 }
 
 const ACTIVE_NAME = "active-run.json";
@@ -173,6 +177,7 @@ export function resolveRunJournalPaths(repositoryRoot: string, configDirName = C
 export function createRunJournalStore(options: { configDirName?: string } = {}): RunJournalStore {
 	const configDirName = options.configDirName ?? CONFIG_DIR_NAME;
 	const assignmentStore = createAssignmentStore({ configDirName });
+	const evidenceStore = createAttemptEvidenceStore();
 
 	function resolvePaths(repositoryRoot: string): RunJournalPaths {
 		return pathsFor(repositoryRoot, configDirName);
@@ -309,6 +314,9 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		appendActivity,
 		resolveAssignmentPaths: (repositoryRoot, runId, taskId, attemptId) => resolveAssignmentPaths(repositoryRoot, runId, taskId, attemptId, configDirName),
 		createAssignment: assignmentStore.createAssignment,
+		loadBuilderEvidenceInputs: evidenceStore.loadBuilderEvidenceInputs,
+		inspectReferencedEvidence: evidenceStore.inspectReferencedEvidence,
+		finalizeBuilderEvidence: evidenceStore.finalizeBuilderEvidence,
 	};
 }
 

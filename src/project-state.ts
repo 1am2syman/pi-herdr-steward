@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, mkdir, open, readFile, rename, lstat, unlink } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { chmod, mkdir, open, readFile, rename, lstat, unlink, rm } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 export const STEWARD_DIRECTORY_NAME = "steward";
@@ -119,6 +119,30 @@ export async function removeKnownTemporaryFile(path: string): Promise<void> {
 	await unlink(path).catch((error: unknown) => {
 		if (!isMissing(error)) throw error;
 	});
+}
+
+/** Create one private temporary directory in an already-owned directory. */
+export async function createOwnedTemporaryDirectory(directory: string, prefix: string): Promise<string> {
+	const temporaryPath = join(directory, `.${prefix}.${process.pid}.${randomUUID()}.tmp`);
+	await mkdir(temporaryPath, { mode: 0o700 });
+	await chmod(temporaryPath, 0o700).catch(() => undefined);
+	return temporaryPath;
+}
+
+/** Remove only a private temporary directory created by this module. */
+export async function removeKnownTemporaryDirectory(path: string): Promise<void> {
+	if (!/^\.[A-Za-z0-9._-]+\.tmp$/.test(basename(path))) throw new Error(`Refusing to remove an unknown temporary directory: ${path}`);
+	await rm(path, { recursive: true, force: true });
+}
+
+export async function syncFile(path: string): Promise<void> {
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		await handle.sync();
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
 }
 
 export async function syncDirectory(path: string): Promise<void> {

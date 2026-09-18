@@ -1,0 +1,37 @@
+ package.json                     |   2 +
+ src/adapters.ts                  |  96 ++++++++++++++-
+ src/extension.ts                 |   3 +-
+ src/project-state.ts             |  28 ++++-
+ src/run-journal-store.ts         |  10 +-
+ src/run.ts                       | 144 ++++++++++++++++++++--
+ src/steward.ts                   | 257 ++++++++++++++++++++++++++++++++++++++-
+ test/run-journal.storage.test.ts |  59 +++++++++
+ 8 files changed, 577 insertions(+), 22 deletions(-)
+## steward/t05-validate-evidence
+ M package.json
+ M src/adapters.ts
+ M src/extension.ts
+ M src/project-state.ts
+ M src/run-journal-store.ts
+ M src/run.ts
+ M src/steward.ts
+ M test/run-journal.storage.test.ts
+?? logs/05-diff-check.log
+?? logs/05-npm-ci.log
+?? logs/05-npm-test-rerun.log
+?? logs/05-npm-test.log
+?? logs/05-scope-status.log
+?? logs/05-test-config.log
+?? logs/05-test-dispatch.log
+?? logs/05-test-evidence.log
+?? logs/05-test-git.log
+?? logs/05-test-herdr.log
+?? logs/05-test-start.log
+?? logs/05-test-status-empty.log
+?? logs/05-test-storage.log
+?? logs/05-typecheck.log
+?? plans/05-validate-builder-evidence.md
+?? src/attempt-evidence-store.ts
+?? src/attempt-report.ts
+?? test/evidence.functional.test.ts
+?? test/git-evidence.contract.test.ts

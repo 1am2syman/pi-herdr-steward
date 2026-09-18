@@ -6,6 +6,7 @@ import { deepStrictEqual, equal, match, ok } from "node:assert/strict";
 import { afterEach, it } from "vitest";
 
 import { createRunJournalStore } from "../src/run-journal-store.ts";
+import { createAttemptEvidenceStore, sha256Bytes } from "../src/attempt-evidence-store.ts";
 import { resolveAssignmentPaths } from "../src/assignment-store.ts";
 import { buildInitialRunJournal, deserializeRunJournal, serializeRunJournal, type RunJournal } from "../src/run.ts";
 import { type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
@@ -189,5 +190,63 @@ it.sequential("Assignment creation is deterministic, protected, no-clobber, and 
 	const conflict = await store.createAssignment(root, { ...document, assignment: { ...document.assignment, requiredOutcome: "A different bounded change" } });
 	equal(conflict.kind, "conflict");
 	equal(await readFile(paths.assignmentPath, "utf8"), bytes);
+	deepStrictEqual(await listTemporaryFiles(paths.attemptDirectory), []);
+});
+
+it.sequential("finalized evidence is an exact protected no-clobber snapshot", async () => {
+	const root = await makeRoot();
+	const store = createRunJournalStore();
+	const runId = "run-20260917T180000000Z-finalize";
+	const paths = resolveAssignmentPaths(root, runId, "task-01", "attempt-01");
+	const document: BuilderAssignmentDocument = {
+		schemaVersion: 1,
+		assignment: {
+			runId,
+			taskId: "task-01",
+			attemptId: "attempt-01",
+			role: "builder",
+			requiredOutcome: "Persist exact evidence",
+			allowedScope: ["reports/result.md"],
+			expectedArtifacts: [{ kind: "evidence", description: "A deterministic report" }],
+			reportPath: paths.reportPath,
+			evidenceDirectory: paths.evidenceDirectory,
+			verification: { kind: "command", command: "npm test" },
+			actualModel: { model: "builder/primary", thinkingLevel: "high" },
+			specificationHash: "sha256:" + "a".repeat(64),
+			baseRevision: "0123456789abcdef0123456789abcdef01234567",
+			worktree: { path: "/tmp/builder-worktree", branch: "steward/run/task/attempt-01" },
+			herdr: { workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1", agentName: "steward-b-abcdef12-01-01" },
+		},
+	};
+	const assignmentBytes = Buffer.from("assignment\n");
+	const reportBytes = Buffer.from("report\n");
+	const manifestBytes = Buffer.from("manifest-v1\n");
+	const copyBytes = Buffer.from("npm test output\n");
+	await store.createAssignment(root, document);
+	await writeFile(paths.reportPath, reportBytes, { mode: 0o600 });
+	const finalizedDirectory = join(paths.attemptDirectory, "finalized");
+	const evidenceStore = createAttemptEvidenceStore();
+	const input = {
+		paths: { attemptDirectory: paths.attemptDirectory, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, finalizedDirectory },
+		assignmentBytes,
+		reportBytes,
+		manifestBytes,
+		manifestSha256: sha256Bytes(manifestBytes),
+		copies: [{ relativePath: "logs/check.log", bytes: copyBytes, size: copyBytes.length, sha256: sha256Bytes(copyBytes) }],
+		originalPaths: [paths.reportPath],
+	};
+	const created = await evidenceStore.finalizeBuilderEvidence(input);
+	equal(created.kind, "created");
+	deepStrictEqual(await readFile(join(finalizedDirectory, "manifest.json")), manifestBytes);
+	deepStrictEqual(await readFile(join(finalizedDirectory, "logs/check.log")), copyBytes);
+	equal((await stat(join(finalizedDirectory, "manifest.json"))).mode & 0o777, 0o400);
+	equal((await stat(finalizedDirectory)).mode & 0o777, 0o500);
+	equal((await stat(paths.reportPath)).mode & 0o777, 0o400);
+	const reused = await evidenceStore.finalizeBuilderEvidence(input);
+	equal(reused.kind, "existing-match");
+	const conflictingManifest = Buffer.from("manifest-v2\n");
+	const conflict = await evidenceStore.finalizeBuilderEvidence({ ...input, manifestBytes: conflictingManifest, manifestSha256: sha256Bytes(conflictingManifest) });
+	equal(conflict.kind, "conflict");
+	deepStrictEqual(await readFile(join(finalizedDirectory, "manifest.json")), manifestBytes);
 	deepStrictEqual(await listTemporaryFiles(paths.attemptDirectory), []);
 });

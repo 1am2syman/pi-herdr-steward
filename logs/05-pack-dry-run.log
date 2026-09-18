@@ -1,0 +1,76 @@
+[
+  {
+    "id": "pi-herdr-steward@0.1.0",
+    "name": "pi-herdr-steward",
+    "version": "0.1.0",
+    "size": 54814,
+    "unpackedSize": 268662,
+    "shasum": "b21cf8476d610c0b5fd9b4b9e4e9a4e0b6b7c28f",
+    "integrity": "sha512-QGacOpDb1N0GPt7leQLAkTlSZ0Azc9grKLvWtCF3fY/2uXNaY2fRHE3sbihKH1lRia6bk/TtFH4GT4oJ914+kA==",
+    "filename": "pi-herdr-steward-0.1.0.tgz",
+    "files": [
+      {
+        "path": "package.json",
+        "size": 1067,
+        "mode": 420
+      },
+      {
+        "path": "src/adapters.ts",
+        "size": 42537,
+        "mode": 420
+      },
+      {
+        "path": "src/assignment-store.ts",
+        "size": 6980,
+        "mode": 420
+      },
+      {
+        "path": "src/attempt-evidence-store.ts",
+        "size": 16535,
+        "mode": 420
+      },
+      {
+        "path": "src/attempt-report.ts",
+        "size": 28548,
+        "mode": 420
+      },
+      {
+        "path": "src/config-store.ts",
+        "size": 7724,
+        "mode": 420
+      },
+      {
+        "path": "src/config.ts",
+        "size": 13960,
+        "mode": 420
+      },
+      {
+        "path": "src/extension.ts",
+        "size": 4259,
+        "mode": 420
+      },
+      {
+        "path": "src/project-state.ts",
+        "size": 6682,
+        "mode": 420
+      },
+      {
+        "path": "src/run-journal-store.ts",
+        "size": 16036,
+        "mode": 420
+      },
+      {
+        "path": "src/run.ts",
+        "size": 58020,
+        "mode": 420
+      },
+      {
+        "path": "src/steward.ts",
+        "size": 66314,
+        "mode": 420
+      }
+    ],
+    "entryCount": 12,
+    "bundled": []
+  }
+]
