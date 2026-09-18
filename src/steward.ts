@@ -28,6 +28,8 @@ import {
 	serializeFinalizedEvidenceManifest,
 	finalizedEvidenceManifestSha256,
 	validateRunJournal,
+	evaluateCompletionGate,
+	COMPLETION_GATE_PREDICATES,
 	validateRunDraft,
 	type IntegrationBase,
 	type RunConfirmationSummary,
@@ -47,6 +49,15 @@ import {
 	type ReworkDispatchRecord,
 	type TaskApproval,
 	type ReportRepairFailure,
+	type IntegrationCheckoutObservation,
+	type TaskIntegration,
+	type FinalVerificationExecution,
+	type CompletionAgentIdentity,
+	type CompletionStopResource,
+	type CompletionStopFailure,
+	type CompletionGateFacts,
+	type CompletionArchiveIntent,
+	type CompletionRecord,
 } from "./run.ts";
 import {
 	buildReviewerAssignment,
@@ -82,8 +93,16 @@ import {
 import {
 	finalizationCopyForArtifact,
 	finalizationCopyForLog,
+	sha256Bytes,
 	type EvidencePaths,
 } from "./attempt-evidence-store.ts";
+import type {
+	ArchiveCompletedRunRequest,
+	ArchiveCompletedRunResult,
+	CompletionPaths,
+	VerificationEvidenceInput,
+	VerificationFinalizeResult,
+} from "./completion-store.ts";
 
 /** The two presentation contexts supported by this slice. */
 export type StatusTarget = "command" | "footer";
@@ -107,6 +126,10 @@ export interface RunJournalAdapter {
 	inspectReferencedReviewerEvidence?(input: import("./attempt-evidence-store.ts").ReferencedReviewerEvidenceRequest): Promise<import("./attempt-evidence-store.ts").ReferencedReviewerEvidenceResult>;
 	finalizeBuilderEvidence?(input: import("./attempt-evidence-store.ts").FinalizeBuilderEvidenceRequest): Promise<import("./attempt-evidence-store.ts").FinalizeBuilderEvidenceResult>;
 	finalizeReviewerEvidence?(input: import("./attempt-evidence-store.ts").FinalizeReviewerEvidenceRequest): Promise<import("./attempt-evidence-store.ts").FinalizeReviewerEvidenceResult>;
+	resolveCompletionPaths?(repositoryRoot: string, runId: string): CompletionPaths;
+	finalizeVerificationResult?(input: VerificationEvidenceInput): Promise<VerificationFinalizeResult>;
+	archiveCompletedRun?(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult>;
+	loadCompletionJournalPointers?(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: import("./completion-store.ts").CompletionJournalPointers } | { kind: "unavailable"; message: string }>;
 	loadRecoveryDefaults(): Promise<ConfigLoadResult<RecoveryDefaults>>;
 	loadModelPlans(repositoryRoot: string): Promise<ConfigLoadResult<ProjectModelPlans>>;
 	saveRecoveryDefaults(recovery: RecoveryDefaults): Promise<ConfigSaveResult>;
@@ -152,6 +175,7 @@ export interface StewardUiAdapter {
 	confirmRun(summary: RunConfirmationSummary): Promise<boolean>;
 	confirmSameFamilyReview?(input: { builderModel: import("./config.ts").ModelChoice; reviewerModel: import("./config.ts").ModelChoice; subject: ReviewSubject; provider: string }): Promise<boolean>;
 	presentStartResult(result: StartResult): void;
+	notifyCompletion?(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void;
 }
 
 export interface StewardModelAdapter {
@@ -169,6 +193,7 @@ export interface StewardHerdrAdapter {
 	createReviewerPane?(input: { repositoryRoot: string; sourcePaneId: string; worktreePath: string; branch: string; agentName: string; workspaceId: string }): Promise<HerdrReviewerPaneResult>;
 	startReviewer?(input: { repositoryRoot: string; name: string; paneId: string; model: import("./config.ts").ModelChoice }): Promise<HerdrAgentStartResult>;
 	promptReviewer?(input: { repositoryRoot: string; name: string; assignmentPrompt: string }): Promise<HerdrPromptResult>;
+	stopAgentGracefully?(input: { repositoryRoot: string; name: string; workspaceId: string; paneId: string; terminalId: string }): Promise<HerdrStopResult>;
 }
 
 export type HerdrWorktreeCreateResult =
@@ -188,6 +213,10 @@ export type HerdrReviewerPaneResult =
 	| { kind: "created"; workspaceId: string; tabId: string; paneId: string; terminalId: string; sourcePaneId: string; worktreePath: string }
 	| { kind: "failed"; stage: "pane-split"; code: string; message: string };
 
+export type HerdrStopResult =
+	| { kind: "acknowledged"; name: string; workspaceId: string; tabId: string; paneId: string; terminalId: string }
+	| { kind: "failed" | "ambiguous"; message: string };
+
 export type HerdrAvailability =
 	| { kind: "available"; status: string; running: true; compatible: true; endpointCompatible: true; protocol?: number }
 	| { kind: "unavailable"; message: string };
@@ -198,6 +227,37 @@ export interface StewardGitAdapter {
 	inspectBuilderWorktree?(worktreePath: string, expectedRevision: string): Promise<BuilderWorktreeInspection>;
 	inspectProducedCodeArtifact?(input: { worktreePath: string; approvedBase: string; producedHead: string }): Promise<ProducedCodeArtifactInspection>;
 	inspectReviewWorktree?(worktreePath: string): Promise<import("./run.ts").ReviewWorktreeSnapshot | { kind: "unavailable"; message: string }>;
+	inspectIntegrationCheckout?(input: IntegrationCheckoutInput): Promise<IntegrationCheckoutResult>;
+	integrateApprovedRange?(input: IntegrationMutationInput): Promise<GitCommandOutcome>;
+}
+
+export interface IntegrationCheckoutInput {
+	repositoryRoot: string;
+	targetBranch: string;
+	targetRevision: string;
+	approvedBaseRevision: string;
+	approvedHeadRevision: string;
+	approvedCommits: string[];
+}
+
+export type IntegrationCheckoutResult =
+	| { kind: "inspected"; observation: import("./run.ts").IntegrationCheckoutObservation; resolvedBaseRevision: string; resolvedHeadRevision: string; commits: string[] }
+	| { kind: "unavailable"; message: string };
+
+export interface IntegrationMutationInput extends IntegrationCheckoutInput {
+	action: { kind: "fast-forward"; argv: ["merge", "--ff-only", "--no-edit", string] };
+}
+
+export type GitCommandOutcome =
+	| { kind: "completed"; code: number; stdout: string; stderr: string; killed: boolean }
+	| { kind: "thrown"; message: string };
+
+export type VerificationProcessOutcome =
+	| { kind: "completed"; code: number; stdout: string; stderr: string; killed: boolean }
+	| { kind: "thrown"; message: string };
+
+export interface StewardProcessAdapter {
+	runApprovedVerification?(input: { cwd: string; command: string }): Promise<VerificationProcessOutcome>;
 }
 
 export type IntegrationBaseInspection =
@@ -221,7 +281,7 @@ export interface StewardDependencies {
 	runJournal: RunJournalAdapter;
 	herdr: StewardHerdrAdapter;
 	git: StewardGitAdapter;
-	process: OpaqueAdapter;
+	process: StewardProcessAdapter;
 	model: StewardModelAdapter;
 	clock: StewardClockAdapter;
 	ui: StewardUiAdapter;
@@ -273,7 +333,14 @@ export interface ActiveStatusView {
 	activeAttempt?: ActiveAttemptStatusView;
 }
 
-export type StatusView = EmptyStatusView | ActiveStatusView;
+export interface CompletedStatusView {
+	kind: "present";
+	completed: true;
+	markdown: string;
+	footer: EmptyFooterView;
+}
+
+export type StatusView = EmptyStatusView | ActiveStatusView | CompletedStatusView;
 
 export type ConfigureResult =
 	| { kind: "cancelled"; scope?: ConfigurationScope; path?: string; message: string }
@@ -337,12 +404,29 @@ function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusVi
 function presentApprovedStatus(journal: RunJournal, note?: string): ActiveStatusView {
 	const task = journal.run.tasks.find((candidate) => candidate.phase === "approved");
 	if (!task || !task.approval) return { kind: "present", markdown: `Run ${journal.run.id} is active; Approval state is unavailable.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
-	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: approved`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, "Attention: none", `Approval: ${task.approval.phase}`, `Builder Attempt: ${task.approval.builderAttemptId}`, `Reviewer Attempt: ${task.approval.reviewerAttemptId}`, `Reviewer manifest: ${task.approval.reviewerManifestPath} (${task.approval.reviewerManifestSha256})`, `Review subject: ${JSON.stringify(task.approval.subject)}`, `Clean snapshot: ${task.approval.worktreeSnapshot.head} (${task.approval.worktreeSnapshot.dirtyStateFingerprint})`];
+	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: approved`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : []), `Approval: ${task.approval.phase}`, `Builder Attempt: ${task.approval.builderAttemptId}`, `Reviewer Attempt: ${task.approval.reviewerAttemptId}`, `Reviewer manifest: ${task.approval.reviewerManifestPath} (${task.approval.reviewerManifestSha256})`, `Review subject: ${JSON.stringify(task.approval.subject)}`, `Clean snapshot: ${task.approval.worktreeSnapshot.head} (${task.approval.worktreeSnapshot.dirtyStateFingerprint})`];
 	if (note) lines.push(note);
-	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · approved · 0 attention` } };
+	const attentionCount = task.attention === "none" ? 0 : 1;
+	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · approved · ${attentionCount} attention` } };
 }
 
-function presentStatusForJournal(journal: RunJournal, note?: string): ActiveStatusView {
+function presentCompletionStatus(journal: RunJournal, note?: string): ActiveStatusView {
+	const task = journal.run.tasks[0];
+	const completion = journal.run.completion;
+	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(task ? [`Task ${task.contract.id}: ${task.phase}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : [])] : []), ...(task?.integration ? [`Integration: ${task.integration.phase}`] : []), ...(journal.run.finalVerificationExecution ? [`Final verification: ${journal.run.finalVerificationExecution.phase}`, `Verification result: ${journal.run.finalVerificationExecution.resultPath}`] : []), ...(completion ? [`Completion: ${completion.phase}`] : []), ...(note ? [note] : [])];
+	const attentionCount = task && task.attention !== "none" ? 1 : 0;
+	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · ${journal.run.status} · ${attentionCount} attention` } };
+}
+
+function presentCompletedStatus(journal: RunJournal, note?: string): CompletedStatusView {
+	const completion = journal.run.completion;
+	const gate = completion && "gate" in completion ? completion.gate : undefined;
+	return { kind: "present", completed: true, markdown: [`Run ${journal.run.id}: completed`, ...(gate ? [`Integrated head: ${gate.integratedHead}`] : []), ...(completion?.phase === "archived" ? [`Archive: ${completion.archive.archiveDirectory}`, `Verification result: ${completion.archive.verification.resultPath}`, `Verification output: ${completion.archive.verification.logPath}`] : []), ...(note ? [note] : [])].join("\n"), footer: { run: "none", attentionCount: 0, text: "steward: no active Run" } };
+}
+
+function presentStatusForJournal(journal: RunJournal, note?: string): StatusView {
+	if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return presentCompletedStatus(journal, note);
+	if (journal.run.status === "completing" || journal.run.tasks.some((candidate) => candidate.phase === "integrating" || candidate.phase === "completed")) return presentCompletionStatus(journal, note);
 	if (journal.run.tasks.some((candidate) => candidate.phase === "approved")) return presentApprovedStatus(journal, note);
 	if (journal.run.tasks.some((candidate) => candidate.phase === "reviewing")) return presentReviewStatus(journal, note);
 	const task = journal.run.tasks.find((candidate) => (candidate.phase === "building" || candidate.phase === "reworking") && candidate.attempts.at(-1)?.role === "builder");
@@ -430,6 +514,7 @@ type EvidenceDecision =
 	| { kind: "unaccepted"; journal: RunJournal; note: string };
 
 type ReviewDecision = { journal: RunJournal; note: string };
+type CompletionDecision = ReviewDecision & { completed?: boolean };
 
 function evidencePathsFor(attempt: AttemptRecord): EvidencePaths {
 	const attemptDirectory = resolve(attempt.assignmentPath, "..");
@@ -1147,6 +1232,356 @@ async function validateApprovedTasks(repositoryRoot: string, journal: RunJournal
 	return { journal, note: "" };
 }
 
+function emptyIntegrationObservation(): IntegrationCheckoutObservation {
+	return { branch: null, head: null, dirtyPaths: [], operationMarkers: [], rangeExact: false };
+}
+
+function completionAttentionReason(reason: TaskAttentionReason): boolean {
+	return ["integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed"].includes(reason);
+}
+
+async function persistCompletionAttention(repositoryRoot: string, journal: RunJournal, taskId: string, reason: TaskAttentionReason, diagnostic: string, dependencies: StewardDependencies): Promise<ReviewDecision> {
+	if (!completionAttentionReason(reason)) return { journal, note: diagnostic };
+	const task = journal.run.tasks.find((candidate) => candidate.contract.id === taskId);
+	if (!task) return { journal, note: diagnostic };
+	if (task.attention === "needs-user" && task.attentionReason === reason) return { journal, note: diagnostic };
+	let candidate: RunJournal;
+	try {
+		candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const nextTask = next.run.tasks.find((item) => item.contract.id === taskId);
+			if (!nextTask) throw new Error("Completion Task disappeared while retaining attention.");
+			if (nextTask.phase === "completed") nextTask.phase = "integrating";
+			nextTask.attention = "needs-user";
+			nextTask.attentionReason = reason;
+			nextTask.attentionDiagnostic = diagnostic.slice(0, 2_000);
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Completion state could not be retained durably; no later effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+	return persisted ? { journal: persisted, note: diagnostic } : { journal, note: `Completion state could not be retained durably; no later effect was attempted. ${diagnostic}` };
+}
+
+async function loadCompletionEvidence(repositoryRoot: string, task: TaskRecord, journal: RunJournal, dependencies: StewardDependencies): Promise<{ subject: ReviewSubject; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord; builderManifest: import("./run.ts").FinalizedEvidenceManifest; reviewerManifest: FinalizedReviewerEvidenceManifest } | { message: string }> {
+	const approval = task.approval;
+	if (!approval || approval.phase !== "valid") return { message: "Current Approval is unavailable." };
+	const builder = task.attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === approval.builderAttemptId && attempt.role === "builder");
+	const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.id === approval.reviewerAttemptId && attempt.role === "reviewer");
+	if (!builder || !reviewer || builder.evidence?.phase !== "finalized" || reviewer.evidence?.phase !== "finalized" || reviewer.evidence.verdict !== "approved" || reviewer.integrity?.kind !== "preserved") return { message: "Protected final Builder/Reviewer evidence is not finalized and approved." };
+	if (!dependencies.runJournal.loadFinalizedEvidenceManifest) return { message: "Protected finalized-manifest loading is unavailable." };
+	const builderLoaded = await dependencies.runJournal.loadFinalizedEvidenceManifest({ manifestPath: builder.evidence.manifestPath, manifestSha256: builder.evidence.manifestSha256 });
+	if (builderLoaded.kind !== "loaded") return { message: `Protected Builder manifest could not be loaded: ${builderLoaded.message}` };
+	const builderManifest = deserializeFinalizedBuilderEvidenceManifest(builderLoaded.bytes.toString("utf8"), builderLoaded.sha256);
+	if (!builderManifest.value) return { message: builderManifest.message ?? "Protected Builder manifest is invalid." };
+	if (builderManifest.value.status !== "completed" || builderManifest.value.producedRevision === null) return { message: "Protected Builder manifest is not a completed code-changing result." };
+	const derived = reviewSubjectFromFinalizedBuilderEvidence({ manifest: builderManifest.value, manifestBytes: builderLoaded.bytes, manifestSha256: builderLoaded.sha256, runId: journal.run.id, taskId: task.contract.id, builderAttemptId: builder.id, builderBaseRevision: builder.baseRevision, builderProducedRevision: builder.evidence.producedRevision });
+	if (!derived.value) return { message: derived.message ?? "Protected Builder subject could not be reconstructed." };
+	if (JSON.stringify(derived.value) !== JSON.stringify(approval.subject) || JSON.stringify(derived.value) !== JSON.stringify(reviewer.subject)) return { message: "Protected Builder/Reviewer subject changed from the current Approval." };
+	const reviewerLoaded = await dependencies.runJournal.loadFinalizedEvidenceManifest({ manifestPath: approval.reviewerManifestPath, manifestSha256: approval.reviewerManifestSha256 });
+	if (reviewerLoaded.kind !== "loaded") return { message: `Protected Reviewer manifest could not be loaded: ${reviewerLoaded.message}` };
+	const reviewerManifest = deserializeFinalizedReviewerEvidenceManifest(reviewerLoaded.bytes.toString("utf8"), reviewerLoaded.sha256);
+	if (!reviewerManifest.value || reviewerManifest.value.verdict !== "approved" || JSON.stringify(reviewerManifest.value.subject) !== JSON.stringify(approval.subject) || reviewerManifest.value.identity.attemptId !== reviewer.id || reviewerManifest.value.identity.runId !== journal.run.id || reviewerManifest.value.identity.taskId !== task.contract.id || reviewerManifest.value.report.sha256.length === 0) return { message: reviewerManifest.message ?? "Protected Reviewer manifest is invalid or no longer binds the Approval." };
+	return { subject: derived.value, builder, reviewer, builderManifest: builderManifest.value, reviewerManifest: reviewerManifest.value };
+}
+
+function completionIntegrationIdentity(journal: RunJournal, task: TaskRecord, evidence: { subject: ReviewSubject; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord }): TaskIntegration | undefined {
+	if (journal.run.integrationBase.kind !== "git" || evidence.subject.kind !== "git" || evidence.builder.evidence?.phase !== "finalized" || evidence.reviewer.evidence?.phase !== "finalized") return undefined;
+	return {
+		phase: "intended",
+		targetBranch: journal.run.integrationBase.branch,
+		targetRevision: journal.run.integrationBase.revision,
+		approvedBaseRevision: evidence.subject.baseRevision,
+		approvedHeadRevision: evidence.subject.headRevision,
+		approvedCommits: [...evidence.subject.commits],
+		builderAttemptId: evidence.builder.id,
+		reviewerAttemptId: evidence.reviewer.id,
+		builderManifestSha256: evidence.builder.evidence.manifestSha256,
+		reviewerManifestSha256: evidence.reviewer.evidence.manifestSha256,
+		action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", evidence.subject.headRevision] },
+		intendedAt: "",
+	};
+}
+
+function integrationObservationExact(input: IntegrationCheckoutInput, result: import("./steward.ts").IntegrationCheckoutResult): boolean {
+	return input.targetRevision === input.approvedBaseRevision && result.kind === "inspected" && result.observation.rangeExact && result.observation.branch === input.targetBranch && result.observation.head === input.approvedHeadRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0 && result.resolvedBaseRevision === input.approvedBaseRevision && result.resolvedHeadRevision === input.approvedHeadRevision && JSON.stringify(result.commits) === JSON.stringify(input.approvedCommits);
+}
+
+function integrationObservationUnchanged(input: IntegrationCheckoutInput, result: import("./steward.ts").IntegrationCheckoutResult): boolean {
+	return input.targetRevision === input.approvedBaseRevision && result.kind === "inspected" && result.observation.branch === input.targetBranch && result.observation.head === input.targetRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0;
+}
+
+async function inspectCompletionCheckout(input: IntegrationCheckoutInput, dependencies: StewardDependencies): Promise<import("./steward.ts").IntegrationCheckoutResult> {
+	if (!dependencies.git.inspectIntegrationCheckout) return { kind: "unavailable", message: "Read-only integration checkout inspection is unavailable." };
+	try { return await dependencies.git.inspectIntegrationCheckout(input); }
+	catch (error: unknown) { return { kind: "unavailable", message: error instanceof Error ? error.message : "Integration checkout inspection failed." }; }
+}
+
+function completionResources(journal: RunJournal): CompletionAgentIdentity[] {
+	const resources: CompletionAgentIdentity[] = [];
+	const seen = new Set<string>();
+	for (const task of journal.run.tasks) {
+		for (const attempt of task.attempts) {
+			const dispatch = attempt.dispatch;
+			if (dispatch.phase !== "prompted") continue;
+			const resource: CompletionAgentIdentity = { role: attempt.role, agentName: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
+			const key = `${resource.role}/${resource.agentName}/${resource.workspaceId}/${resource.paneId}/${resource.terminalId}`;
+			if (!seen.has(key)) { seen.add(key); resources.push(resource); }
+		}
+	}
+	return resources;
+}
+
+function completionResourceKey(resource: CompletionAgentIdentity): string {
+	return `${resource.role}/${resource.agentName}/${resource.workspaceId}/${resource.paneId}/${resource.terminalId}`;
+}
+
+function completionGateFacts(journal: RunJournal, checkout: IntegrationCheckoutObservation, dependencies: StewardDependencies): CompletionGateFacts | undefined {
+	const result = evaluateCompletionGate(journal, checkout);
+	if (!result.passed) return undefined;
+	return { ...result.facts, evaluatedAt: transitionTimestamp(journal, dependencies.clock.now()), predicates: [...COMPLETION_GATE_PREDICATES] };
+}
+
+async function collectCompletionReports(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<import("./completion-store.ts").CompletionReportSource[] | { message: string }> {
+	if (!dependencies.runJournal.loadFinalizedEvidenceManifest) return { message: "Protected finalized-manifest loading is unavailable for archive publication." };
+	const reports: import("./completion-store.ts").CompletionReportSource[] = [];
+	for (const task of journal.run.tasks) {
+		for (const attempt of task.attempts) {
+			if (!attempt.evidence || attempt.evidence.phase !== "finalized") continue;
+			const loaded = await dependencies.runJournal.loadFinalizedEvidenceManifest({ manifestPath: attempt.evidence.manifestPath, manifestSha256: attempt.evidence.manifestSha256 });
+			if (loaded.kind !== "loaded") return { message: `Protected ${attempt.role} manifest could not be loaded for archive: ${loaded.message}` };
+			let report: { finalizedPath: string; size: number; sha256: string } | undefined;
+			if (attempt.role === "builder") {
+				const parsed = deserializeFinalizedBuilderEvidenceManifest(loaded.bytes.toString("utf8"), loaded.sha256);
+				if (!parsed.value) return { message: parsed.message ?? "Protected Builder manifest is invalid for archive." };
+				report = parsed.value.report;
+			} else {
+				const parsed = deserializeFinalizedReviewerEvidenceManifest(loaded.bytes.toString("utf8"), loaded.sha256);
+				if (!parsed.value) return { message: parsed.message ?? "Protected Reviewer manifest is invalid for archive." };
+				report = parsed.value.report;
+			}
+			reports.push({ taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, sourcePath: report.finalizedPath, destinationPath: `reports/${task.contract.id}/${attempt.id}-${attempt.role}.md`, size: report.size, sha256: report.sha256 });
+		}
+	}
+	return reports.length > 0 ? reports : { message: "No protected finalized Attempt Reports were available for archive publication." };
+}
+
+async function persistStopFailure(repositoryRoot: string, journal: RunJournal, taskId: string, resource: CompletionAgentIdentity, state: CompletionStopFailure["state"], diagnostic: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	const failure: CompletionStopFailure = { state, resource: { ...resource }, observedAt: transitionTimestamp(journal, dependencies.clock.now()), diagnostic: diagnostic.slice(0, 2_000) };
+	let incomplete: RunJournal;
+	try {
+		incomplete = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const current = next.run.completion;
+			const nextTask = next.run.tasks.find((candidate) => candidate.contract.id === taskId);
+			if (!current || current.phase !== "stops-intended" || !nextTask) throw new Error("Graceful-stop intent disappeared while retaining its failure.");
+			next.run.completion = { phase: "stops-incomplete", gate: current.gate, resources: current.resources.map((item) => item.state === "acknowledged" ? { ...item, acknowledgement: { ...item.acknowledgement } } : { ...item }), failure };
+			nextTask.phase = "integrating";
+			nextTask.attention = "needs-user";
+			nextTask.attentionReason = "agent-stop-failed";
+			nextTask.attentionDiagnostic = failure.diagnostic;
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Graceful-stop failure could not be retained durably; no /quit resend or archive was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, incomplete, dependencies);
+	return persisted ? { journal: persisted, note: `Graceful stop paused at ${resource.agentName}; no archive or completion notification was attempted.` } : { journal, note: "Graceful-stop failure could not be retained durably; no /quit resend or archive was attempted." };
+}
+
+async function advanceApprovedCompletion(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	let journal = journalInput;
+	if (journal.run.status === "completing") return advanceCompletionLifecycle(repositoryRoot, journal, dependencies);
+	if (journal.run.status !== "active") return { journal, note: "" };
+	const approvedTasks = journal.run.tasks.filter((candidate) => candidate.phase === "approved" && candidate.attention === "none" && candidate.approval?.phase === "valid");
+	const integratingTask = journal.run.tasks.find((candidate) => candidate.integration?.phase === "integrated");
+	if (approvedTasks.length === 0 && !integratingTask) return { journal, note: "" };
+	if (approvedTasks.length > 1 || journal.run.tasks.length !== 1) {
+		const target = approvedTasks[0] ?? journal.run.tasks[0];
+		return target ? persistCompletionAttention(repositoryRoot, journal, target.contract.id, "integration-preflight", "Ticket-08 completion requires exactly one ordered code-changing Task; no integration effect was attempted.", dependencies) : { journal, note: "Ticket-08 completion requires exactly one ordered Task; no effect was attempted." };
+	}
+	let task = journal.run.tasks[0]!;
+	if (!task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") || !task.contract.reviewRequired) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Ticket-08 completion requires one reviewed code-changing Task; no integration effect was attempted.", dependencies);
+	if (task.phase === "approved" && task.attention === "none" && !task.integration) {
+		if (!dependencies.git.inspectIntegrationCheckout || !dependencies.git.integrateApprovedRange) return { journal, note: "Integration adapters are unavailable; Approval remains unchanged and no Git effect was attempted." };
+		const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
+		if ("message" in evidence) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", evidence.message, dependencies);
+		if (evidence.subject.kind !== "git" || journal.run.integrationBase.kind !== "git") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved completion requires a Git Builder subject and Git integration base; no Git effect was attempted.", dependencies);
+		const input: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: journal.run.integrationBase.revision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] };
+		const preflight = await inspectCompletionCheckout(input, dependencies);
+		if (input.targetRevision !== input.approvedBaseRevision || preflight.kind !== "inspected" || !preflight.observation.rangeExact || preflight.observation.branch !== input.targetBranch || preflight.observation.head !== input.targetRevision || preflight.observation.dirtyPaths.length > 0 || preflight.observation.operationMarkers.length > 0 || preflight.resolvedBaseRevision !== input.approvedBaseRevision || preflight.resolvedHeadRevision !== input.approvedHeadRevision || JSON.stringify(preflight.commits) !== JSON.stringify(input.approvedCommits)) {
+			const detail = preflight.kind === "inspected" ? `Integration checkout ${repositoryRoot} is not the clean exact target (${preflight.observation.branch ?? "detached"}@${preflight.observation.head ?? "unknown"}); the recorded Builder worktree remains untouched.` : `Integration checkout ${repositoryRoot} could not be inspected: ${preflight.message}`;
+			return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", detail, dependencies);
+		}
+		const identity = completionIntegrationIdentity(journal, task, evidence);
+		if (!identity) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved integration identity could not be reconstructed from protected Git evidence.", dependencies);
+		const intendedAt = transitionTimestamp(journal, dependencies.clock.now());
+		let intended: RunJournal;
+		try { intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const nextTask = next.run.tasks[0]!; nextTask.phase = "integrating"; nextTask.attention = "none"; delete nextTask.attentionDiagnostic; delete nextTask.attentionReason; nextTask.integration = { ...identity, phase: "intended", intendedAt }; }); }
+		catch (error: unknown) { return { journal, note: `Integration intent could not be built durably; no Git merge was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persistedIntent = await persistReviewJournal(repositoryRoot, intended, dependencies);
+		if (!persistedIntent) return { journal, note: "Integration intent could not be persisted; no Git merge was attempted." };
+		journal = persistedIntent;
+		let outcome: GitCommandOutcome;
+		try { outcome = await dependencies.git.integrateApprovedRange({ ...input, action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", input.approvedHeadRevision] } }); }
+		catch (error: unknown) { outcome = { kind: "thrown", message: error instanceof Error ? error.message : "Git fast-forward integration failed." }; }
+		const post = await inspectCompletionCheckout(input, dependencies);
+		const exact = integrationObservationExact(input, post);
+		const unchanged = integrationObservationUnchanged(input, post);
+		let classified: TaskIntegration;
+		if (exact) classified = { ...identity, phase: "integrated", intendedAt, integratedAt: transitionTimestamp(journal, dependencies.clock.now()), observedHead: input.approvedHeadRevision };
+		else if (unchanged) classified = { ...identity, phase: "failed", intendedAt, observedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: outcome.kind === "completed" ? outcome.code : null, diagnostic: outcome.kind === "completed" ? (outcome.stderr.trim() || `Git fast-forward integration exited with code ${outcome.code}.`).slice(0, 2_000) : outcome.message.slice(0, 2_000) };
+		else { const observed = post.kind === "inspected" ? post.observation : emptyIntegrationObservation(); const diagnostic = post.kind === "unavailable" ? post.message : outcome.kind === "completed" ? (outcome.stderr.trim() || "Git integration left a partial or unexpected checkout state.") : outcome.message; classified = { ...identity, phase: "ambiguous", intendedAt, observedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: outcome.kind === "completed" ? outcome.code : null, diagnostic: diagnostic.slice(0, 2_000), observed }; }
+		let classifiedJournal: RunJournal;
+		try { classifiedJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const nextTask = next.run.tasks[0]!; nextTask.integration = classified; if (classified.phase === "integrated") { nextTask.phase = "integrating"; nextTask.attention = "none"; delete nextTask.attentionDiagnostic; delete nextTask.attentionReason; } else { nextTask.phase = "integrating"; nextTask.attention = "needs-user"; nextTask.attentionReason = classified.phase === "failed" ? "integration-failed" : "integration-ambiguous"; nextTask.attentionDiagnostic = classified.diagnostic; } }); }
+		catch (error: unknown) { return { journal, note: `Git integration returned but its post-state could not be retained durably; no merge retry was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persistedClassified = await persistReviewJournal(repositoryRoot, classifiedJournal, dependencies);
+		if (!persistedClassified) return { journal, note: "Git integration returned but its post-state could not be retained durably; no merge retry was attempted." };
+		journal = persistedClassified;
+		if (classified.phase !== "integrated") return { journal, note: classified.diagnostic };
+	}
+	task = journal.run.tasks[0]!;
+	if (!task.integration || task.integration.phase === "intended") return { journal, note: task.integration ? "Integration intent is durably retained; ticket-08 will not retry or infer its post-state." : "" };
+	if (task.integration.phase !== "integrated") return { journal, note: task.attentionDiagnostic ?? "Integration is paused for user attention; no retry or recovery was attempted." };
+	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? "Integrated Task remains paused for user attention." };
+	if (!journal.run.finalVerificationExecution) {
+		if (journal.run.finalVerification.kind !== "command") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-unexecutable", "Final verification is criteria-only; ticket-08 requires one frozen executable command and did not launch a process.", dependencies);
+		if (!dependencies.process.runApprovedVerification || !dependencies.runJournal.resolveCompletionPaths || !dependencies.runJournal.finalizeVerificationResult) return { journal, note: "Final-verification process/storage adapters are unavailable; no process was launched." };
+		const paths = dependencies.runJournal.resolveCompletionPaths(repositoryRoot, journal.run.id);
+		const intendedAt = transitionTimestamp(journal, dependencies.clock.now());
+		let intended: RunJournal;
+		try { intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.finalVerificationExecution = { phase: "intended", id: "verification-01", command: journal.run.finalVerification.kind === "command" ? journal.run.finalVerification.command : "", cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt }; }); }
+		catch (error: unknown) { return { journal, note: `Final-verification intent could not be persisted; no process was launched. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persistedIntent = await persistReviewJournal(repositoryRoot, intended, dependencies);
+		if (!persistedIntent) return { journal, note: "Final-verification intent could not be persisted; no process was launched." };
+		journal = persistedIntent;
+		const command = journal.run.finalVerification.kind === "command" ? journal.run.finalVerification.command : "";
+		const startedAt = transitionTimestamp(journal, dependencies.clock.now());
+		let processResult: VerificationProcessOutcome;
+		try { processResult = await dependencies.process.runApprovedVerification({ cwd: repositoryRoot, command }); }
+		catch (error: unknown) { processResult = { kind: "thrown", message: error instanceof Error ? error.message : "Final-verification process failed." }; }
+		const post = await inspectCompletionCheckout({ repositoryRoot, targetBranch: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.branch : "", targetRevision: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.revision : "", approvedBaseRevision: task.integration.approvedBaseRevision, approvedHeadRevision: task.integration.approvedHeadRevision, approvedCommits: [...task.integration.approvedCommits] }, dependencies);
+		let logSha256: string | undefined;
+		let resultSha256: string | undefined;
+		let finalizedResult: VerificationFinalizeResult | undefined;
+		if (processResult.kind === "completed" && processResult.killed === false) {
+			try { finalizedResult = await dependencies.runJournal.finalizeVerificationResult({ repositoryRoot, runId: journal.run.id, command, cwd: repositoryRoot, startedAt, completedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: processResult.code, killed: false, stdout: processResult.stdout, stderr: processResult.stderr }); }
+			catch (error: unknown) { finalizedResult = { kind: "storage-error", paths, message: error instanceof Error ? error.message : "Final-verification result storage failed." }; }
+			if (finalizedResult.kind === "created" || finalizedResult.kind === "existing-match") { logSha256 = finalizedResult.logSha256; resultSha256 = finalizedResult.resultSha256; }
+		}
+		const exact = post.kind === "inspected" && integrationObservationExact({ repositoryRoot, targetBranch: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.branch : "", targetRevision: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.revision : "", approvedBaseRevision: task.integration.approvedBaseRevision, approvedHeadRevision: task.integration.approvedHeadRevision, approvedCommits: [...task.integration.approvedCommits] }, post);
+		const outputStorageOk = Boolean(logSha256 && resultSha256 && finalizedResult && (finalizedResult.kind === "created" || finalizedResult.kind === "existing-match"));
+		let execution: FinalVerificationExecution;
+		let reason: TaskAttentionReason | undefined;
+		if (processResult.kind === "completed" && processResult.killed === false && outputStorageOk && processResult.code !== 0 && post.kind === "inspected") {
+			execution = { phase: "failed", id: "verification-01", command, cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt, startedAt, completedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: processResult.code, killed: false, logSha256: logSha256!, resultSha256: resultSha256!, checkout: post.observation }; reason = "final-verification-failed";
+		} else if (processResult.kind === "completed" && processResult.killed === false && processResult.code === 0 && outputStorageOk && exact && post.kind === "inspected") {
+			execution = { phase: "passed", id: "verification-01", command, cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt, startedAt, completedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: 0, killed: false, logSha256: logSha256!, resultSha256: resultSha256!, checkout: post.observation };
+		} else if (processResult.kind === "completed" && processResult.killed === false && outputStorageOk && post.kind === "inspected") {
+			execution = { phase: "ambiguous", id: "verification-01", command, cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt, observedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: processResult.code, killed: false, diagnostic: exact ? "Verification output was durably stored but the result could not be classified as a conclusive pass or failure." : "Final verification changed or dirtied the integration checkout; preserved state requires user attention.", logSha256, resultSha256, checkout: post.observation }; reason = exact ? "final-verification-ambiguous" : "verification-dirtied-checkout";
+		} else {
+			const storageDiagnostic = finalizedResult && "message" in finalizedResult ? finalizedResult.message : undefined;
+			execution = { phase: "ambiguous", id: "verification-01", command, cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt, observedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: processResult.kind === "completed" ? processResult.code : null, killed: processResult.kind === "completed" ? processResult.killed : null, diagnostic: processResult.kind === "thrown" ? processResult.message.slice(0, 2_000) : storageDiagnostic ? storageDiagnostic.slice(0, 2_000) : post.kind === "unavailable" ? post.message.slice(0, 2_000) : "Final verification acknowledgement was killed or incomplete.", ...(logSha256 ? { logSha256 } : {}), ...(resultSha256 ? { resultSha256 } : {}), ...(post.kind === "inspected" ? { checkout: post.observation } : {}) }; reason = post.kind === "inspected" && !exact ? "verification-dirtied-checkout" : "final-verification-ambiguous";
+		}
+		let completed: RunJournal;
+		try { completed = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.finalVerificationExecution = execution; const nextTask = next.run.tasks[0]!; nextTask.phase = "integrating"; nextTask.attention = reason ? "needs-user" : "none"; if (reason) { nextTask.attentionReason = reason; nextTask.attentionDiagnostic = execution.phase === "ambiguous" ? execution.diagnostic : execution.phase === "failed" ? "Final verification returned a nonzero exit code." : "Final verification requires user attention."; } else { delete nextTask.attentionReason; delete nextTask.attentionDiagnostic; } }); }
+		catch (error: unknown) { return { journal, note: `Final-verification result could not be retained durably; no process rerun was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, completed, dependencies);
+		if (!persisted) return { journal, note: "Final-verification result could not be retained durably; no process rerun was attempted." };
+		journal = persisted;
+		if (reason) return { journal, note: journal.run.tasks[0]?.attentionDiagnostic ?? "Final verification is paused for user attention." };
+	}
+	task = journal.run.tasks[0]!;
+	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? "Final verification is paused for user attention; no rerun was attempted." };
+	const execution = journal.run.finalVerificationExecution;
+	if (!execution || execution.phase !== "passed") return { journal, note: "Final verification has not produced a conclusive passing result; no rerun was attempted." };
+	const checkout = execution.checkout;
+	const gate = completionGateFacts(journal, checkout, dependencies);
+	if (!gate) {
+		const result = evaluateCompletionGate(journal, checkout);
+		return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", `Completion Gate failed: ${result.passed ? "unknown" : result.failures.join(" ")}`, dependencies);
+	}
+	let gateJournal: RunJournal;
+	try { gateJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.status = "completing"; next.run.tasks[0]!.phase = "completed"; next.run.tasks[0]!.attention = "none"; delete next.run.tasks[0]!.attentionReason; delete next.run.tasks[0]!.attentionDiagnostic; next.run.completion = { phase: "gate-passed", gate }; }); }
+	catch (error: unknown) { return { journal, note: `Completion Gate passed in memory but could not be retained durably; no agent stop or archive effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedGate = await persistReviewJournal(repositoryRoot, gateJournal, dependencies);
+	if (!persistedGate) return { journal, note: "Completion Gate passed in memory but could not be retained durably; no agent stop or archive effect was attempted." };
+	return advanceCompletionLifecycle(repositoryRoot, persistedGate, dependencies);
+}
+
+async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	let journal = journalInput;
+	const task = journal.run.tasks[0];
+	if (!task || journal.run.status !== "completing" || !journal.run.completion) return { journal, note: "" };
+	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? `Completion is paused (${task.attentionReason ?? "needs-user"}).` };
+	let completion = journal.run.completion;
+	if (completion.phase === "gate-passed") {
+		const resources = completionResources(journal).map((resource) => ({ ...resource, state: "intended" as const, intendedAt: transitionTimestamp(journal, dependencies.clock.now()) }));
+		if (resources.length === 0) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "agent-stop-failed", "No distinct prompted Steward-created Builder or Reviewer resource was available for graceful stop.", dependencies);
+		let intended: RunJournal;
+		try { intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.completion = { phase: "stops-intended", gate: next.run.completion!.gate, resources }; }); }
+		catch (error: unknown) { return { journal, note: `Graceful-stop intent could not be persisted; no /quit was sent. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, intended, dependencies);
+		if (!persisted) return { journal, note: "Graceful-stop intent could not be persisted; no /quit was sent." };
+		journal = persisted;
+		completion = journal.run.completion!;
+	}
+	if (completion.phase === "stops-intended") {
+		const stopCompletion = completion;
+		if (!dependencies.herdr.stopAgentGracefully) return persistStopFailure(repositoryRoot, journal, task.contract.id, stopCompletion.resources.find((resource) => resource.state === "intended") ?? stopCompletion.resources[0]!, "failed", "Graceful Herdr /quit is unavailable; no lifecycle inference, pane closure, or worktree cleanup was attempted.", dependencies);
+		for (let index = 0; index < stopCompletion.resources.length; index += 1) {
+			const resource = stopCompletion.resources[index]!;
+			if (resource.state === "acknowledged") continue;
+			let stopped: HerdrStopResult;
+			try { stopped = await dependencies.herdr.stopAgentGracefully({ repositoryRoot, name: resource.agentName, workspaceId: resource.workspaceId, paneId: resource.paneId, terminalId: resource.terminalId }); }
+			catch (error: unknown) { stopped = { kind: "ambiguous", message: error instanceof Error ? error.message : "Graceful /quit failed." }; }
+			if (stopped.kind !== "acknowledged" || stopped.name !== resource.agentName || stopped.workspaceId !== resource.workspaceId || stopped.paneId !== resource.paneId || stopped.terminalId !== resource.terminalId || !validIdentity(stopped.tabId)) {
+				return persistStopFailure(repositoryRoot, journal, task.contract.id, resource, stopped.kind === "ambiguous" ? "ambiguous" : "failed", stopped.kind === "acknowledged" ? "Herdr /quit acknowledgement identity did not match the recorded resource." : stopped.message, dependencies);
+			}
+			let acknowledged: RunJournal;
+			try { acknowledged = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const current = next.run.completion; if (!current || current.phase !== "stops-intended") throw new Error("Graceful-stop intent disappeared after acknowledgement."); current.resources[index] = { ...resource, state: "acknowledged", acknowledgedAt: transitionTimestamp(journal, dependencies.clock.now()), acknowledgement: { name: stopped.name, workspaceId: stopped.workspaceId, tabId: stopped.tabId, paneId: stopped.paneId, terminalId: stopped.terminalId } }; }); }
+			catch (error: unknown) { return persistStopFailure(repositoryRoot, journal, task.contract.id, resource, "ambiguous", `Graceful-stop acknowledgement could not be retained; no resend will be attempted. ${error instanceof Error ? error.message : "Journal validation failed."}`, dependencies); }
+			const persisted = await persistReviewJournal(repositoryRoot, acknowledged, dependencies);
+			if (!persisted) return persistStopFailure(repositoryRoot, journal, task.contract.id, resource, "ambiguous", "Graceful-stop acknowledgement could not be persisted; no resend will be attempted.", dependencies);
+			journal = persisted;
+			completion = journal.run.completion!;
+		}
+		completion = journal.run.completion!;
+		if (completion.phase === "stops-intended" && completion.resources.every((resource) => resource.state === "acknowledged")) {
+			let complete: RunJournal;
+			try { complete = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const current = next.run.completion; if (!current || current.phase !== "stops-intended") throw new Error("Graceful-stop state disappeared."); next.run.completion = { phase: "stops-complete", gate: current.gate, resources: current.resources.filter((resource): resource is Extract<CompletionStopResource, { state: "acknowledged" }> => resource.state === "acknowledged") }; }); }
+			catch (error: unknown) { return { journal, note: `Graceful-stop completion could not be persisted; archive was not attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+			const persisted = await persistReviewJournal(repositoryRoot, complete, dependencies);
+			if (!persisted) return { journal, note: "Graceful-stop completion could not be persisted; archive was not attempted." };
+			journal = persisted;
+			completion = journal.run.completion!;
+		}
+	}
+	if (completion.phase === "stops-incomplete") return { journal, note: "Graceful stop is durably incomplete; no /quit resend, archive, cleanup, or notification was attempted." };
+	if (completion.phase === "stops-complete") {
+		const execution = journal.run.finalVerificationExecution;
+		if (!execution || execution.phase !== "passed" || !dependencies.runJournal.resolveCompletionPaths || !dependencies.runJournal.archiveCompletedRun || !dependencies.runJournal.loadCompletionJournalPointers) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", "Completed Run storage adapters or the immutable verification result are unavailable; archive was not attempted.", dependencies);
+		const reports = await collectCompletionReports(repositoryRoot, journal, dependencies);
+		if ("message" in reports) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", reports.message, dependencies);
+		const paths = dependencies.runJournal.resolveCompletionPaths(repositoryRoot, journal.run.id);
+		const pointers = await dependencies.runJournal.loadCompletionJournalPointers(repositoryRoot);
+		if (pointers.kind !== "loaded") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", pointers.message, dependencies);
+		const archive: CompletionArchiveIntent = { intendedAt: transitionTimestamp(journal, dependencies.clock.now()), archiveDirectory: paths.archiveDirectory, runPath: paths.archiveRunPath, previousRunPath: paths.archivePreviousRunPath, manifestPath: paths.archiveManifestPath, activeJournalSha256: sha256Bytes(pointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(pointers.pointers.previousBytes), verification: { logPath: execution.logPath, resultPath: execution.resultPath, logSha256: execution.logSha256, resultSha256: execution.resultSha256 }, reports };
+		let archiveIntentJournal: RunJournal;
+		try { archiveIntentJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const current = next.run.completion; if (!current || current.phase !== "stops-complete") throw new Error("Graceful-stop completion disappeared before archive intent."); next.run.completion = { phase: "archive-intended", gate: current.gate, resources: current.resources.map((resource) => ({ ...resource, acknowledgement: { ...resource.acknowledgement } })), archive }; }); }
+		catch (error: unknown) { return { journal, note: `Archive intent could not be persisted; active evidence was preserved. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, archiveIntentJournal, dependencies);
+		if (!persisted) return { journal, note: "Archive intent could not be persisted; active evidence was preserved." };
+		journal = persisted;
+		const finalPointers = await dependencies.runJournal.loadCompletionJournalPointers(repositoryRoot);
+		if (finalPointers.kind !== "loaded") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", finalPointers.message, dependencies);
+		const finalJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const current = next.run.completion; if (!current || current.phase !== "archive-intended") throw new Error("Archive intent disappeared before final snapshot."); const archive = { ...current.archive, activeJournalSha256: sha256Bytes(finalPointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(finalPointers.pointers.previousBytes) }; next.run.status = "completed"; next.run.tasks[0]!.phase = "completed"; next.run.tasks[0]!.attention = "none"; delete next.run.tasks[0]!.attentionReason; delete next.run.tasks[0]!.attentionDiagnostic; next.run.completion = { phase: "archived", gate: current.gate, resources: current.resources.map((resource) => ({ ...resource, acknowledgement: { ...resource.acknowledgement } })), archive, archivedAt: transitionTimestamp(journal, dependencies.clock.now()) }; }, "archive/run.json");
+		const published = await dependencies.runJournal.archiveCompletedRun({ repositoryRoot, runId: journal.run.id, run: finalJournal, archivedAt: finalJournal.run.completion?.phase === "archived" ? finalJournal.run.completion.archivedAt : dependencies.clock.now().toISOString(), verification: archive.verification, reports });
+		if (published.kind !== "published" && published.kind !== "existing-match") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", `Completion archive was not published: ${"message" in published ? published.message : "unknown archive failure"}`, dependencies);
+		await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: finalJournal.run.updatedAt, runId: finalJournal.run.id, event: "run-completed", message: `Run ${finalJournal.run.id} was archived at ${paths.archiveDirectory}.` }).catch(() => undefined);
+		try { dependencies.ui.notifyCompletion?.({ runId: journal.run.id, targetBranch: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.branch : "unknown", integratedHead: completion.gate.integratedHead, verificationResultPath: execution.resultPath, verificationLogPath: execution.logPath, archivePath: paths.archiveDirectory }); } catch { /* The archive remains authoritative if UI delivery fails. */ }
+		return { journal: finalJournal, note: `Run ${journal.run.id} archived and completion notification was attempted.`, completed: true };
+	}
+	return { journal, note: "" };
+}
+
 async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, findings: import("./review.ts").ReviewerFinding[], dependencies: StewardDependencies): Promise<ReviewDecision> {
 	let journal = journalInput;
 	const previousDispatch = candidate.builder.dispatch;
@@ -1456,7 +1891,10 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 				: await advanceEligibleReview(repositoryRoot, controllerSessionId, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
 			currentJournal = review.journal;
 			if (review.note) note = note ? `${note} ${review.note}` : review.note;
-			statusView = presentStatusForJournal(currentJournal, note);
+			const completion = await advanceApprovedCompletion(repositoryRoot, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
+			currentJournal = completion.journal;
+			if (completion.note) note = note ? `${note} ${completion.note}` : completion.note;
+			statusView = completion.completed ? presentCompletedStatus(currentJournal, completion.note) : presentStatusForJournal(currentJournal, note);
 		} else if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && loaded.journal.run.controllerSessionId !== controllerSessionId) {
 			statusView = presentStatusForJournal(loaded.journal, "Controller Session does not match; evidence validation is read-only until the authorized Controller returns.");
 		}

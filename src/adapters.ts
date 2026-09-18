@@ -31,6 +31,7 @@ import type {
 	StewardDependencies,
 	StewardGitAdapter,
 	StewardHerdrAdapter,
+	StewardProcessAdapter,
 	StewardClockAdapter,
 	StewardModelAdapter,
 	StewardUiAdapter,
@@ -78,6 +79,10 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		inspectReferencedReviewerEvidence: runStore.inspectReferencedReviewerEvidence,
 		finalizeBuilderEvidence: runStore.finalizeBuilderEvidence,
 		finalizeReviewerEvidence: runStore.finalizeReviewerEvidence,
+		resolveCompletionPaths: runStore.resolveCompletionPaths,
+		finalizeVerificationResult: runStore.finalizeVerificationResult,
+		archiveCompletedRun: runStore.archiveCompletedRun,
+		loadCompletionJournalPointers: runStore.loadCompletionJournalPointers,
 		loadRecoveryDefaults: () => configStore.loadRecoveryDefaults(),
 		loadModelPlans: (repositoryRoot) => configStore.loadModelPlans(repositoryRoot),
 		saveRecoveryDefaults: (recovery) => configStore.saveRecoveryDefaults(recovery),
@@ -514,6 +519,36 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			const error = safeErrorEnvelope(result);
 			return { kind: "failed", stage: "agent-prompt", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid Reviewer agent_prompted envelope." };
 		},
+		async stopAgentGracefully(input) {
+			if (!exec) return { kind: "failed", message: "The Pi command runner is unavailable." };
+			let result: ExecResult;
+			try {
+				result = await exec("herdr", ["agent", "prompt", input.name, "/quit"], { cwd: input.repositoryRoot, timeout: 30000 });
+			} catch (error: unknown) {
+				return { kind: "ambiguous", message: error instanceof Error ? error.message : "Herdr /quit prompt failed." };
+			}
+			const value = resultObject(safeEnvelope(result));
+			const identity = identityFields(objectValue(value?.agent));
+			if (value?.type === "agent_prompted" && identity && identity.name === input.name && identity.workspaceId === input.workspaceId && identity.paneId === input.paneId && identity.terminalId === input.terminalId) return { kind: "acknowledged", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+			const error = safeErrorEnvelope(result);
+			return { kind: result.killed ? "ambiguous" : "failed", message: error?.message ?? "Herdr returned no valid same-identity /quit acknowledgement." };
+		},
+	};
+}
+
+/** Execute only the Controller-owned frozen verification envelope. */
+export function createProcessAdapter(exec: CommandRunner | undefined): StewardProcessAdapter {
+	return {
+		async runApprovedVerification(input) {
+			if (!exec) return { kind: "thrown", message: "The Pi command runner is unavailable." };
+			if (input.command.length === 0 || input.command !== input.command.trim() || !isAbsolute(input.cwd) || input.cwd !== resolve(input.cwd)) return { kind: "thrown", message: "Verification command or cwd is not an exact safe value." };
+			try {
+				const result = await exec("/bin/sh", ["-c", input.command], { cwd: input.cwd });
+				return { kind: "completed", code: result.code, stdout: result.stdout, stderr: result.stderr, killed: result.killed };
+			} catch (error: unknown) {
+				return { kind: "thrown", message: error instanceof Error ? error.message : "Verification process failed before a result was returned." };
+			}
+		},
 	};
 }
 
@@ -626,6 +661,46 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 				return { kind: "inspected", base: input.approvedBase, head: input.producedHead, commits, changedPaths, clean: true };
 			} catch (error: unknown) {
 				return { kind: "invalid", code: "git-inspection-failed", message: error instanceof Error ? error.message : "Git Artifact inspection failed." };
+			}
+		},
+		async inspectIntegrationCheckout(input) {
+			if (!/^[0-9a-f]{40}$/.test(input.targetRevision) || !/^[0-9a-f]{40}$/.test(input.approvedBaseRevision) || !/^[0-9a-f]{40}$/.test(input.approvedHeadRevision) || input.approvedCommits.length === 0 || input.approvedCommits.some((commit) => !/^[0-9a-f]{40}$/.test(commit))) return unavailable("Integration checkout inspection requires full immutable revisions.");
+			try {
+				const inside = await run(input.repositoryRoot, ["rev-parse", "--is-inside-work-tree"]);
+				if (inside.code !== 0 || inside.killed || inside.stderr.length > 0 || inside.stdout.trim() !== "true") return unavailable("Integration checkout is not a Git worktree.");
+				const branch = await run(input.repositoryRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+				const head = await run(input.repositoryRoot, ["rev-parse", "--verify", "HEAD"]);
+				if (branch.code !== 0 || branch.killed || branch.stderr.length > 0 || head.code !== 0 || head.killed || head.stderr.length > 0 || !/^[0-9A-Za-z._/-]+\n?$/.test(branch.stdout) || !/^[0-9a-f]{40}\n?$/.test(head.stdout)) return unavailable("Integration checkout branch or HEAD is not a strict attached full revision.");
+				const status = await run(input.repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
+				const dirtyPaths = parsePorcelainPaths(status.stdout, status.code, status.killed, status.stderr);
+				if (!dirtyPaths) return unavailable("Integration checkout dirty-state output was malformed.");
+				const markerRoot = await operationMarkerRoot(input.repositoryRoot);
+				const operationMarkers: string[] = [];
+				for (const marker of ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"]) {
+					try { lstatSync(join(markerRoot, marker)); operationMarkers.push(marker); } catch (error: unknown) { if (!isMissing(error)) return unavailable(`Git operation state could not be inspected (${marker}).`); }
+				}
+				operationMarkers.sort();
+				const resolvedBase = await run(input.repositoryRoot, ["rev-parse", "--verify", `${input.approvedBaseRevision}^{commit}`]);
+				const resolvedHead = await run(input.repositoryRoot, ["rev-parse", "--verify", `${input.approvedHeadRevision}^{commit}`]);
+				if (resolvedBase.code !== 0 || resolvedBase.killed || resolvedBase.stderr.length > 0 || resolvedHead.code !== 0 || resolvedHead.killed || resolvedHead.stderr.length > 0 || !/^[0-9a-f]{40}\n?$/.test(resolvedBase.stdout) || !/^[0-9a-f]{40}\n?$/.test(resolvedHead.stdout)) return unavailable("Approved integration revisions could not be resolved exactly.");
+				const ancestor = await run(input.repositoryRoot, ["merge-base", "--is-ancestor", input.approvedBaseRevision, input.approvedHeadRevision]);
+				const range = await run(input.repositoryRoot, ["rev-list", "--reverse", `${input.approvedBaseRevision}..${input.approvedHeadRevision}`]);
+				if (range.code !== 0 || range.killed || range.stderr.length > 0 || (range.stdout.length > 0 && !range.stdout.endsWith("\n"))) return unavailable("Approved Git range output was malformed.");
+				const commits = range.stdout.length === 0 ? [] : range.stdout.trimEnd().split("\n");
+				if (commits.some((commit) => !/^[0-9a-f]{40}$/.test(commit)) || new Set(commits).size !== commits.length) return unavailable("Approved Git range contained malformed or duplicate revisions.");
+				const observation = { branch: branch.stdout.trim(), head: head.stdout.trim(), dirtyPaths, operationMarkers, rangeExact: resolvedBase.stdout.trim() === input.approvedBaseRevision && resolvedHead.stdout.trim() === input.approvedHeadRevision && ancestor.code === 0 && !ancestor.killed && ancestor.stderr.length === 0 && JSON.stringify(commits) === JSON.stringify(input.approvedCommits) };
+				return { kind: "inspected", observation, resolvedBaseRevision: resolvedBase.stdout.trim(), resolvedHeadRevision: resolvedHead.stdout.trim(), commits };
+			} catch (error: unknown) {
+				return unavailable(error instanceof Error ? error.message : "Integration checkout inspection failed.");
+			}
+		},
+		async integrateApprovedRange(input) {
+			if (input.action.kind !== "fast-forward" || JSON.stringify(input.action.argv) !== JSON.stringify(["merge", "--ff-only", "--no-edit", input.approvedHeadRevision])) return { kind: "thrown", message: "Integration action is not the fixed fast-forward envelope." };
+			try {
+				const result = await run(input.repositoryRoot, ["merge", "--ff-only", "--no-edit", input.approvedHeadRevision]);
+				return { kind: "completed", code: result.code, stdout: result.stdout, stderr: result.stderr, killed: result.killed };
+			} catch (error: unknown) {
+				return { kind: "thrown", message: error instanceof Error ? error.message : "Git fast-forward integration failed before a result was returned." };
 			}
 		},
 	};
@@ -793,6 +868,10 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		ui.notify(result.message, result.kind === "started" || result.kind === "started-and-dispatched" ? "info" : result.kind === "started-with-warning" || result.kind === "started-and-dispatched-with-warning" || result.kind === "started-dispatch-pending" ? "warning" : result.kind === "cancelled" ? "info" : "error");
 	}
 
+	function notifyCompletion(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void {
+		ui.notify(`Steward Run ${input.runId} completed on ${input.targetBranch} at ${input.integratedHead}. Final verification: ${input.verificationResultPath} (output: ${input.verificationLogPath}). Archive: ${input.archivePath}`, "info");
+	}
+
 	async function confirmSameFamilyReview(input: { builderModel: ModelChoice; reviewerModel: ModelChoice; subject: import("./review.ts").ReviewSubject; provider: string }): Promise<boolean> {
 		const dialogs = getDialogSurface(ui);
 		const subject = input.subject.kind === "git" ? `Git ${input.subject.baseRevision}..${input.subject.headRevision} (${input.subject.commits.length} commit(s))` : `non-Git artifacts: ${input.subject.artifacts.map((artifact) => artifact.identity).join(", ")}`;
@@ -807,17 +886,17 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		confirmRun: (summary) => ui.confirm!("Confirm Steward Run", summary.markdown),
 		confirmSameFamilyReview,
 		presentStartResult,
+		notifyCompletion,
 	};
 }
 
 /** Assemble production adapters for one request without growing the seven-slot seam. */
 export function createProductionAdapters(request: StewardHostRequest, options?: ConfigStoreOptions): StewardDependencies {
-	const emptyProcess: OpaqueAdapter = {};
 	return {
 		runJournal: createRunJournalAdapter(options),
 		herdr: createHerdrAdapter(request.exec),
 		git: createGitAdapter(request.exec),
-		process: emptyProcess,
+		process: createProcessAdapter(request.exec),
 		model: createPiModelAdapter(request.modelRegistry, request.scopedModels),
 		clock: createClockAdapter(),
 		ui: createPiUiAdapter(request.ui),

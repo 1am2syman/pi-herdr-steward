@@ -6,6 +6,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
 import { createAttemptEvidenceStore, type BuilderEvidenceInputRequest, type BuilderEvidenceInputs, type FinalizeBuilderEvidenceRequest, type FinalizeBuilderEvidenceResult, type ReferencedEvidenceRequest, type ReferencedEvidenceResult, type ReviewerEvidenceInputRequest, type ReviewerEvidenceInputs, type ReferencedReviewerEvidenceRequest, type ReferencedReviewerEvidenceResult, type FinalizeReviewerEvidenceRequest, type FinalizeReviewerEvidenceResult, type FinalizedManifestLoadResult } from "./attempt-evidence-store.ts";
+import { archiveCompletedRun, finalizeVerificationResult, resolveCompletionPaths, type ArchiveCompletedRunRequest, type ArchiveCompletedRunResult, type CompletionJournalPointers, type CompletionPaths, type VerificationEvidenceInput, type VerificationFinalizeResult } from "./completion-store.ts";
 import {
 	ensureProjectStateDirectory,
 	ensureOwnedDirectory,
@@ -68,6 +69,10 @@ export interface RunJournalStore {
 	inspectReferencedReviewerEvidence(input: ReferencedReviewerEvidenceRequest): Promise<ReferencedReviewerEvidenceResult>;
 	finalizeBuilderEvidence(input: FinalizeBuilderEvidenceRequest): Promise<FinalizeBuilderEvidenceResult>;
 	finalizeReviewerEvidence(input: FinalizeReviewerEvidenceRequest): Promise<FinalizeReviewerEvidenceResult>;
+	resolveCompletionPaths(repositoryRoot: string, runId: string): CompletionPaths;
+	finalizeVerificationResult(input: VerificationEvidenceInput): Promise<VerificationFinalizeResult>;
+	archiveCompletedRun(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult>;
+	loadCompletionJournalPointers(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: CompletionJournalPointers } | { kind: "unavailable"; message: string }>;
 }
 
 const ACTIVE_NAME = "active-run.json";
@@ -309,6 +314,29 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		}
 	}
 
+	async function archiveRun(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult> {
+		const paths = resolvePaths(input.repositoryRoot);
+		const active = await readJournalFile(paths.activePath);
+		const previous = await readJournalFile(paths.previousPath);
+		if (active.kind !== "loaded" || previous.kind !== "loaded") {
+			const completionPaths = resolveCompletionPaths(input.repositoryRoot, input.runId, configDirName);
+			return { kind: "storage-error", paths: completionPaths, message: "Both active and previous Journal pointers must be loaded before archive publication.", deletedActive: false, deletedPrevious: false };
+		}
+		return archiveCompletedRun({ ...input, activeRunBytes: Buffer.from(active.bytes, "utf8"), previousRunBytes: Buffer.from(previous.bytes, "utf8"), configDirName });
+	}
+
+	async function loadCompletionJournalPointers(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: CompletionJournalPointers } | { kind: "unavailable"; message: string }> {
+		const paths = resolvePaths(repositoryRoot);
+		try {
+			const active = await readJournalFile(paths.activePath);
+			const previous = await readJournalFile(paths.previousPath);
+			if (active.kind !== "loaded" || previous.kind !== "loaded") return { kind: "unavailable", message: "Active and previous Journal pointers must both be valid regular Journals." };
+			return { kind: "loaded", pointers: { activePath: paths.activePath, previousPath: paths.previousPath, activeBytes: Buffer.from(active.bytes, "utf8"), previousBytes: Buffer.from(previous.bytes, "utf8") } };
+		} catch (error: unknown) {
+			return { kind: "unavailable", message: filesystemErrorText(error) };
+		}
+	}
+
 	return {
 		resolvePaths,
 		probeActive,
@@ -325,6 +353,10 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		inspectReferencedReviewerEvidence: evidenceStore.inspectReferencedReviewerEvidence,
 		finalizeBuilderEvidence: evidenceStore.finalizeBuilderEvidence,
 		finalizeReviewerEvidence: evidenceStore.finalizeReviewerEvidence,
+		resolveCompletionPaths: (repositoryRoot, runId) => resolveCompletionPaths(repositoryRoot, runId, configDirName),
+		finalizeVerificationResult,
+		archiveCompletedRun: archiveRun,
+		loadCompletionJournalPointers,
 	};
 }
 
