@@ -29,14 +29,15 @@ type ReviewHooks = {
 	onPane?: (journal: RunJournal, input: { sourcePaneId: string; worktreePath: string; agentName: string; workspaceId: string }) => Promise<void>;
 	onStart?: (journal: RunJournal, input: { name: string; paneId: string; model: ModelChoice }) => Promise<void>;
 	onPrompt?: (journal: RunJournal, input: { name: string; assignmentPrompt: string; assignmentBytes: string }) => Promise<void>;
+	onBuilderPrompt?: (journal: RunJournal, input: { name: string; assignmentPrompt: string }) => Promise<void>;
 };
 
-function draft(builderPrimaryModel = "builder/builder"): RunDraft {
+function draft(builderPrimaryModel = "builder/builder", reworkCycleLimit = recovery.reworkCycleLimit): RunDraft {
 	const modelPlan: ProjectModelPlans = {
 		builder: { primary: { model: builderPrimaryModel, thinkingLevel: "high" }, fallbacks: [] },
 		reviewer: { primary: { model: "builder/reviewer", thinkingLevel: "high" }, fallbacks: [{ model: "other/unavailable", thinkingLevel: "medium" }, { model: "other/reviewer", thinkingLevel: "medium" }] },
 	};
-	return { declaredOutcome: "Build and independently review", tasks: [{ requiredOutcome: "Implement the change", allowedScope: ["src"], expectedArtifacts: [{ kind: "git-commit" }, { kind: "file", path: "src/change.ts" }], verification: { kind: "command", command: "npm test" }, reviewRequired: true }], modelPlan, effectiveSettings: recovery, finalVerification: { kind: "command", command: "npm test" } };
+	return { declaredOutcome: "Build and independently review", tasks: [{ requiredOutcome: "Implement the change", allowedScope: ["src"], expectedArtifacts: [{ kind: "git-commit" }, { kind: "file", path: "src/change.ts" }], verification: { kind: "command", command: "npm test" }, reviewRequired: true }], modelPlan, effectiveSettings: { ...recovery, reworkCycleLimit }, finalVerification: { kind: "command", command: "npm test" } };
 }
 
 function context(root: string, sessionId = "controller-session"): StewardCommandContext {
@@ -57,7 +58,7 @@ async function invoke(root: string, dependencies: StewardDependencies, command: 
 	return view;
 }
 
-function makeDependencies(root: string, options: { snapshots?: Array<{ head: string; dirtyStateFingerprint: string; dirtyPaths: string[]; operationMarkers: string[] }>; confirmSameFamily?: boolean; sameFamilyOnly?: boolean; noReviewerModels?: boolean; inspectionCalls?: string[]; confirmationCalls?: number[]; builderPrimaryModel?: string; builderActualModel?: ModelChoice; reviewFailure?: "pane" | "agent" | "prompt"; reviewHooks?: ReviewHooks } = {}): StewardDependencies {
+	function makeDependencies(root: string, options: { snapshots?: Array<{ head: string; dirtyStateFingerprint: string; dirtyPaths: string[]; operationMarkers: string[] }>; confirmSameFamily?: boolean; sameFamilyOnly?: boolean; noReviewerModels?: boolean; inspectionCalls?: string[]; confirmationCalls?: number[]; builderPrimaryModel?: string; builderActualModel?: ModelChoice; reworkCycleLimit?: number; reviewFailure?: "pane" | "agent" | "prompt"; reviewHooks?: ReviewHooks } = {}): StewardDependencies {
 	const productionRunJournal = createRunJournalAdapter();
 	let builderActualModelStarted = false;
 	const runJournal: StewardDependencies["runJournal"] = {
@@ -84,7 +85,7 @@ function makeDependencies(root: string, options: { snapshots?: Array<{ head: str
 		presentStatus() {},
 		async editConfiguration() { return { kind: "cancelled" }; },
 		presentConfigurationResult() {},
-		async draftRun() { return { kind: "drafted" as const, draft: draft(options.builderPrimaryModel) }; },
+		async draftRun() { return { kind: "drafted" as const, draft: draft(options.builderPrimaryModel, options.reworkCycleLimit ?? recovery.reworkCycleLimit) }; },
 		async confirmRun() { return true; },
 		async confirmSameFamilyReview() { if (options.confirmationCalls) options.confirmationCalls[0] = (options.confirmationCalls[0] ?? 0) + 1; return options.confirmSameFamily ?? false; },
 		presentStartResult() {},
@@ -95,7 +96,7 @@ function makeDependencies(root: string, options: { snapshots?: Array<{ head: str
 			async checkAvailability() { return { kind: "available", status: "running", running: true, compatible: true, endpointCompatible: true }; },
 			async createBuilderWorktree(input) { return { kind: "created", branch: input.branch, path: builderPath, workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
 			async startBuilder() { const active = await runJournal.loadActive(root); if (active.kind !== "loaded") throw new Error("missing journal"); const attempt = active.journal.run.tasks[0]!.attempts[0]!; builderActualModelStarted = Boolean(options.builderActualModel); return { kind: "started", name: attempt.role === "builder" ? attempt.dispatch.agentName : "builder", agentKind: "pi", workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
-			async promptBuilder(input) { return { kind: "prompted", name: input.name, workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
+			async promptBuilder(input) { const active = await runJournal.loadActive(root); if (active.kind !== "loaded") throw new Error("missing journal before Builder prompt"); await options.reviewHooks?.onBuilderPrompt?.(active.journal, input); return { kind: "prompted", name: input.name, workspaceId: "workspace-1", tabId: "tab-1", paneId: "builder-pane", terminalId: "builder-terminal" }; },
 			async createReviewerPane(input) {
 				const active = await runJournal.loadActive(root);
 				if (active.kind !== "loaded") throw new Error("missing Journal before Reviewer pane split");
@@ -113,7 +114,7 @@ function makeDependencies(root: string, options: { snapshots?: Array<{ head: str
 			async promptReviewer(input) {
 				const active = await runJournal.loadActive(root);
 				if (active.kind !== "loaded") throw new Error("missing Journal before Reviewer prompt");
-				const reviewer = active.journal.run.tasks[0]!.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+				const reviewer = [...active.journal.run.tasks[0]!.attempts].reverse().find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
 				if (!reviewer) throw new Error("missing Reviewer before prompt");
 				const assignmentBytes = await readFile(reviewer.assignmentPath, "utf8");
 				await options.reviewHooks?.onPrompt?.(active.journal, { ...input, assignmentBytes });
@@ -149,8 +150,8 @@ async function startRun(root: string, dependencies: StewardDependencies): Promis
 
 async function writeBuilderReport(root: string, journal: RunJournal): Promise<void> {
 	const task = journal.run.tasks[0]!;
-	const attempt = task.attempts[0]!;
-	if (attempt.role !== "builder") throw new Error("Builder missing");
+	const attempt = [...task.attempts].reverse().find((candidate) => candidate.role === "builder");
+	if (!attempt || attempt.role !== "builder") throw new Error("Builder missing");
 	const assignment = JSON.parse(await readFile(attempt.assignmentPath, "utf8")) as { assignment: { actualModel: BuilderAttemptReport["actualModel"]; specificationHash: string; worktree: { path: string } } };
 	const artifact = Buffer.from("approved\n");
 	const sourcePath = join(builderPathFor(root), "src", "change.ts");
@@ -168,8 +169,8 @@ function builderPathFor(root: string): string { return join(root, "builder-workt
 
 async function writeReviewerReport(journal: RunJournal, verdict: ReviewerAttemptReport["verdict"] = "approved"): Promise<void> {
 	const task = journal.run.tasks[0]!;
-	const reviewer = task.attempts.find((attempt) => attempt.role === "reviewer");
-	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing");
+	const reviewer = [...task.attempts].reverse().find((attempt) => attempt.role === "reviewer");
+	if (!reviewer || reviewer.role !== "reviewer") throw new Error(`Reviewer missing (${task.phase}; ${task.attempts.map((attempt) => `${attempt.id}:${attempt.role}:${attempt.state}`).join(",")})`);
 	const assignment = deserializeReviewerAssignment(await readFile(reviewer.assignmentPath, "utf8"));
 	if (!assignment.value) throw new Error("Reviewer assignment invalid");
 	await writeFile(reviewer.reportPath, serializeReviewerAttemptReport({ schemaVersion: 1, identity: { runId: journal.run.id, taskId: task.contract.id, attemptId: reviewer.id, role: "reviewer", specificationHash: reviewer.specificationHash, assignmentSha256: digest(Buffer.from(await readFile(reviewer.assignmentPath, "utf8"))) }, status: "completed", summary: "Review completed.", blockers: [], actualModel: reviewer.actualModel, reviewedSubject: assignment.value.assignment.subject, verdict, findings: verdict === "changes-required" ? [{ id: "finding-1", severity: "major", summary: "The changed behavior needs correction.", detail: "Correct the changed behavior before relying on the result." }] : [], checks: [], logReferences: [] }));
@@ -272,12 +273,13 @@ it.sequential("registered status selects the first available independent Reviewe
 	match(promptText, /lifecycle state is not a verdict/);
 	await writeReviewerReport(afterDispatch.journal);
 	const finalizedView = await invoke(root, dependencies, "status");
-	match(finalizedView?.markdown ?? "", /Reviewer verdict recorded: approved/);
+	match(finalizedView?.markdown ?? "", /Approval: valid/);
 	const finalized = await dependencies.runJournal.loadActive(root);
 	if (finalized.kind !== "loaded") throw new Error("missing finalized journal");
 	const reviewer = finalized.journal.run.tasks[0]!.attempts.find((attempt) => attempt.role === "reviewer");
 	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing after finalization");
-	equal(finalized.journal.run.tasks[0]!.phase, "reviewing");
+	equal(finalized.journal.run.tasks[0]!.phase, "approved");
+	equal(finalized.journal.run.tasks[0]!.approval?.phase, "valid");
 	equal(reviewer.state, "reported");
 	equal(reviewer.evidence?.phase, "finalized");
 }, 60_000);
@@ -323,10 +325,35 @@ it.sequential.each([
 it.sequential.each([
 	{ verdict: "approved" as const, hasFinding: false },
 	{ verdict: "changes-required" as const, hasFinding: true },
-])("registered status finalizes $verdict while Task stays reviewing", async ({ verdict, hasFinding }) => {
+	])("registered status finalizes $verdict and applies the ticket-07 transition", async ({ verdict, hasFinding }) => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-changes-required-"));
 	roots.push(root);
-	const dependencies = makeDependencies(root);
+	const dependencies = makeDependencies(root, verdict === "changes-required" ? {
+			reviewHooks: {
+			async onBuilderPrompt(journal, input) {
+				const task = journal.run.tasks[0]!;
+				if (task.attempts.length === 1) return;
+				const original = task.attempts[0]!;
+				const rework = task.attempts.at(-1)!;
+				if (original.role !== "builder" || rework.role !== "builder") throw new Error("Builder identity missing during rework prompt");
+				if (original.dispatch.phase !== "prompted" || rework.dispatch.phase !== "prompt-intended") throw new Error("Builder dispatch phase missing during rework prompt");
+				if (!("paneId" in original.dispatch) || !("paneId" in rework.dispatch)) throw new Error("Builder pane identity missing during rework prompt");
+				equal(task.phase, "reworking");
+				equal(task.reworkCycles, 1);
+				equal(rework.state, "prepared");
+				equal(rework.dispatch.phase, "prompt-intended");
+				equal(rework.dispatch.agentName, original.dispatch.agentName);
+				equal(rework.dispatch.paneId, original.dispatch.paneId);
+				const assignment = JSON.parse(await readFile(rework.assignmentPath, "utf8")) as { assignment: { rework?: { cycle: number; priorBuilderAttemptId: string; priorReviewerAttemptId: string; reviewerEvidence: { manifestPath: string; manifestSha256: string }; findings: unknown[] } } };
+				if (!assignment.assignment.rework) throw new Error("Rework facts missing from Assignment");
+				equal(assignment.assignment.rework.cycle, 1);
+				equal(assignment.assignment.rework.priorBuilderAttemptId, "attempt-01");
+				equal(assignment.assignment.rework.priorReviewerAttemptId, "attempt-02");
+				equal(assignment.assignment.rework.findings.length, 1);
+				equal(input.name, original.dispatch.agentName);
+			},
+		},
+	} : undefined);
 	const journal = await startRun(root, dependencies);
 	await writeBuilderReport(root, journal);
 	await invoke(root, dependencies, "status");
@@ -334,13 +361,13 @@ it.sequential.each([
 	if (dispatched.kind !== "loaded") throw new Error("missing dispatched journal");
 	await writeReviewerReport(dispatched.journal, verdict);
 	const view = await invoke(root, dependencies, "status");
-	match(view?.markdown ?? "", /Reviewer evidence finalized/);
 	const finalized = await dependencies.runJournal.loadActive(root);
 	if (finalized.kind !== "loaded") throw new Error("missing finalized journal");
 	const task = finalized.journal.run.tasks[0]!;
 	const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
 	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing after changes-required finalization");
-	equal(task.phase, "reviewing");
+	match(view?.markdown ?? "", verdict === "approved" ? /Approval: valid/ : /Rework cycle 1 reserved and prompted/);
+	equal(task.phase, verdict === "approved" ? "approved" : "reworking");
 	equal(task.attention, "none");
 	equal(reviewer.state, "reported");
 	equal(reviewer.evidence?.phase, "finalized");
@@ -349,6 +376,14 @@ it.sequential.each([
 	const manifest = JSON.parse(await readFile(reviewer.evidence.manifestPath, "utf8")) as { verdict: string; findings: unknown[] };
 	equal(manifest.verdict, verdict);
 	equal(manifest.findings.length > 0, hasFinding);
+	if (verdict === "approved") equal(task.approval?.phase, "valid");
+	else {
+		equal(task.reworkCycles, 1);
+		equal(task.attempts.length, 3);
+		equal(task.attempts[2]?.role, "builder");
+		equal(task.attempts[2]?.state, "active");
+		equal(task.approval, undefined);
+	}
 }, 60_000);
 
 it.sequential("registered status invalidates a finalized Reviewer verdict after a later worktree change and remains idempotent", async () => {
@@ -356,7 +391,7 @@ it.sequential("registered status invalidates a finalized Reviewer verdict after 
 	roots.push(root);
 	const changed = { head: headRevision, dirtyStateFingerprint: "sha256:" + "c".repeat(64), dirtyPaths: ["src/late-change.ts"], operationMarkers: [] };
 	const baseline = { head: headRevision, dirtyStateFingerprint: fingerprint, dirtyPaths: [], operationMarkers: [] };
-	const dependencies = makeDependencies(root, { snapshots: [baseline, baseline, baseline, changed] });
+	const dependencies = makeDependencies(root, { snapshots: [baseline, baseline, baseline, baseline, changed] });
 	const journal = await startRun(root, dependencies);
 	await writeBuilderReport(root, journal);
 	await invoke(root, dependencies, "status");
@@ -366,6 +401,7 @@ it.sequential("registered status invalidates a finalized Reviewer verdict after 
 	await invoke(root, dependencies, "status");
 	const accepted = await dependencies.runJournal.loadActive(root);
 	if (accepted.kind !== "loaded") throw new Error("missing accepted journal");
+	equal(accepted.journal.run.tasks[0]!.phase, "approved");
 	const acceptedReviewer = accepted.journal.run.tasks[0]!.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
 	if (!acceptedReviewer || acceptedReviewer.role !== "reviewer" || !acceptedReviewer.evidence || acceptedReviewer.evidence.phase !== "finalized") throw new Error("Reviewer was not finalized");
 	const evidenceBefore = JSON.parse(JSON.stringify(acceptedReviewer.evidence)) as typeof acceptedReviewer.evidence;
@@ -375,7 +411,7 @@ it.sequential("registered status invalidates a finalized Reviewer verdict after 
 	const manifestBytes = await readFile(manifestPath);
 	const finalizedReportBytes = await readFile(finalizedReportPath);
 	const lateView = await invoke(root, dependencies, "status");
-	match(lateView?.markdown ?? "", /no verdict was accepted|no verdict is eligible/);
+	match(lateView?.markdown ?? "", /Approval:? invalidated|no verdict was accepted|no verdict is eligible/);
 	const violated = await dependencies.runJournal.loadActive(root);
 	if (violated.kind !== "loaded") throw new Error("missing violated journal");
 	const task = violated.journal.run.tasks[0]!;
@@ -383,8 +419,10 @@ it.sequential("registered status invalidates a finalized Reviewer verdict after 
 	if (!reviewer || reviewer.role !== "reviewer") throw new Error("Reviewer missing after late violation");
 	equal(task.phase, "reviewing");
 	equal(task.attention, "needs-user");
+	equal(task.approval?.phase, "invalidated");
+	equal(task.approval?.reason, "dirty-state-changed");
 	equal(reviewer.state, "reported");
-	equal(reviewer.integrity?.kind, "violated");
+	equal(reviewer.integrity?.kind, "preserved");
 	deepStrictEqual(reviewer.evidence, evidenceBefore);
 	equal(reviewer.evidence?.manifestPath, manifestPath);
 	equal(dirname(reviewer.evidence?.manifestPath ?? ""), finalizedDirectory);
@@ -392,7 +430,7 @@ it.sequential("registered status invalidates a finalized Reviewer verdict after 
 	deepStrictEqual(await readFile(finalizedReportPath), finalizedReportBytes);
 	const revision = violated.journal.journalRevision;
 	const repeatedView = await invoke(root, dependencies, "status");
-	match(repeatedView?.markdown ?? "", /no verdict was accepted|no verdict is eligible/);
+	match(repeatedView?.markdown ?? "", /Approval:? invalidated|no verdict was accepted|no verdict is eligible/);
 	const repeated = await dependencies.runJournal.loadActive(root);
 	if (repeated.kind !== "loaded") throw new Error("missing repeated violated journal");
 	equal(repeated.journal.journalRevision, revision);
@@ -467,6 +505,91 @@ it.sequential("same-family Review pauses durably until exact Controller confirma
 	const reviewer = resumed.journal.run.tasks[0]!.attempts.find((attempt) => attempt.role === "reviewer");
 	if (!reviewer || reviewer.role !== "reviewer") throw new Error("same-family Reviewer missing");
 	deepStrictEqual(reviewer.independence, { kind: "same-provider-family-approved", provider: "builder", approvedAt: "2026-09-18T00:00:00.000Z", controllerSessionId: "controller-session" });
+}, 60_000);
+
+it.sequential("ticket-07 repairs one missing Reviewer report on the same Reviewer and then approves", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-repair-"));
+	roots.push(root);
+	let repairPrompts = 0;
+	const dependencies = makeDependencies(root, { reviewHooks: { async onPrompt(_journal, input) { if (input.assignmentPrompt.startsWith("Steward Reviewer report repair")) repairPrompts += 1; } } });
+	const journal = await startRun(root, dependencies);
+	await writeBuilderReport(root, journal);
+	await invoke(root, dependencies, "status");
+	const dispatched = await dependencies.runJournal.loadActive(root);
+	if (dispatched.kind !== "loaded") throw new Error("missing dispatched journal");
+	await invoke(root, dependencies, "status");
+	const requested = await dependencies.runJournal.loadActive(root);
+	if (requested.kind !== "loaded") throw new Error("missing repair-requested journal");
+	const requestedReviewer = requested.journal.run.tasks[0]!.attempts.at(-1);
+	if (!requestedReviewer || requestedReviewer.role !== "reviewer") throw new Error("missing requested Reviewer");
+	equal(requestedReviewer.reportRepair?.phase, "requested");
+	equal(repairPrompts, 1);
+	await writeReviewerReport(requested.journal, "approved");
+	const repairedView = await invoke(root, dependencies, "status");
+	match(repairedView?.markdown ?? "", /Approval: valid/);
+	const repaired = await dependencies.runJournal.loadActive(root);
+	if (repaired.kind !== "loaded") throw new Error("missing repaired journal");
+	const task = repaired.journal.run.tasks[0]!;
+	equal(task.phase, "approved");
+	equal(task.attempts.length, 2);
+	const reviewer = task.attempts[1]!;
+	if (reviewer.role !== "reviewer") throw new Error("reviewer sequence changed during repair");
+	equal(reviewer.reportRepair?.phase, "requested");
+	equal(repairPrompts, 1);
+}, 60_000);
+
+it.sequential("ticket-07 blocks a second repairable Reviewer failure idempotently", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-repair-blocked-"));
+	roots.push(root);
+	let repairPrompts = 0;
+	const dependencies = makeDependencies(root, { reviewHooks: { async onPrompt(_journal, input) { if (input.assignmentPrompt.startsWith("Steward Reviewer report repair")) repairPrompts += 1; } } });
+	const journal = await startRun(root, dependencies);
+	await writeBuilderReport(root, journal);
+	await invoke(root, dependencies, "status");
+	await invoke(root, dependencies, "status");
+	const requested = await dependencies.runJournal.loadActive(root);
+	if (requested.kind !== "loaded") throw new Error("missing requested journal");
+	const requestedRevision = requested.journal.journalRevision;
+	const blockedView = await invoke(root, dependencies, "status");
+	match(blockedView?.markdown ?? "", /second .* failure|no further prompt/i);
+	const blocked = await dependencies.runJournal.loadActive(root);
+	if (blocked.kind !== "loaded") throw new Error("missing blocked journal");
+	const task = blocked.journal.run.tasks[0]!;
+	equal(task.phase, "reviewing");
+	equal(task.attention, "blocked");
+	const reviewer = task.attempts.at(-1);
+	if (!reviewer || reviewer.role !== "reviewer") throw new Error("missing blocked Reviewer");
+	equal(reviewer.reportRepair?.phase, "blocked");
+	equal(repairPrompts, 1);
+	const revision = blocked.journal.journalRevision;
+	await invoke(root, dependencies, "status");
+	const repeated = await dependencies.runJournal.loadActive(root);
+	if (repeated.kind !== "loaded") throw new Error("missing repeated blocked journal");
+	equal(repeated.journal.journalRevision, revision);
+	equal(repeated.journal.journalRevision > requestedRevision, true);
+	equal(repairPrompts, 1);
+}, 60_000);
+
+it.sequential("ticket-07 exhausts a frozen zero rework limit without reserving Attempt 03", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-rework-exhausted-"));
+	roots.push(root);
+	const dependencies = makeDependencies(root, { reworkCycleLimit: 0 });
+	const journal = await startRun(root, dependencies);
+	await writeBuilderReport(root, journal);
+	await invoke(root, dependencies, "status");
+	const dispatched = await dependencies.runJournal.loadActive(root);
+	if (dispatched.kind !== "loaded") throw new Error("missing dispatched journal");
+	await writeReviewerReport(dispatched.journal, "changes-required");
+	const view = await invoke(root, dependencies, "status");
+	match(view?.markdown ?? "", /frozen rework limit 0 is exhausted/);
+	const exhausted = await dependencies.runJournal.loadActive(root);
+	if (exhausted.kind !== "loaded") throw new Error("missing exhausted journal");
+	const task = exhausted.journal.run.tasks[0]!;
+	equal(task.phase, "reviewing");
+	equal(task.attention, "needs-user");
+	equal(task.reworkCycles, 0);
+	equal(task.attempts.length, 2);
+	equal(task.attempts[1]?.role, "reviewer");
 }, 60_000);
 
 it.sequential("no available Reviewer pauses idempotently and foreign/footer status stays read-only", async () => {

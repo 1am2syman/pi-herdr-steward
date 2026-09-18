@@ -43,6 +43,9 @@ import {
 	type BuilderEvidenceRecord,
 	type ReviewerEvidenceRecord,
 	type ReviewerAttemptRecord,
+	type ReworkDispatchRecord,
+	type TaskApproval,
+	type ReportRepairFailure,
 } from "./run.ts";
 import {
 	buildReviewerAssignment,
@@ -56,6 +59,7 @@ import {
 	reviewerAssignmentSha256,
 	selectReviewerModel,
 	deserializeFinalizedBuilderEvidenceManifest,
+	deserializeFinalizedReviewerEvidenceManifest,
 	validateReviewerReportAgainstAssignment,
 	worktreeSnapshotsEqual,
 	type ReviewSubject,
@@ -243,7 +247,7 @@ export interface EmptyStatusView {
 export interface ActiveAttemptStatusView {
 	runId: string;
 	taskId: string;
-	taskPhase: "building";
+	taskPhase: "building" | "reworking" | "reviewing" | "approved";
 	attemptId: string;
 	role: "builder";
 	attemptState: "prepared" | "active" | "reported";
@@ -256,8 +260,8 @@ export interface ActiveAttemptStatusView {
 	paneId?: string;
 	workspaceId?: string;
 	reportPath: string;
-	attention: "none" | "needs-user";
-	dispatchPhase: DispatchRecord["phase"];
+	attention: "none" | "blocked" | "needs-user";
+	dispatchPhase: DispatchRecord["phase"] | "assignment-intended";
 	evidence?: BuilderEvidenceRecord;
 }
 
@@ -307,25 +311,39 @@ const EMPTY_STATUS: EmptyStatusView = {
 function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusView {
 	const task = journal.run.tasks.find((candidate) => candidate.phase === "reviewing");
 	if (!task) return { kind: "present", markdown: `Run ${journal.run.id} is active; no Reviewer Task is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
-	const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
-	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: reviewing`, `Attention: ${task.attention}`];
+	const reviewer = latestReviewerAttempt(task);
+	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: reviewing`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, `Attention: ${task.attention}`];
+	if (task.approval?.phase === "invalidated") lines.push(`Approval: invalidated (${task.approval.reason}); preserved exact facts require user attention.`);
 	if (!reviewer) {
 		lines.push("Review dispatch pending; no Reviewer Attempt has been launched.");
 	} else {
 		lines.push(`Reviewer Attempt ${reviewer.id}: ${reviewer.state}`, `Reviewer dispatch phase: ${reviewer.dispatch.phase}`, `Reviewer Assignment: ${reviewer.assignmentPath}${reviewer.dispatch.phase === "prompt-intended" || reviewer.dispatch.phase === "prompted" ? ` (${reviewer.dispatch.assignmentSha256})` : ""}`, `Reviewer Report: ${reviewer.reportPath}`, `Reviewer Model: ${reviewer.actualModel.model} [thinking=${reviewer.actualModel.thinkingLevel}]`);
 		if (reviewer.integrity?.kind === "violated") lines.push(`Review integrity: violated (${reviewer.integrity.after.head}, ${reviewer.integrity.after.dirtyStateFingerprint}); verdict retained but needs-user.`);
 		else if (reviewer.integrity?.kind === "preserved") lines.push("Review integrity: preserved; worktree remained read-only.");
+		if (reviewer.reportRepair?.phase === "request-intended") lines.push(`Reviewer report repair: request-intended (${reviewer.reportRepair.failure}); no duplicate prompt will be sent.`);
+		else if (reviewer.reportRepair?.phase === "requested") lines.push(`Reviewer report repair: requested (${reviewer.reportRepair.failure}); awaiting the same Reviewer.`);
+		else if (reviewer.reportRepair?.phase === "blocked") lines.push(`Reviewer report repair: blocked after a second ${reviewer.reportRepair.secondFailure} failure; no further prompt will be sent.`);
 		if (reviewer.evidence?.phase === "finalized") lines.push(`Reviewer verdict recorded: ${reviewer.evidence.verdict}; Task remains reviewing.`);
 		else if (reviewer.state === "active") lines.push("Awaiting Reviewer Attempt Report; Herdr lifecycle is not a verdict.");
 	}
 	if (note) lines.push(note);
-	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount: task.attention === "needs-user" ? 1 : 0, text: `steward: ${journal.run.id} · reviewing · ${task.attention === "needs-user" ? 1 : 0} attention` } };
+	const attentionCount = task.attention === "none" ? 0 : 1;
+	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · reviewing · ${attentionCount} attention` } };
+}
+
+function presentApprovedStatus(journal: RunJournal, note?: string): ActiveStatusView {
+	const task = journal.run.tasks.find((candidate) => candidate.phase === "approved");
+	if (!task || !task.approval) return { kind: "present", markdown: `Run ${journal.run.id} is active; Approval state is unavailable.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
+	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: approved`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, "Attention: none", `Approval: ${task.approval.phase}`, `Builder Attempt: ${task.approval.builderAttemptId}`, `Reviewer Attempt: ${task.approval.reviewerAttemptId}`, `Reviewer manifest: ${task.approval.reviewerManifestPath} (${task.approval.reviewerManifestSha256})`, `Review subject: ${JSON.stringify(task.approval.subject)}`, `Clean snapshot: ${task.approval.worktreeSnapshot.head} (${task.approval.worktreeSnapshot.dirtyStateFingerprint})`];
+	if (note) lines.push(note);
+	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · approved · 0 attention` } };
 }
 
 function presentStatusForJournal(journal: RunJournal, note?: string): ActiveStatusView {
+	if (journal.run.tasks.some((candidate) => candidate.phase === "approved")) return presentApprovedStatus(journal, note);
 	if (journal.run.tasks.some((candidate) => candidate.phase === "reviewing")) return presentReviewStatus(journal, note);
-	const task = journal.run.tasks.find((candidate) => candidate.phase === "building" && candidate.attempts.length === 1 && candidate.attempts[0]?.role === "builder");
-	const attempt = task?.attempts[0];
+	const task = journal.run.tasks.find((candidate) => (candidate.phase === "building" || candidate.phase === "reworking") && candidate.attempts.at(-1)?.role === "builder");
+	const attempt = task?.attempts.at(-1);
 	if (!task || !attempt) {
 		return {
 			kind: "present",
@@ -346,7 +364,7 @@ function presentStatusForJournal(journal: RunJournal, note?: string): ActiveStat
 	const activeAttempt: ActiveAttemptStatusView = {
 		runId: journal.run.id,
 		taskId: task.contract.id,
-		taskPhase: "building",
+		taskPhase: task.phase === "building" ? "building" : "reworking",
 		attemptId: attempt.id,
 		role: "builder",
 		attemptState: attempt.state,
@@ -368,7 +386,7 @@ function presentStatusForJournal(journal: RunJournal, note?: string): ActiveStat
 				: [];
 	const lines = [
 		`Run ${journal.run.id}: active`,
-		`Task ${task.contract.id}: building`,
+		`Task ${task.contract.id}: ${task.phase}`,
 		`Attempt ${attempt.id}: ${attempt.state} (builder)`,
 		`Dispatch phase: ${dispatch.phase}`,
 		`Assignment: ${attempt.assignmentPath}${"assignmentHash" in activeAttempt && activeAttempt.assignmentHash ? ` (${activeAttempt.assignmentHash})` : ""}`,
@@ -377,13 +395,13 @@ function presentStatusForJournal(journal: RunJournal, note?: string): ActiveStat
 		...(activeAttempt.worktreeBranch ? [`Worktree: ${activeAttempt.worktreeBranch} @ ${activeAttempt.worktreePath}`] : []),
 		...(activeAttempt.agentName ? [`Herdr Builder: ${activeAttempt.agentName} (pane=${activeAttempt.paneId}, workspace=${activeAttempt.workspaceId})`] : []),
 		`Attention: ${task.attention}`,
-		...(evidenceLines.length > 0 ? evidenceLines : ["Completion: not inferred from Herdr activity; awaiting a validated Attempt Report."]),
+		...(evidenceLines.length > 0 ? evidenceLines : [task.phase === "reworking" ? "Rework: awaiting the same Builder's validated Attempt Report." : "Completion: not inferred from Herdr activity; awaiting a validated Attempt Report."]),
 		...(note ? [note] : []),
 	];
 	return {
 		kind: "present",
 		markdown: lines.join("\n"),
-		footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · building · 0 attention` },
+		footer: { run: "active", attentionCount: task.attention === "needs-user" || task.attention === "blocked" ? 1 : 0, text: `steward: ${journal.run.id} · ${task.phase} · ${task.attention === "needs-user" || task.attention === "blocked" ? 1 : 0} attention` },
 		activeAttempt,
 	};
 }
@@ -473,8 +491,11 @@ function buildEvidenceManifest(input: {
 }
 
 function activeBuilder(journal: RunJournal): { task: TaskRecord; attempt: BuilderAttemptRecord } | undefined {
-	const candidates = journal.run.tasks.flatMap((task) => task.phase === "building" && task.attempts.length === 1 && task.attempts[0]?.role === "builder" ? [{ task, attempt: task.attempts[0] as BuilderAttemptRecord }] : []);
-	return candidates.length === 1 && candidates[0]!.attempt.state === "active" && candidates[0]!.attempt.dispatch.phase === "prompted" ? candidates[0] : undefined;
+	const candidates = journal.run.tasks.flatMap((task) => {
+		const attempt = task.attempts[task.attempts.length - 1];
+		return (task.phase === "building" || task.phase === "reworking") && attempt?.role === "builder" && attempt.state === "active" && attempt.dispatch.phase === "prompted" ? [{ task, attempt }] : [];
+	});
+	return candidates.length === 1 ? candidates[0] : undefined;
 }
 
 function rejectionSummary(codes: readonly string[], details: readonly string[]): string {
@@ -556,7 +577,7 @@ async function validateActiveBuilderEvidence(repositoryRoot: string, controllerS
 	let journal = loadedJournal;
 	if (!intentEquivalent(attempt.evidence, intent)) {
 		const candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
-			const nextAttempt = next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts[0];
+			const nextAttempt = [...(next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts ?? [])].reverse().find((candidate): candidate is BuilderAttemptRecord => candidate.role === "builder");
 			if (!nextAttempt) throw new Error("Builder Attempt disappeared before finalization intent.");
 			nextAttempt.evidence = intent;
 		});
@@ -577,7 +598,7 @@ async function validateActiveBuilderEvidence(repositoryRoot: string, controllerS
 	if (finalization.kind !== "created" && finalization.kind !== "existing-match") return { kind: "unaccepted", journal, note: "Evidence snapshot could not be completed." };
 	const finalized: BuilderEvidenceRecord = { phase: "finalized", finalizedAt: transitionTimestamp(journal, dependencies.clock.now()), status: parsed.value.status, reportSha256: inputs.reportSha256, manifestPath: finalization.manifestPath, manifestSha256: finalization.manifestSha256, producedRevision: parsed.value.producedRevision };
 	const reportedJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
-		const nextAttempt = next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts[0];
+		const nextAttempt = [...(next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts ?? [])].reverse().find((candidate): candidate is BuilderAttemptRecord => candidate.role === "builder");
 		if (!nextAttempt) throw new Error("Builder Attempt disappeared before finalization.");
 		nextAttempt.state = "reported";
 		nextAttempt.evidence = finalized;
@@ -591,11 +612,11 @@ async function validateActiveBuilderEvidence(repositoryRoot: string, controllerS
 async function persistEvidenceRejection(repositoryRoot: string, journal: RunJournal, task: TaskRecord, attempt: AttemptRecord, dependencies: StewardDependencies, topCodes: string[], details: string[], reportSha256?: string): Promise<EvidenceDecision> {
 	const codes = [...new Set(topCodes.concat(details.map((detail) => detail.split(":")[0] ?? "").map(rejectionCode)))].map(rejectionCode);
 	const rejection: BuilderEvidenceRecord = { phase: "rejected", checkedAt: transitionTimestamp(journal, dependencies.clock.now()), ...(reportSha256 ? { reportSha256 } : {}), codes: codes.length > 0 ? codes : ["report-or-evidence-invalid"], summary: rejectionSummary(codes, details) };
-	const currentAttempt = journal.run.tasks.find((candidate) => candidate.contract.id === task.contract.id)?.attempts[0];
+	const currentAttempt = [...(journal.run.tasks.find((candidate) => candidate.contract.id === task.contract.id)?.attempts ?? [])].reverse().find((candidate): candidate is BuilderAttemptRecord => candidate.role === "builder");
 	if (!currentAttempt || currentAttempt.role !== "builder") return { kind: "rejected", journal, note: "Builder evidence rejection could not find the Builder Attempt; preserved state remains authoritative." };
 	if (currentAttempt && rejectionEquivalent(currentAttempt.evidence, rejection)) return { kind: "rejected", journal, note: `Evidence rejected (${rejection.codes.join(", ")}); preserved bytes were not rewritten.` };
 	const candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
-		const nextAttempt = next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts[0];
+		const nextAttempt = [...(next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts ?? [])].reverse().find((candidate): candidate is BuilderAttemptRecord => candidate.role === "builder");
 		if (!nextAttempt) throw new Error("Builder Attempt disappeared while retaining evidence rejection.");
 		if (nextAttempt.role !== "builder") throw new Error("Reviewer Attempt cannot receive Builder evidence.");
 		nextAttempt.evidence = rejection;
@@ -616,15 +637,19 @@ function reviewTaskCandidate(journal: RunJournal): { task: TaskRecord; index: nu
 	for (let index = 0; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
 		if (!task || !task.contract.reviewRequired) continue;
-		const builder = task.attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder");
-		if (task.phase === "reviewing" && builder?.state === "reported" && builder.evidence?.phase === "finalized" && builder.evidence.status === "completed") return { task, index, builder };
-		if (task.phase === "building" && task.attempts.length === 1 && builder?.state === "reported" && builder.evidence?.phase === "finalized" && builder.evidence.status === "completed") return { task, index, builder };
+		const builder = [...task.attempts].reverse().find((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder");
+		const latest = task.attempts[task.attempts.length - 1];
+		if ((task.phase === "reviewing" || task.phase === "reworking" || task.phase === "building") && (latest?.role === "builder" || latest?.role === "reviewer") && builder?.state === "reported" && builder.evidence?.phase === "finalized" && builder.evidence.status === "completed") return { task, index, builder };
 	}
 	return undefined;
 }
 
 function reviewerForTask(task: TaskRecord): ReviewerAttemptRecord | undefined {
-	return task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	return latestReviewerAttempt(task);
+}
+
+function latestReviewerAttempt(task: TaskRecord): ReviewerAttemptRecord | undefined {
+	return [...task.attempts].reverse().find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
 }
 
 function reviewSnapshotFor(value: import("./run.ts").ReviewWorktreeSnapshot): import("./run.ts").ReviewWorktreeSnapshot {
@@ -681,7 +706,7 @@ async function recordReviewerViolation(repositoryRoot: string, journal: RunJourn
 	try {
 		violated = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const task = next.run.tasks[candidate.index];
-			const attempt = task?.attempts.find((item): item is ReviewerAttemptRecord => item.role === "reviewer");
+			const attempt = task ? latestReviewerAttempt(task) : undefined;
 			if (!task || !attempt) throw new Error("Reviewer Attempt disappeared while recording the read-only violation.");
 			task.attention = "needs-user";
 			attempt.integrity = { kind: "violated", detectedAt: transitionTimestamp(journal, dependencies.clock.now()), before: reviewSnapshotFor(attempt.worktree.baseline), after: reviewSnapshotFor(after), code: "reviewer-modified-worktree" };
@@ -695,6 +720,69 @@ async function recordReviewerViolation(repositoryRoot: string, journal: RunJourn
 	return { journal: persisted, note: "Reviewer worktree changed; read-only violation is retained, attention is needs-user, and no verdict was accepted." };
 }
 
+function repairDiagnosticText(values: readonly string[]): string[] {
+	return (values.length > 0 ? values : ["Reviewer report or referenced evidence is incomplete."]).map((value) => value.slice(0, 2_000)).slice(0, 8);
+}
+
+async function retainReviewerRepairFailure(repositoryRoot: string, journal: RunJournal, candidate: { index: number; task: TaskRecord }, reviewer: ReviewerAttemptRecord, failure: ReportRepairFailure, details: readonly string[], observedReportSha256: string | null, dependencies: StewardDependencies): Promise<ReviewDecision> {
+	const diagnostics = repairDiagnosticText(details);
+	if (reviewer.reportRepair?.phase === "blocked") return { journal, note: "Reviewer report repair is already blocked; no further prompt was sent." };
+	if (reviewer.reportRepair?.phase === "requested") {
+		let blocked: RunJournal;
+		try {
+			blocked = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const task = next.run.tasks[candidate.index];
+				const attempt = task?.attempts[task.attempts.length - 1];
+				if (!task || !attempt || attempt.role !== "reviewer") throw new Error("Reviewer Attempt disappeared while blocking report repair.");
+				if (reviewer.reportRepair?.phase !== "requested") throw new Error("Reviewer repair is not in requested state.");
+				attempt.reportRepair = { ...reviewer.reportRepair, phase: "blocked", secondFailure: failure, secondDiagnostics: diagnostics, secondObservedReportSha256: observedReportSha256, blockedAt: transitionTimestamp(journal, dependencies.clock.now()) };
+				task.attention = "blocked";
+			});
+		} catch (error: unknown) { return { journal, note: `Reviewer report repair remains invalid; durable block could not be built. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, blocked, dependencies);
+		return persisted ? { journal: persisted, note: "Reviewer report repair failed a second time; Task is blocked and no further prompt will be sent." } : { journal, note: "Reviewer report repair failed a second time; durable block write failed and no further prompt was sent." };
+	}
+	if (reviewer.reportRepair?.phase === "request-intended") return { journal, note: "Reviewer report repair was already intended; no duplicate repair prompt was sent." };
+	if (!reviewer.dispatch || reviewer.dispatch.phase !== "prompted" || !dependencies.herdr.promptReviewer) return { journal, note: "Reviewer report is repairable, but the same Reviewer prompt adapter is unavailable; no repair was attempted." };
+	let intended: RunJournal;
+	try {
+		intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const task = next.run.tasks[candidate.index];
+			const attempt = task?.attempts[task.attempts.length - 1];
+			if (!task || !attempt || attempt.role !== "reviewer") throw new Error("Reviewer Attempt disappeared before repair intent.");
+			attempt.reportRepair = { phase: "request-intended", failure, diagnostics, observedReportSha256, intendedAt: transitionTimestamp(journal, dependencies.clock.now()) };
+		});
+	} catch (error: unknown) { return { journal, note: `Reviewer report repair intent could not be built; no prompt was sent. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedIntent = await persistReviewJournal(repositoryRoot, intended, dependencies);
+	if (!persistedIntent) return { journal, note: "Reviewer report repair intent could not be persisted; no prompt was sent." };
+	const assignmentPrompt = [
+		"Steward Reviewer report repair request",
+		"Repair only the existing Reviewer Attempt Report and its referenced evidence.",
+		`Attempt: ${reviewer.id}`,
+		`Assignment: ${reviewer.assignmentPath}`,
+		`Report: ${reviewer.reportPath}`,
+		`Evidence directory: ${reviewer.evidenceDirectory}`,
+		`Immutable Review subject: ${JSON.stringify(reviewer.subject)}`,
+		`Validation failures: ${diagnostics.join(" ")}`,
+		"Do not modify the Review subject or worktree and do not dispatch another agent.",
+	].join("\n");
+	let prompted: HerdrPromptResult;
+	try { prompted = await dependencies.herdr.promptReviewer({ repositoryRoot, name: reviewer.dispatch.agentName, assignmentPrompt }); }
+	catch (error: unknown) { return { journal: persistedIntent, note: `Reviewer report repair prompt failed; request-intended state is retained without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
+	if (prompted.kind !== "prompted" || prompted.name !== reviewer.dispatch.agentName || prompted.workspaceId !== reviewer.dispatch.workspaceId || prompted.paneId !== reviewer.dispatch.paneId || prompted.terminalId !== reviewer.dispatch.terminalId || !validIdentity(prompted.tabId)) return { journal: persistedIntent, note: "Reviewer report repair prompt envelope was malformed; request-intended state is retained without a resend." };
+	let requested: RunJournal;
+	try {
+		requested = advanceRunJournal(persistedIntent, dependencies.clock.now(), (next) => {
+			const task = next.run.tasks[candidate.index];
+			const attempt = task?.attempts[task.attempts.length - 1];
+			if (!task || !attempt || attempt.role !== "reviewer" || attempt.reportRepair?.phase !== "request-intended") throw new Error("Reviewer repair intent disappeared after prompt.");
+			attempt.reportRepair = { ...attempt.reportRepair, phase: "requested", requestedAt: transitionTimestamp(persistedIntent, dependencies.clock.now()) };
+		});
+	} catch (error: unknown) { return { journal: persistedIntent, note: `Reviewer report repair prompt succeeded but requested state could not be persisted; no resend will be attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedRequested = await persistReviewJournal(repositoryRoot, requested, dependencies);
+	return persistedRequested ? { journal: persistedRequested, note: `Reviewer Attempt ${reviewer.id} received one repair prompt; awaiting repaired report.` } : { journal: persistedIntent, note: "Reviewer report repair prompt succeeded but requested state could not be persisted; no resend will be attempted." };
+}
+
 async function validateActiveReviewerReport(repositoryRoot: string, journal: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, dependencies: StewardDependencies): Promise<ReviewDecision> {
 	if (!dependencies.git.inspectReviewWorktree || !dependencies.runJournal.loadReviewerEvidenceInputs || !dependencies.runJournal.inspectReferencedReviewerEvidence || !dependencies.runJournal.finalizeReviewerEvidence) return { journal, note: "Review evidence adapters are unavailable; Review remains pending and no verdict was inferred." };
 	let before: import("./run.ts").ReviewWorktreeSnapshot | { kind: "unavailable"; message: string };
@@ -702,22 +790,28 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	if ("kind" in before) return { journal, note: `Reviewer worktree inspection is unavailable; no verdict was inferred. ${before.message}` };
 	if (!worktreeSnapshotsEqual(before, reviewer.worktree.baseline)) return recordReviewerViolation(repositoryRoot, journal, candidate, reviewer, before, dependencies);
 	if (reviewer.integrity?.kind === "violated") return { journal, note: "Reviewer read-only violation is retained; finalized evidence bytes are preserved and no verdict is eligible." };
-	if (reviewer.state === "reported" && reviewer.evidence?.phase === "finalized") return { journal, note: `Reviewer verdict recorded: ${reviewer.evidence.verdict}; Task remains reviewing.` };
+	if (reviewer.state === "reported" && reviewer.evidence?.phase === "finalized") return interpretReviewerVerdict(repositoryRoot, journal, candidate, reviewer, dependencies);
 	const paths = evidencePathsFor(reviewer);
 	const assignmentSha256 = reviewer.dispatch.phase === "prompt-intended" || reviewer.dispatch.phase === "prompted" ? reviewer.dispatch.assignmentSha256 : "";
 	let inputs: import("./attempt-evidence-store.ts").ReviewerEvidenceInputs;
 	try { inputs = await dependencies.runJournal.loadReviewerEvidenceInputs({ repositoryRoot, paths, assignmentSha256 }); } catch (error: unknown) { return { journal, note: `Reviewer evidence loading failed; no verdict was inferred. ${error instanceof Error ? error.message : "Evidence loading failed."}` }; }
-	if (inputs.kind === "report-missing") return { journal, note: `Awaiting Reviewer Attempt Report at ${reviewer.reportPath}; Herdr lifecycle is not a verdict.` };
-	if (inputs.kind === "unsafe") return { journal, note: `Reviewer evidence is not accepted (${inputs.code}); preserved bytes remain authoritative and no verdict was inferred.` };
+	if (inputs.kind === "report-missing") return retainReviewerRepairFailure(repositoryRoot, journal, candidate, reviewer, "missing-report", [`Reviewer Attempt Report is missing at ${reviewer.reportPath}.`], null, dependencies);
+	if (inputs.kind === "unsafe") {
+		if (["report-invalid", "missing-evidence", "hash-mismatch", "unsafe-path"].includes(inputs.code)) return retainReviewerRepairFailure(repositoryRoot, journal, candidate, reviewer, inputs.code === "report-invalid" ? "malformed-report" : "evidence-incomplete", [inputs.code, inputs.message], inputs.reportSha256 ?? null, dependencies);
+		return { journal, note: `Reviewer evidence is not accepted (${inputs.code}); preserved bytes remain authoritative and no verdict was inferred.` };
+	}
 	const parsed = parseReviewerAttemptReport(inputs.reportBytes.toString("utf8"));
-	if (!parsed.value || parsed.diagnostics.length > 0) return { journal, note: `Reviewer Attempt Report is not a valid explicit verdict; no verdict was inferred. ${parsed.diagnostics.map((item) => item.message).join(" ")}` };
+	if (!parsed.value || parsed.diagnostics.length > 0) return retainReviewerRepairFailure(repositoryRoot, journal, candidate, reviewer, "malformed-report", parsed.diagnostics.map((item) => `${item.code}: ${item.message}`), inputs.reportSha256, dependencies);
 	const assignment = deserializeReviewerAssignment(inputs.assignmentBytes.toString("utf8"), reviewer.assignmentPath);
 	if (!assignment.value || assignment.diagnostics.length > 0) return { journal, note: "Reviewer Assignment is invalid or changed; preserved bytes remain authoritative and no verdict was inferred." };
 	const cross = validateReviewerReportAgainstAssignment({ report: parsed.value, assignment: assignment.value, assignmentSha256: inputs.assignmentSha256, runId: journal.run.id, task: candidate.task.contract, attempt: reviewer });
-	if (!cross.value || cross.diagnostics.length > 0) return { journal, note: `Reviewer Attempt Report is not accepted (${cross.diagnostics.map((item) => item.code).join(", ")}); no verdict was inferred.` };
+	if (!cross.value || cross.diagnostics.length > 0) {
+		const repairable = cross.diagnostics.every((item) => ["model-mismatch", "subject-mismatch", "specification-mismatch"].includes(item.code));
+		return repairable ? retainReviewerRepairFailure(repositoryRoot, journal, candidate, reviewer, "malformed-report", cross.diagnostics.map((item) => `${item.code}: ${item.message}`), inputs.reportSha256, dependencies) : { journal, note: `Reviewer Attempt Report is not accepted (${cross.diagnostics.map((item) => item.code).join(", ")}); no verdict was inferred.` };
+	}
 	let referenced: import("./attempt-evidence-store.ts").ReferencedReviewerEvidenceResult;
 	try { referenced = await dependencies.runJournal.inspectReferencedReviewerEvidence({ repositoryRoot, paths, logReferences: parsed.value.logReferences }); } catch (error: unknown) { return { journal, note: `Reviewer evidence inspection failed; no verdict was inferred. ${error instanceof Error ? error.message : "Inspection failed."}` }; }
-	if (referenced.kind !== "inspected") return { journal, note: `Reviewer evidence is invalid (${referenced.code}); preserved bytes remain authoritative and no verdict was inferred.` };
+	if (referenced.kind !== "inspected") return retainReviewerRepairFailure(repositoryRoot, journal, candidate, reviewer, "evidence-incomplete", [referenced.code, referenced.message], inputs.reportSha256, dependencies);
 	let after: import("./run.ts").ReviewWorktreeSnapshot | { kind: "unavailable"; message: string };
 	try { after = await dependencies.git.inspectReviewWorktree(reviewer.worktree.path); } catch (error: unknown) { return { journal, note: `Reviewer worktree inspection failed before finalization; no verdict was inferred. ${error instanceof Error ? error.message : "Inspection failed."}` }; }
 	if ("kind" in after) return { journal, note: `Reviewer worktree inspection is unavailable before finalization; no verdict was inferred. ${after.message}` };
@@ -731,7 +825,7 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	try {
 		intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const task = next.run.tasks[candidate.index];
-			const attempt = task?.attempts.find((item): item is ReviewerAttemptRecord => item.role === "reviewer");
+			const attempt = task ? latestReviewerAttempt(task) : undefined;
 			if (!task || !attempt) throw new Error("Reviewer Attempt disappeared before finalization intent.");
 			attempt.integrity = { kind: "preserved", after: reviewSnapshotFor(after as import("./run.ts").ReviewWorktreeSnapshot) };
 			attempt.evidence = { phase: "finalization-intended", checkedAt: transitionTimestamp(journal, dependencies.clock.now()), reportSha256: inputs.reportSha256, manifestPath: join(finalDirectory, "manifest.json"), manifestSha256, subject: { ...reviewer.subject, ...(reviewer.subject.kind === "git" ? { commits: [...reviewer.subject.commits] } : { artifacts: reviewer.subject.artifacts.map((artifact) => ({ ...artifact })) }) } };
@@ -751,7 +845,7 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	try {
 		reported = advanceRunJournal(persistedIntent, dependencies.clock.now(), (next) => {
 			const task = next.run.tasks[candidate.index];
-			const attempt = task?.attempts.find((item): item is ReviewerAttemptRecord => item.role === "reviewer");
+			const attempt = task ? latestReviewerAttempt(task) : undefined;
 			if (!task || !attempt) throw new Error("Reviewer Attempt disappeared after evidence finalization.");
 			attempt.state = "reported";
 			attempt.integrity = { kind: "preserved", after: reviewSnapshotFor(after as import("./run.ts").ReviewWorktreeSnapshot) };
@@ -761,7 +855,55 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	const persisted = await persistReviewJournal(repositoryRoot, reported, dependencies);
 	if (!persisted) return { journal: persistedIntent, note: "Reviewer evidence was finalized but the reported Journal state could not be persisted; no resend will be attempted." };
 	await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: persisted.run.updatedAt, runId: persisted.run.id, event: "reviewer-evidence-finalized", message: `Reviewer Attempt ${reviewer.id} finalized with explicit ${parsed.value.verdict} verdict; Task remains reviewing.` }).catch(() => undefined);
-	return { journal: persisted, note: "Reviewer evidence finalized; explicit verdict recorded while Task remains reviewing." };
+	const updatedTask = persisted.run.tasks[candidate.index];
+	const updatedReviewer = updatedTask?.attempts[updatedTask.attempts.length - 1];
+	return updatedTask && updatedReviewer?.role === "reviewer" ? interpretReviewerVerdict(repositoryRoot, persisted, { ...candidate, task: updatedTask }, updatedReviewer, dependencies) : { journal: persisted, note: "Reviewer evidence finalized; explicit verdict recorded while Task remains reviewing." };
+}
+
+async function interpretReviewerVerdict(repositoryRoot: string, journal: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, dependencies: StewardDependencies): Promise<ReviewDecision> {
+	if (reviewer.evidence?.phase !== "finalized" || reviewer.state !== "reported") return { journal, note: "Reviewer verdict is not finalized; no transition was inferred." };
+	if (candidate.task.attention === "blocked" || candidate.task.attention === "needs-user") return { journal, note: candidate.task.attention === "blocked" ? "Reviewer report repair is blocked; no further effect was attempted." : "Review is paused for user attention; no further effect was attempted." };
+	if (!dependencies.runJournal.loadFinalizedEvidenceManifest) return { journal, note: "Finalized Reviewer manifest loading is unavailable; verdict transition is pending." };
+	const loaded = await dependencies.runJournal.loadFinalizedEvidenceManifest({ manifestPath: reviewer.evidence.manifestPath, manifestSha256: reviewer.evidence.manifestSha256 });
+	if (loaded.kind !== "loaded") return pauseReview(repositoryRoot, candidate, journal, dependencies, `Protected Reviewer evidence is unavailable; no verdict transition was inferred. ${loaded.message}`);
+	const manifest = deserializeFinalizedReviewerEvidenceManifest(loaded.bytes.toString("utf8"), loaded.sha256);
+	if (!manifest.value || manifest.value.identity.runId !== journal.run.id || manifest.value.identity.taskId !== candidate.task.contract.id || manifest.value.identity.attemptId !== reviewer.id || manifest.value.verdict !== reviewer.evidence.verdict || JSON.stringify(manifest.value.subject) !== JSON.stringify(reviewer.subject)) return pauseReview(repositoryRoot, candidate, journal, dependencies, `Protected Reviewer evidence does not exactly match Attempt ${reviewer.id}; no verdict transition was inferred.`);
+	if (reviewer.evidence.verdict === "approved") {
+		if (!dependencies.git.inspectReviewWorktree) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Approval requires a read-only Review worktree inspection; no approval was recorded.");
+		let observed: import("./run.ts").ReviewWorktreeSnapshot | { kind: "unavailable"; message: string };
+		try { observed = await dependencies.git.inspectReviewWorktree(reviewer.worktree.path); } catch (error: unknown) { return pauseReview(repositoryRoot, candidate, journal, dependencies, `Approval worktree inspection failed; no approval was recorded. ${error instanceof Error ? error.message : "Inspection failed."}`); }
+		if ("kind" in observed) return pauseReview(repositoryRoot, candidate, journal, dependencies, `Approval worktree inspection is unavailable; no approval was recorded. ${observed.message}`);
+		if (reviewer.integrity?.kind !== "preserved" || !reviewSnapshotsExact(observed, reviewer.integrity.after) || observed.dirtyPaths.length !== 0 || observed.operationMarkers.length !== 0 || (reviewer.subject.kind === "git" && observed.head !== reviewer.subject.headRevision)) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Approved Review worktree no longer matches the protected clean snapshot; no approval was recorded.");
+		const approval: TaskApproval = { phase: "valid", approvedAt: transitionTimestamp(journal, dependencies.clock.now()), builderAttemptId: candidate.builder.id, reviewerAttemptId: reviewer.id, subject: cloneReviewSubject(reviewer.subject), reviewerManifestPath: reviewer.evidence.manifestPath, reviewerManifestSha256: reviewer.evidence.manifestSha256, worktreeSnapshot: reviewSnapshotFor(observed), verdict: "approved" };
+		let approved: RunJournal;
+		try {
+			approved = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const task = next.run.tasks[candidate.index];
+				if (!task) throw new Error("Review Task disappeared while recording Approval.");
+				task.phase = "approved";
+				task.attention = "none";
+				task.approval = approval;
+			});
+		} catch (error: unknown) { return { journal, note: `Approval could not be built durably; no external effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, approved, dependencies);
+		return persisted ? { journal: persisted, note: `Review approved exactly for ${reviewer.subject.kind === "git" ? reviewer.subject.headRevision : reviewer.id}; durable Approval recorded.` } : { journal, note: "Approval could not be persisted; the finalized Review evidence remains authoritative." };
+	}
+	if (journal.run.effectiveSettings.reworkCycleLimit <= candidate.task.reworkCycles) return pauseReview(repositoryRoot, candidate, journal, dependencies, `Review requested changes, but the frozen rework limit ${journal.run.effectiveSettings.reworkCycleLimit} is exhausted; all evidence is retained and no new Attempt was created.`);
+	const findingFacts = manifest.value.findings;
+	if (findingFacts.length === 0) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Protected changes-required Reviewer evidence contains no actionable findings; no rework was created.");
+	return dispatchReworkBuilder(repositoryRoot, journal, candidate, reviewer, findingFacts, dependencies);
+}
+
+function cloneReviewSubject(subject: ReviewSubject): ReviewSubject {
+	return subject.kind === "git" ? { ...subject, commits: [...subject.commits] } : { ...subject, artifacts: subject.artifacts.map((artifact) => ({ ...artifact })) };
+}
+
+function reviewSubjectBindsBuilderForStatus(subject: ReviewSubject, builder: BuilderAttemptRecord): boolean {
+	return builder.evidence?.phase === "finalized" && subject.builderManifestSha256 === builder.evidence.manifestSha256 && (subject.kind !== "git" || (subject.baseRevision === builder.baseRevision && subject.headRevision === builder.evidence.producedRevision));
+}
+
+function reviewSnapshotsExact(left: import("./run.ts").ReviewWorktreeSnapshot, right: import("./run.ts").ReviewWorktreeSnapshot): boolean {
+	return left.head === right.head && left.dirtyStateFingerprint === right.dirtyStateFingerprint && JSON.stringify(left.dirtyPaths) === JSON.stringify(right.dirtyPaths) && JSON.stringify(left.operationMarkers) === JSON.stringify(right.operationMarkers);
 }
 
 async function dispatchReviewer(repositoryRoot: string, controllerSessionId: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, subject: ReviewSubject, manifestPath: string, manifestSha256: string, baseline: import("./run.ts").ReviewWorktreeSnapshot, reviewerModel: import("./config.ts").ModelChoice, independence: ReviewerIndependence, dependencies: StewardDependencies): Promise<ReviewDecision> {
@@ -769,11 +911,12 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	const builderDispatch = candidate.builder.dispatch;
 	if (builderDispatch.phase !== "prompted") return { journal, note: "Reviewer dispatch is waiting for a fully prompted Builder identity; no Reviewer effect was attempted." };
 	if (!dependencies.herdr.createReviewerPane || !dependencies.herdr.startReviewer || !dependencies.herdr.promptReviewer) return { journal, note: "Review dispatch pending; Reviewer Herdr adapters are unavailable." };
-	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, candidate.task.contract.id, "attempt-02");
-	let agentName = `steward-r-${compactUuid(dependencies.clock)}-${candidate.task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-02`;
+	const attemptId = `attempt-${String(candidate.task.attempts.length + 1).padStart(2, "0")}`;
+	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, candidate.task.contract.id, attemptId);
+	let agentName = `steward-r-${compactUuid(dependencies.clock)}-${candidate.task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-${attemptId.slice(-2)}`;
 	if (!safeHerdrName(agentName)) return { journal, note: "Reviewer dispatch pending; Steward could not derive a valid Reviewer name." };
 	const prepared: ReviewerAttemptRecord = {
-		id: "attempt-02",
+		id: attemptId,
 		role: "reviewer",
 		state: "prepared",
 		preparedAt: transitionTimestamp(journal, dependencies.clock.now()),
@@ -793,7 +936,7 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	try {
 		preparedJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const task = next.run.tasks[candidate.index];
-			if (!task || task.attempts.some((attempt) => attempt.role === "reviewer")) throw new Error("Reviewer Attempt already exists.");
+			if (!task || task.attempts.some((attempt) => attempt.id === attemptId)) throw new Error("Reviewer Attempt already exists.");
 			task.phase = "reviewing";
 			task.attention = "none";
 			task.attempts.push(prepared);
@@ -809,7 +952,8 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	let agentIntent: RunJournal;
 	try {
 		agentIntent = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
-			const reviewer = next.run.tasks[candidate.index]?.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+			const task = next.run.tasks[candidate.index];
+			const reviewer = task ? latestReviewerAttempt(task) : undefined;
 			if (!reviewer) throw new Error("Reviewer Attempt disappeared before agent intent.");
 			reviewer.dispatch = { phase: "agent-intended", agentName, worktreePath: builderDispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId } as ReviewerAttemptRecord["dispatch"];
 		});
@@ -824,10 +968,11 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 		catch (error: unknown) { return { journal, note: `Reviewer start failed; dispatch remains at agent-intended and no verdict exists. ${error instanceof Error ? error.message : "Herdr agent start failed."}` }; }
 		if (result.kind !== "name-collision") { started = result; break; }
 		if (collision === 7) return { journal, note: "Eight Steward-owned Reviewer names collided; dispatch remains pending and no verdict exists." };
-		agentName = `steward-r-${compactUuid(dependencies.clock)}-${candidate.task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-02`;
+			agentName = `steward-r-${compactUuid(dependencies.clock)}-${candidate.task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-${attemptId.slice(-2)}`;
 		try {
 			const renamed = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
-				const reviewer = next.run.tasks[candidate.index]?.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+				const task = next.run.tasks[candidate.index];
+				const reviewer = task ? latestReviewerAttempt(task) : undefined;
 				if (!reviewer) throw new Error("Reviewer Attempt disappeared while changing its name.");
 				reviewer.dispatch = { phase: "agent-intended", agentName, worktreePath: builderDispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId } as ReviewerAttemptRecord["dispatch"];
 			});
@@ -838,7 +983,8 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	}
 	if (!started || started.kind !== "started" || started.name !== agentName || started.agentKind !== "pi" || started.workspaceId !== pane.workspaceId || started.paneId !== pane.paneId || started.terminalId !== pane.terminalId || !validIdentity(started.tabId)) return { journal, note: "Reviewer start envelope was malformed or contradictory; dispatch remains at agent-intended and no verdict exists." };
 	let assignment: ReviewerAssignmentDocument;
-	const activeReviewer = journal.run.tasks[candidate.index]?.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	const activeTask = journal.run.tasks[candidate.index];
+	const activeReviewer = activeTask ? latestReviewerAttempt(activeTask) : undefined;
 	if (!activeReviewer) return { journal, note: "Reviewer Attempt disappeared before Assignment creation; no prompt was sent." };
 	try { assignment = buildReviewerAssignment({ runId: journal.run.id, task: candidate.task.contract, attempt: activeReviewer, manifestPath, manifestSha256, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId, agentName }); }
 	catch (error: unknown) { return { journal, note: `Reviewer Assignment could not be built; dispatch remains at agent-intended. ${error instanceof Error ? error.message : "Assignment validation failed."}` }; }
@@ -850,7 +996,8 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	let promptIntent: RunJournal;
 	try {
 		promptIntent = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
-			const reviewer = next.run.tasks[candidate.index]?.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+			const task = next.run.tasks[candidate.index];
+			const reviewer = task ? latestReviewerAttempt(task) : undefined;
 			if (!reviewer) throw new Error("Reviewer Attempt disappeared before prompt intent.");
 			reviewer.dispatch = { phase: "prompt-intended", agentName, worktreePath: builderDispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId, assignmentSha256: assignmentHash } as ReviewerAttemptRecord["dispatch"];
 		});
@@ -866,7 +1013,8 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	let active: RunJournal;
 	try {
 		active = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
-			const reviewer = next.run.tasks[candidate.index]?.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+			const task = next.run.tasks[candidate.index];
+			const reviewer = task ? latestReviewerAttempt(task) : undefined;
 			if (!reviewer) throw new Error("Reviewer Attempt disappeared before activation.");
 			reviewer.state = "active";
 			reviewer.activatedAt = promptedAt;
@@ -926,6 +1074,119 @@ function safeHerdrName(value: string): boolean {
 
 function validIdentity(value: string): boolean {
 	return value.trim().length > 0 && value === value.trim() && !value.includes("\u0000");
+}
+
+async function validateApprovedTasks(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<ReviewDecision> {
+	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+		const task = journal.run.tasks[index];
+		if (!task || task.phase !== "approved" || !task.approval || task.approval.phase !== "valid") continue;
+		const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.id === task.approval?.reviewerAttemptId && attempt.role === "reviewer");
+		const builder = task.attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === task.approval?.builderAttemptId && attempt.role === "builder");
+		let reason: "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | undefined;
+		let diagnostic = "";
+		let observedSnapshot: import("./run.ts").ReviewWorktreeSnapshot | undefined;
+		if (!reviewer || !builder || reviewer.evidence?.phase !== "finalized" || builder.evidence?.phase !== "finalized" || reviewer.evidence.manifestPath !== task.approval.reviewerManifestPath || reviewer.evidence.manifestSha256 !== task.approval.reviewerManifestSha256 || JSON.stringify(reviewer.subject) !== JSON.stringify(task.approval.subject) || !reviewSubjectBindsBuilderForStatus(task.approval.subject, builder)) {
+			reason = "evidence-changed";
+			diagnostic = "Approval no longer matches the exact latest Builder/Reviewer Attempts or protected evidence.";
+		}
+		if (!reason && (!dependencies.runJournal.loadFinalizedEvidenceManifest || !dependencies.git.inspectReviewWorktree)) return { journal, note: "Approved Task revalidation adapters are unavailable; Approval remains unchanged and no effect was attempted." };
+		if (!reason) {
+			const loaded = await dependencies.runJournal.loadFinalizedEvidenceManifest!({ manifestPath: task.approval.reviewerManifestPath, manifestSha256: task.approval.reviewerManifestSha256 });
+			if (loaded.kind !== "loaded") { reason = "evidence-changed"; diagnostic = loaded.message; }
+			else {
+				const manifest = deserializeFinalizedReviewerEvidenceManifest(loaded.bytes.toString("utf8"), loaded.sha256);
+				if (!manifest.value || manifest.value.verdict !== "approved" || JSON.stringify(manifest.value.subject) !== JSON.stringify(task.approval.subject)) { reason = "subject-changed"; diagnostic = "Protected Reviewer manifest subject or verdict changed."; }
+			}
+		}
+		if (!reason) {
+			const snapshot = await dependencies.git.inspectReviewWorktree!(reviewer!.worktree.path);
+			if ("kind" in snapshot) { reason = "approval-invalid"; diagnostic = snapshot.message; }
+			else { observedSnapshot = snapshot; if (snapshot.head !== task.approval.worktreeSnapshot.head) reason = "head-changed"; else if (!reviewSnapshotsExact(snapshot, task.approval.worktreeSnapshot)) reason = "dirty-state-changed"; diagnostic = reason ? "Approved Review worktree snapshot changed after Approval." : ""; }
+		}
+		if (!reason) continue;
+		let invalidated: RunJournal;
+		try {
+			invalidated = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const nextTask = next.run.tasks[index];
+				if (!nextTask || !nextTask.approval || nextTask.approval.phase !== "valid") throw new Error("Approval disappeared while invalidating.");
+				const current = nextTask.approval;
+				nextTask.approval = { ...current, phase: "invalidated", invalidatedAt: transitionTimestamp(journal, dependencies.clock.now()), reason: reason!, diagnostic: diagnostic.slice(0, 2_000), ...(observedSnapshot ? { observedSnapshot: reviewSnapshotFor(observedSnapshot) } : {}) };
+				nextTask.phase = "reviewing";
+				nextTask.attention = "needs-user";
+			});
+		} catch (error: unknown) { return { journal, note: `Approval changed (${reason}) but invalidation could not be built durably. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, invalidated, dependencies);
+		return persisted ? { journal: persisted, note: `Approval invalidated (${reason}); exact evidence and worktree were preserved and no new effect was attempted.` } : { journal, note: "Approval changed, but invalidation could not be persisted; no new effect was attempted." };
+	}
+	return { journal, note: "" };
+}
+
+async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, findings: import("./review.ts").ReviewerFinding[], dependencies: StewardDependencies): Promise<ReviewDecision> {
+	let journal = journalInput;
+	const previousDispatch = candidate.builder.dispatch;
+	if (previousDispatch.phase !== "prompted" || !dependencies.git.inspectBuilderWorktree || !dependencies.herdr.promptBuilder) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Rework requires the original prompted Builder identity and read-only worktree/prompt adapters; no replacement Builder was created.");
+	if (reviewer.subject.kind !== "git") return pauseReview(repositoryRoot, candidate, journal, dependencies, "Automatic same-Builder rework is only available for the existing Git flow; preserved non-Git evidence requires user attention.");
+	let inspected: { kind: "ready"; head: string; clean: true } | { kind: "unavailable"; message: string };
+	try { inspected = await dependencies.git.inspectBuilderWorktree(previousDispatch.worktreePath, reviewer.subject.headRevision); } catch (error: unknown) { return pauseReview(repositoryRoot, candidate, journal, dependencies, `Rework preflight failed; no Attempt was reserved. ${error instanceof Error ? error.message : "Builder worktree inspection failed."}`); }
+	if (inspected.kind !== "ready" || inspected.head !== reviewer.subject.headRevision || !inspected.clean) return pauseReview(repositoryRoot, candidate, journal, dependencies, `Rework preflight requires the same clean Builder worktree at reviewed head ${reviewer.subject.headRevision}; no Attempt was reserved.`);
+	const cycle = candidate.task.reworkCycles + 1;
+	const attemptId = `attempt-${String(candidate.task.attempts.length + 1).padStart(2, "0")}`;
+	const dispatch: ReworkDispatchRecord = { phase: "assignment-intended", branch: previousDispatch.branch, agentName: previousDispatch.agentName, worktreePath: previousDispatch.worktreePath, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, cycle, priorBuilderAttemptId: candidate.builder.id, priorReviewerAttemptId: reviewer.id, reviewedSubject: cloneReviewSubject(reviewer.subject), reviewerManifestPath: reviewer.evidence?.phase === "finalized" ? reviewer.evidence.manifestPath : "", reviewerManifestSha256: reviewer.evidence?.phase === "finalized" ? reviewer.evidence.manifestSha256 : "", findings: findings.map((finding) => ({ ...finding })) };
+	if (!dispatch.reviewerManifestPath || !dispatch.reviewerManifestSha256) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Rework findings are not bound to a protected Reviewer manifest; no Attempt was reserved.");
+	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, candidate.task.contract.id, attemptId);
+	const prepared: BuilderAttemptRecord = { id: attemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...candidate.builder.actualModel }, specificationHash: candidate.task.specificationHash, baseRevision: candidate.builder.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch };
+	let reserved: RunJournal;
+	try {
+		reserved = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const task = next.run.tasks[candidate.index];
+			if (!task || task.attempts.length !== candidate.task.attempts.length || task.reworkCycles !== candidate.task.reworkCycles) throw new Error("Rework predecessor changed before cycle reservation.");
+			task.phase = "reworking";
+			task.attention = "none";
+			task.reworkCycles = cycle;
+			task.attempts.push(prepared);
+		});
+	} catch (error: unknown) { return { journal, note: `Rework cycle reservation failed before Assignment or prompt effects. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedReserved = await persistReviewJournal(repositoryRoot, reserved, dependencies);
+	if (!persistedReserved) return { journal, note: "Rework cycle reservation could not be persisted; no Assignment or prompt effect was attempted." };
+	journal = persistedReserved;
+	const task = journal.run.tasks[candidate.index];
+	const attempt = task?.attempts[task.attempts.length - 1];
+	if (!task || !attempt || attempt.role !== "builder") return { journal, note: "Reserved rework Attempt disappeared; no external effect was attempted." };
+	let assignment: BuilderAssignmentDocument;
+	try { assignment = buildBuilderAssignment({ run: journal.run, task, attempt, worktreePath: previousDispatch.worktreePath, branch: previousDispatch.branch, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, agentName: previousDispatch.agentName }); }
+	catch (error: unknown) { return { journal, note: `Rework Assignment could not be built; reserved Attempt is retained without a prompt. ${error instanceof Error ? error.message : "Assignment validation failed."}` }; }
+	let assignmentResult: AssignmentCreateResult;
+	try { assignmentResult = await dependencies.runJournal.createAssignment(repositoryRoot, assignment); } catch (error: unknown) { return { journal, note: `Rework Assignment storage failed; reserved Attempt is retained without a prompt. ${error instanceof Error ? error.message : "Storage failed."}` }; }
+	if (assignmentResult.kind !== "created" && assignmentResult.kind !== "existing-match") return { journal, note: "Rework Assignment conflicts with different bytes; reserved Attempt is retained and no prompt was sent." };
+	const assignmentHash = builderAssignmentSha256(assignmentResult.bytes);
+	let promptIntent: RunJournal;
+	try {
+		promptIntent = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const currentTask = next.run.tasks[candidate.index];
+			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			if (!current || current.role !== "builder" || !("cycle" in current.dispatch)) throw new Error("Reserved rework Attempt disappeared before prompt intent.");
+			current.dispatch = { ...current.dispatch, phase: "prompt-intended", assignmentSha256: assignmentHash };
+		});
+	} catch (error: unknown) { return { journal, note: `Rework Builder prompt intent could not be built; no prompt was sent. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedIntent = await persistReviewJournal(repositoryRoot, promptIntent, dependencies);
+	if (!persistedIntent) return { journal, note: "Rework Builder prompt intent could not be persisted; no prompt was sent." };
+	journal = persistedIntent;
+	let prompted: HerdrPromptResult;
+	try { prompted = await dependencies.herdr.promptBuilder({ repositoryRoot, name: previousDispatch.agentName, assignmentPrompt: formatBuilderPrompt(assignment) }); } catch (error: unknown) { return { journal, note: `Same Builder rework prompt failed; prompt-intended state is retained without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
+	if (prompted.kind !== "prompted" || prompted.name !== previousDispatch.agentName || prompted.workspaceId !== previousDispatch.workspaceId || prompted.paneId !== previousDispatch.paneId || prompted.terminalId !== previousDispatch.terminalId || !validIdentity(prompted.tabId)) return { journal, note: "Same Builder rework prompt envelope was malformed; prompt-intended state is retained without a resend." };
+	let active: RunJournal;
+	try {
+		active = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const currentTask = next.run.tasks[candidate.index];
+			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			if (!current || current.role !== "builder" || current.dispatch.phase !== "prompt-intended") throw new Error("Rework prompt intent disappeared after prompt.");
+			current.state = "active";
+			current.activatedAt = transitionTimestamp(journal, dependencies.clock.now());
+			current.dispatch = { ...current.dispatch, phase: "prompted", promptedAt: current.activatedAt };
+		});
+	} catch (error: unknown) { return { journal, note: `Same Builder rework prompt succeeded but activation could not be built; no resend will be attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedActive = await persistReviewJournal(repositoryRoot, active, dependencies);
+	return persistedActive ? { journal: persistedActive, note: `Rework cycle ${cycle} reserved and prompted the existing Builder ${previousDispatch.agentName}; awaiting ${attemptId} report.` } : { journal, note: "Same Builder rework prompt succeeded but activation could not be persisted; no resend will be attempted." };
 }
 
 function findInitialCodeTask(journal: RunJournal): { task: TaskRecord; index: number } | undefined {
@@ -1158,7 +1419,13 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 				currentJournal = decision.journal;
 				note = decision.note;
 			}
-			const review = await advanceEligibleReview(repositoryRoot, controllerSessionId, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
+			const approvedCheck = await validateApprovedTasks(repositoryRoot, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
+			currentJournal = approvedCheck.journal;
+			if (approvedCheck.note) note = note ? `${note} ${approvedCheck.note}` : approvedCheck.note;
+			const approvalInvalidated = currentJournal.run.tasks.some((task) => task.approval?.phase === "invalidated" && task.attention === "needs-user");
+			const review = approvalInvalidated
+				? { journal: currentJournal, note: "Approval invalidation is durable; no Reviewer or Builder effect was attempted." }
+				: await advanceEligibleReview(repositoryRoot, controllerSessionId, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
 			currentJournal = review.journal;
 			if (review.note) note = note ? `${note} ${review.note}` : review.note;
 			statusView = presentStatusForJournal(currentJournal, note);

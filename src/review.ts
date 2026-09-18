@@ -129,7 +129,7 @@ export function reviewSubjectsEqual(left: ReviewSubject, right: ReviewSubject): 
 }
 
 export function worktreeSnapshotsEqual(left: ReviewWorktreeSnapshot, right: ReviewWorktreeSnapshot): boolean {
-	return left.head === right.head && left.dirtyStateFingerprint === right.dirtyStateFingerprint;
+	return left.head === right.head && left.dirtyStateFingerprint === right.dirtyStateFingerprint && JSON.stringify(left.dirtyPaths) === JSON.stringify(right.dirtyPaths) && JSON.stringify(left.operationMarkers) === JSON.stringify(right.operationMarkers);
 }
 
 export function reviewSubjectFromFinalizedBuilderEvidence(input: {
@@ -451,6 +451,33 @@ export interface FinalizedReviewerEvidenceManifest {
 
 export function serializeFinalizedReviewerEvidenceManifest(manifest: FinalizedReviewerEvidenceManifest): string { return `${JSON.stringify(manifest, null, 2)}\n`; }
 export function finalizedReviewerEvidenceManifestSha256(manifest: FinalizedReviewerEvidenceManifest): string { return hash(serializeFinalizedReviewerEvidenceManifest(manifest)); }
+
+export function deserializeFinalizedReviewerEvidenceManifest(content: string, expectedSha256: string): { value?: FinalizedReviewerEvidenceManifest; message?: string } {
+	if (hash(content) !== expectedSha256 || !content.endsWith("\n")) return { message: "Finalized Reviewer manifest bytes do not match the durable hash." };
+	let parsed: unknown;
+	try { parsed = JSON.parse(content) as unknown; } catch { return { message: "Finalized Reviewer manifest is malformed JSON." }; }
+	if (!isRecord(parsed)) return { message: "Finalized Reviewer manifest must be an object." };
+	const keys = ["schemaVersion", "identity", "status", "verdict", "summary", "findings", "actualModel", "specificationHash", "assignmentSha256", "subject", "independence", "report", "logs", "before", "after"];
+	if (!exactKeys(parsed, keys) || `${JSON.stringify(parsed, null, 2)}\n` !== content || parsed.schemaVersion !== 1 || parsed.status !== "completed" || (parsed.verdict !== "approved" && parsed.verdict !== "changes-required") || !text(parsed.summary, 2_000) || !sha(parsed.specificationHash) || !sha(parsed.assignmentSha256) || !isRecord(parsed.identity) || parsed.identity.role !== "reviewer" || !safeIdentifier(parsed.identity.runId) || !safeIdentifier(parsed.identity.taskId) || !safeIdentifier(parsed.identity.attemptId)) return { message: "Finalized Reviewer manifest has invalid exact fields." };
+	const modelResult = model(parsed.actualModel, "manifest.actualModel");
+	const subjectResult = subject(parsed.subject, "manifest.subject");
+	const independenceResult = parseIndependence(parsed.independence, "manifest.independence");
+	if (!modelResult.value || !subjectResult.value || !independenceResult.value || !Array.isArray(parsed.findings) || !Array.isArray(parsed.logs) || !isRecord(parsed.report) || !isRecord(parsed.before) || !isRecord(parsed.after)) return { message: "Finalized Reviewer manifest contains invalid subject, identity, or evidence fields." };
+	const findings: ReviewerFinding[] = [];
+	for (const [index, item] of parsed.findings.entries()) { const finding = parseFinding(item, `manifest.findings[${index}]`); if (!finding.value) return { message: "Finalized Reviewer manifest contains invalid findings." }; findings.push(finding.value); }
+	if (parsed.verdict === "changes-required" && findings.length === 0) return { message: "Finalized Reviewer manifest requires actionable findings for changes-required." };
+	const report = parsed.report;
+	if (!exactKeys(report, ["originalPath", "finalizedPath", "size", "sha256"]) || !absolutePath(report.originalPath) || !absolutePath(report.finalizedPath) || !Number.isSafeInteger(report.size) || (report.size as number) < 0 || !sha(report.sha256)) return { message: "Finalized Reviewer report pointer is invalid." };
+	const before = parseSnapshot(parsed.before, "manifest.before");
+	const after = parseSnapshot(parsed.after, "manifest.after");
+	if (!before.value || !after.value) return { message: "Finalized Reviewer snapshots are invalid." };
+	const logs: FinalizedReviewerEvidenceManifest["logs"] = [];
+	for (const [index, item] of parsed.logs.entries()) {
+		if (!isRecord(item) || !exactKeys(item, ["id", "originalPath", "finalizedPath", "size", "sha256"]) || !safeIdentifier(item.id) || !absolutePath(item.originalPath) || !absolutePath(item.finalizedPath) || !Number.isSafeInteger(item.size) || (item.size as number) < 0 || !sha(item.sha256)) return { message: `Finalized Reviewer log ${index} is invalid.` };
+		logs.push({ id: item.id, originalPath: item.originalPath, finalizedPath: item.finalizedPath, size: item.size as number, sha256: item.sha256 });
+	}
+	return { value: { schemaVersion: 1, identity: { runId: parsed.identity.runId as string, taskId: parsed.identity.taskId as string, attemptId: parsed.identity.attemptId as string, role: "reviewer" }, status: "completed", verdict: parsed.verdict, summary: parsed.summary, findings, actualModel: modelResult.value, specificationHash: parsed.specificationHash, assignmentSha256: parsed.assignmentSha256, subject: subjectResult.value, independence: independenceResult.value, report: { originalPath: report.originalPath as string, finalizedPath: report.finalizedPath as string, size: report.size as number, sha256: report.sha256 as string }, logs, before: before.value, after: after.value }, message: undefined };
+}
 
 export function buildFinalizedReviewerEvidenceManifest(input: { runId: string; taskId: string; attempt: ReviewerAttemptRecord; report: ReviewerAttemptReport; reportSize: number; reportSha256: string; assignmentSha256: string; finalizedDirectory: string; logs: Array<{ id: string; originalPath: string; finalizedPath: string; size: number; sha256: string }>; after: ReviewWorktreeSnapshot }): FinalizedReviewerEvidenceManifest {
 	return { schemaVersion: 1, identity: { runId: input.runId, taskId: input.taskId, attemptId: input.attempt.id, role: "reviewer" }, status: "completed", verdict: input.report.verdict, summary: input.report.summary, findings: input.report.findings.map((finding) => ({ ...finding })), actualModel: { ...input.report.actualModel }, specificationHash: input.attempt.specificationHash, assignmentSha256: input.assignmentSha256, subject: cloneSubject(input.attempt.subject), independence: { ...input.attempt.independence }, report: { originalPath: input.attempt.reportPath, finalizedPath: `${input.finalizedDirectory}/report.md`, size: input.reportSize, sha256: input.reportSha256 }, logs: input.logs.map((log) => ({ ...log })), before: { ...input.attempt.worktree.baseline, dirtyPaths: [...input.attempt.worktree.baseline.dirtyPaths], operationMarkers: [...input.attempt.worktree.baseline.operationMarkers] }, after: { ...input.after, dirtyPaths: [...input.after.dirtyPaths], operationMarkers: [...input.after.operationMarkers] } };
