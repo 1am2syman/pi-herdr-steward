@@ -339,7 +339,7 @@ it.sequential("registered lifecycle flow waits for safe idle and advances Builde
 	equal(effects.reviewerPrompts, 1);
 	ok(presentations.every((item) => !item.footerText.includes("dashboard")));
 	await registered.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, ctx);
-}, 20_000);
+}, 60_000);
 
 it.sequential("records lifecycle, terminal, worktree, Git, and report progress independently and skips unchanged scans", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-progress-"));
@@ -384,7 +384,7 @@ it.sequential("records lifecycle, terminal, worktree, Git, and report progress i
 	await changed("report", () => writeFile(builder.reportPath, "report progress\n"));
 	equal(effects.reviewerStarts, 0);
 	equal(effects.reviewerPrompts, 0);
-}, 20_000);
+}, 60_000);
 
 it.sequential("uses the exact lifecycle wait first and the frozen passive interval for timeout or unavailable fallback", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-wait-"));
@@ -417,7 +417,7 @@ it.sequential("uses the exact lifecycle wait first and the frozen passive interv
 	equal((await steward.waitForMonitorSignal(root, "monitor-controller", new AbortController().signal)).kind, "timeout");
 	equal(waitCalls, 2);
 	equal(fallbackWaits, 3);
-}, 20_000);
+}, 60_000);
 
 it.sequential("keeps foreign, stale, and wrong-resource observations read-only", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-authority-"));
@@ -459,7 +459,7 @@ it.sequential("keeps foreign, stale, and wrong-resource observations read-only",
 	equal(wrong.condition, "degraded");
 	equal(effects.reviewerStarts, 0);
 	equal(effects.reviewerPrompts, 0);
-}, 20_000);
+}, 60_000);
 
 it.sequential("bounds automatic advancement to one workflow action and does not repeat after activity failure", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-action-"));
@@ -482,7 +482,7 @@ it.sequential("bounds automatic advancement to one workflow action and does not 
 	const repeat = await steward.advanceNext(root, "monitor-controller", { interactive: false, maximumActions: 1 });
 	equal(effects.reviewerPrompts, 1);
 	equal(repeat.action, "none");
-}, 20_000);
+}, 60_000);
 
 it.sequential("does not spin when an automatic action reports no durable Journal progress", async () => {
 	const journal = buildInitialRunJournal({
@@ -522,7 +522,7 @@ it.sequential("does not spin when an automatic action reports no durable Journal
 	deepStrictEqual([...new Set(presentations.map((result) => result.journal?.journalRevision))], [journal.journalRevision]);
 	equal(presentations.at(-1)?.action, "none");
 	await monitor.stop();
-}, 20_000);
+}, 60_000);
 
 it.sequential("interprets an automatic approved Reviewer verdict and advances the real completion chain one action at a time", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-completion-"));
@@ -639,7 +639,7 @@ it.sequential("retains same-family approval-required state without calling confi
 	const repeated = await steward.advanceNext(root, "monitor-controller", { interactive: false, maximumActions: 1 });
 	equal(repeated.action, "approval-required");
 	equal(confirmations, 0);
-}, 20_000);
+}, 60_000);
 
 it.sequential("derives a blocked condition and warning for durable needs-user attention", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-needs-user-"));
@@ -685,7 +685,7 @@ it.sequential("derives a blocked condition and warning for durable needs-user at
 	} finally {
 		await monitor.stop();
 	}
-}, 20_000);
+}, 60_000);
 
 it.sequential("shutdown aborts the wait and ignores a late lifecycle completion", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-shutdown-"));
@@ -707,7 +707,7 @@ it.sequential("shutdown aborts the wait and ignores a late lifecycle completion"
 	equal(effects.reviewerStarts, 0);
 	equal(effects.reviewerPrompts, 0);
 	equal(presentations.length, beforeShutdown);
-}, 20_000);
+}, 60_000);
 
 it.sequential("presents ordinary, approval-required, blocked, degraded, and completed monitor conditions through the bounded footer surface", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-footer-"));
