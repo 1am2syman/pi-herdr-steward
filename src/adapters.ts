@@ -565,7 +565,7 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 		async inspectBuilderWorktree(worktreePath, expectedRevision) {
 			try {
 				const head = await exec!("git", ["rev-parse", "--verify", "HEAD"], { cwd: worktreePath, timeout: 5000 });
-				if (head.code !== 0 || head.killed || head.stdout.trim() !== expectedRevision) return { kind: "unavailable", message: "Builder worktree HEAD does not equal the selected Run base revision." };
+				if (head.code !== 0 || head.killed || head.stdout.trim() !== expectedRevision) return { kind: "unavailable", message: "Builder worktree HEAD does not equal the expected reviewed revision." };
 				const status = await exec!("git", ["status", "--porcelain=v1", "--untracked-files=all"], { cwd: worktreePath, timeout: 5000 });
 				if (status.code !== 0 || status.killed) return { kind: "unavailable", message: "Builder worktree clean-state inspection failed." };
 				if (status.stdout.length > 0) return { kind: "unavailable", message: "Builder worktree is not clean before dispatch." };

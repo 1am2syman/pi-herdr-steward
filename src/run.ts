@@ -21,6 +21,7 @@ export const RUN_JOURNAL_SCHEMA_VERSION = 1 as const;
 export type RunStatus = "active";
 export type TaskPhase = "pending" | "building" | "reviewing" | "reworking" | "approved";
 export type TaskAttention = "none" | "blocked" | "needs-user";
+export type TaskAttentionReason = "rework-preflight" | "protected-evidence" | "rework-exhausted";
 
 export type Verification =
 	| { kind: "command"; command: string }
@@ -307,6 +308,8 @@ export interface TaskRecord {
 	contract: TaskContract;
 	phase: TaskPhase;
 	attention: TaskAttention;
+	attentionDiagnostic?: string;
+	attentionReason?: TaskAttentionReason;
 	attempts: AttemptRecord[];
 	reworkCycles: number;
 	approval?: TaskApproval;
@@ -1023,7 +1026,9 @@ function validateRunRecord(value: unknown, path: string): { value?: RunRecord; d
 			continue;
 		}
 		const hasApproval = Object.prototype.hasOwnProperty.call(task, "approval");
-		if (!exactKeys(task, ["specificationVersion", "specificationHash", "contract", "phase", "attention", "attempts", "reworkCycles", ...(hasApproval ? ["approval"] : [])])) {
+		const hasAttentionDiagnostic = Object.prototype.hasOwnProperty.call(task, "attentionDiagnostic");
+		const hasAttentionReason = Object.prototype.hasOwnProperty.call(task, "attentionReason");
+		if (!exactKeys(task, ["specificationVersion", "specificationHash", "contract", "phase", "attention", ...(hasAttentionDiagnostic ? ["attentionDiagnostic"] : []), ...(hasAttentionReason ? ["attentionReason"] : []), "attempts", "reworkCycles", ...(hasApproval ? ["approval"] : [])])) {
 			diagnostics.push(diagnostic("invalid-task", "Task contains unknown or missing initialization keys.", taskPath));
 			continue;
 		}
@@ -1035,6 +1040,8 @@ function validateRunRecord(value: unknown, path: string): { value?: RunRecord; d
 		if (typeof task.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(task.specificationHash) || (contractResult.value && specificationHash(contractResult.value) !== task.specificationHash)) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationHash does not match its exact contract.", `${taskPath}.specificationHash`));
 		const settingsLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.reworkCycleLimit) ? value.effectiveSettings.reworkCycleLimit as number : 5;
 		if (!["pending", "building", "reviewing", "reworking", "approved"].includes(task.phase as string) || !["none", "blocked", "needs-user"].includes(task.attention as string) || !Array.isArray(task.attempts) || !Number.isSafeInteger(task.reworkCycles) || (task.reworkCycles as number) < 0 || (task.reworkCycles as number) > 5 || (task.reworkCycles as number) > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Task has an invalid phase, attention, Attempt sequence, or bounded rework counter.", taskPath));
+		if (hasAttentionDiagnostic && (!boundedText(task.attentionDiagnostic, 2_000) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionDiagnostic must be bounded and accompany durable attention.", `${taskPath}.attentionDiagnostic`));
+		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
 		const attempts: AttemptRecord[] = [];
 		if (Array.isArray(task.attempts)) {
 			if (task.attempts.length > 12) taskDiagnostics.push(diagnostic("invalid-task", "A Task allows at most the initial pair plus five rework/review cycles.", `${taskPath}.attempts`));
@@ -1058,7 +1065,11 @@ function validateRunRecord(value: unknown, path: string): { value?: RunRecord; d
 		if (task.phase === "reworking" && (attempts.length < 3 || !latestBuilder || !isReworkDispatch(latestBuilder.dispatch))) taskDiagnostics.push(diagnostic("invalid-task", "Reworking Tasks require a latest reserved rework Builder Attempt.", taskPath));
 		if (task.phase === "reviewing" && !latestReviewer && !(attempts.length === 1 && attempts[0]?.role === "builder" && task.attention === "needs-user")) taskDiagnostics.push(diagnostic("invalid-task", "Reviewing Tasks require a latest Reviewer Attempt unless Review is durably paused before dispatch.", taskPath));
 		if (task.phase === "reviewing" && latestReviewer && latestReviewer.state === "reported" && task.attention === "needs-user" && latestReviewer.integrity?.kind !== "violated" && latestReviewer.evidence?.phase !== "finalized") taskDiagnostics.push(diagnostic("invalid-task", "A reported Reviewer with needs-user attention requires finalized evidence or a recorded integrity violation.", taskPath));
-		if (task.phase === "reviewing" && latestReviewer && task.attention === "needs-user" && latestReviewer.evidence?.phase === "finalized" && latestReviewer.evidence.verdict === "changes-required" && task.reworkCycles !== settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Reviewer changes-required needs-user attention is legal only at the frozen rework limit.", taskPath));
+		if (task.phase === "reviewing" && latestReviewer && task.attention === "needs-user" && latestReviewer.evidence?.phase === "finalized" && latestReviewer.evidence.verdict === "changes-required") {
+			if (!boundedText(task.attentionDiagnostic, 2_000)) taskDiagnostics.push(diagnostic("invalid-task", "A paused changes-required Review requires a bounded durable diagnostic.", `${taskPath}.attentionDiagnostic`));
+			else if (task.reworkCycles !== settingsLimit && task.attentionReason !== "rework-preflight" && task.attentionReason !== "protected-evidence") taskDiagnostics.push(diagnostic("invalid-task", "A below-limit changes-required pause must record a rework preflight or protected evidence reason.", `${taskPath}.attentionReason`));
+			else if (task.reworkCycles === settingsLimit && task.attentionReason !== "rework-exhausted" && task.attentionReason !== "protected-evidence" && task.attentionReason !== "rework-preflight") taskDiagnostics.push(diagnostic("invalid-task", "A changes-required pause at the frozen limit must retain an exhaustion or safety reason.", `${taskPath}.attentionReason`));
+		}
 		if (task.phase === "approved" && (!approval.value || approval.value.phase !== "valid" || task.attention !== "none" || !latestReviewer || latestReviewer.state !== "reported" || latestReviewer.evidence?.phase !== "finalized" || latestReviewer.evidence.verdict !== "approved")) taskDiagnostics.push(diagnostic("invalid-task", "Approved Tasks require a valid Approval bound to a finalized approved Reviewer.", taskPath));
 		if (task.attention === "blocked" && (!latestReviewer || latestReviewer.reportRepair?.phase !== "blocked")) taskDiagnostics.push(diagnostic("invalid-task", "Blocked attention requires the latest Reviewer report repair to be blocked.", taskPath));
 		if (approval.value?.phase === "valid" && task.phase !== "approved") taskDiagnostics.push(diagnostic("invalid-task", "A valid Approval requires approved Task phase.", `${taskPath}.approval`));
@@ -1071,7 +1082,7 @@ function validateRunRecord(value: unknown, path: string): { value?: RunRecord; d
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
 		if (contractResult.value) taskIds.add(contractResult.value.id);
 		if (taskDiagnostics.length > 0 || !contractResult.value || typeof task.specificationHash !== "string") diagnostics.push(...taskDiagnostics);
-		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}) });
+		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, ...(hasAttentionDiagnostic ? { attentionDiagnostic: task.attentionDiagnostic as string } : {}), ...(hasAttentionReason ? { attentionReason: task.attentionReason as TaskAttentionReason } : {}), attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}) });
 	}
 	const plans = validateProjectModelPlans(value.modelPlan, `${path}.modelPlan`);
 	if (!plans.value || plans.diagnostics.length > 0) diagnostics.push(...plans.diagnostics.map((item: ConfigDiagnostic) => diagnostic("invalid-config", item.message, item.path)));

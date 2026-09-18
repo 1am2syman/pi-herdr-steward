@@ -8,7 +8,8 @@ import { afterEach, it } from "vitest";
 import { createRunJournalStore } from "../src/run-journal-store.ts";
 import { createAttemptEvidenceStore, sha256Bytes } from "../src/attempt-evidence-store.ts";
 import { resolveAssignmentPaths } from "../src/assignment-store.ts";
-import { buildInitialRunJournal, deserializeRunJournal, serializeRunJournal, type RunJournal } from "../src/run.ts";
+import { buildInitialRunJournal, deserializeRunJournal, serializeRunJournal, validateRunJournal, type BuilderAttemptRecord, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
+import type { ReviewSubject } from "../src/review.ts";
 import { type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
 import type { BuilderAssignmentDocument } from "../src/run.ts";
 
@@ -47,6 +48,59 @@ function journal(runId: string, revision = 1, updatedAt = "2026-09-17T18:00:00.0
 		integrationBase: { kind: "none" },
 	});
 	return { ...created, journalRevision: revision, run: { ...created.run, updatedAt } };
+}
+
+function maxHistoryJournal(): RunJournal {
+	const maxSettings = { ...settings, reworkCycleLimit: 5 };
+	const base = buildInitialRunJournal({
+		identity: { runId: "run-20260917T180000000Z-maxhistory", createdAt: "2026-09-17T18:00:00.000Z" },
+		controllerSessionId: "storage-session",
+		draft: {
+			declaredOutcome: "Persist a maximum Review history",
+			tasks: [{ requiredOutcome: "Keep the code change reviewable", allowedScope: ["src/change.ts"], expectedArtifacts: [{ kind: "git-commit" }], verification: { kind: "command", command: "npm test" }, reviewRequired: true }],
+			modelPlan: plans,
+			effectiveSettings: maxSettings,
+			finalVerification: { kind: "command", command: "npm test" },
+		},
+		modelPlan: plans,
+		effectiveSettings: maxSettings,
+		integrationBase: { kind: "git", branch: "main", revision: "0".repeat(40) },
+	});
+	const task = base.run.tasks[0]!;
+	const timestamp = "2026-09-17T18:00:00.000Z";
+	const sha = (prefix: string, index: number) => `sha256:${prefix.repeat(63)}${index.toString(16)}`;
+	const revision = (index: number) => index.toString(16).padStart(40, "0");
+	const snapshot = (index: number): ReviewWorktreeSnapshot => ({ head: revision(index), dirtyStateFingerprint: sha("c", index), dirtyPaths: [], operationMarkers: [] });
+	const builderPaths = (attempt: number) => ({ assignmentPath: `/tmp/max-history/attempt-${String(attempt).padStart(2, "0")}/assignment.json`, reportPath: `/tmp/max-history/attempt-${String(attempt).padStart(2, "0")}/report.md`, evidenceDirectory: `/tmp/max-history/attempt-${String(attempt).padStart(2, "0")}/evidence` });
+	const attempts: Array<BuilderAttemptRecord | ReviewerAttemptRecord> = [];
+	const builderIdentity = { branch: "steward/run/task/attempt-01", agentName: "steward-b-abcdef12-01-01", worktreePath: "/tmp/max-history/builder", workspaceId: "workspace-1", paneId: "builder-pane", terminalId: "builder-terminal" };
+	for (let cycle = 0; cycle <= 5; cycle += 1) {
+		const builderNumber = cycle * 2 + 1;
+		const builderPath = builderPaths(builderNumber);
+		const builderManifest = sha("a", builderNumber);
+		const builder: BuilderAttemptRecord = {
+			id: `attempt-${String(builderNumber).padStart(2, "0")}`, role: "builder", state: "reported", preparedAt: timestamp, activatedAt: timestamp, actualModel: { ...plans.builder.primary }, specificationHash: task.specificationHash, baseRevision: "0".repeat(40), ...builderPath,
+			dispatch: cycle === 0 ? { phase: "prompted", ...builderIdentity, assignmentSha256: sha("d", builderNumber), promptedAt: timestamp } : { phase: "prompted", ...builderIdentity, cycle, priorBuilderAttemptId: `attempt-${String(builderNumber - 2).padStart(2, "0")}`, priorReviewerAttemptId: `attempt-${String(builderNumber - 1).padStart(2, "0")}`, reviewedSubject: (attempts[attempts.length - 1] as ReviewerAttemptRecord).subject, reviewerManifestPath: `/tmp/max-history/attempt-${String(builderNumber - 1).padStart(2, "0")}/finalized/manifest.json`, reviewerManifestSha256: (attempts[attempts.length - 1] as ReviewerAttemptRecord).evidence!.phase === "finalized" ? (attempts[attempts.length - 1] as ReviewerAttemptRecord).evidence!.manifestSha256 : sha("b", builderNumber - 1), findings: [{ id: `finding-${cycle}`, severity: "major", summary: "Fix the protected finding.", detail: "Fix the protected finding before the next Review." }], assignmentSha256: sha("d", builderNumber), promptedAt: timestamp },
+			evidence: { phase: "finalized", finalizedAt: timestamp, status: "completed", reportSha256: sha("e", builderNumber), manifestPath: `/tmp/max-history/attempt-${String(builderNumber).padStart(2, "0")}/finalized/manifest.json`, manifestSha256: builderManifest, producedRevision: revision(builderNumber) },
+		};
+		attempts.push(builder);
+		const reviewerNumber = builderNumber + 1;
+		const subject: ReviewSubject = { kind: "git", baseRevision: "0".repeat(40), headRevision: revision(builderNumber), commits: ["1".repeat(40), revision(builderNumber)], builderManifestSha256: builderManifest };
+		const reviewerPath = builderPaths(reviewerNumber);
+		const reviewer: ReviewerAttemptRecord = {
+			id: `attempt-${String(reviewerNumber).padStart(2, "0")}`, role: "reviewer", state: "reported", preparedAt: timestamp, activatedAt: timestamp, actualModel: { ...plans.reviewer.primary }, specificationHash: task.specificationHash, ...reviewerPath, subject, independence: { kind: "different-provider-family", builderProvider: "builder", reviewerProvider: "reviewer" }, worktree: { path: "/tmp/max-history/builder", baseline: snapshot(builderNumber) }, dispatch: { phase: "prompted", agentName: `steward-r-abcdef12-01-${String(reviewerNumber).padStart(2, "0")}`, worktreePath: "/tmp/max-history/builder", workspaceId: "workspace-1", paneId: `reviewer-pane-${reviewerNumber}`, terminalId: `reviewer-terminal-${reviewerNumber}`, assignmentSha256: sha("f", reviewerNumber), promptedAt: timestamp } as ReviewerAttemptRecord["dispatch"], integrity: { kind: "preserved", after: snapshot(builderNumber) }, evidence: { phase: "finalized", finalizedAt: timestamp, verdict: cycle === 5 ? "approved" : "changes-required", reportSha256: sha("b", reviewerNumber), manifestPath: `/tmp/max-history/attempt-${String(reviewerNumber).padStart(2, "0")}/finalized/manifest.json`, manifestSha256: sha("b", reviewerNumber), subject },
+		};
+		attempts.push(reviewer);
+	}
+	const finalBuilder = attempts[10] as BuilderAttemptRecord;
+	const finalReviewer = attempts[11] as ReviewerAttemptRecord;
+	const finalSubject = finalReviewer.subject;
+	const finalEvidence = finalReviewer.evidence;
+	if (!finalEvidence || finalEvidence.phase !== "finalized") throw new Error("fixture final Reviewer evidence missing");
+	const result: RunJournal = { ...base, journalRevision: 2, run: { ...base.run, updatedAt: "2026-09-17T18:12:00.000Z", tasks: [{ ...task, phase: "approved", attention: "none", attempts, reworkCycles: 5, approval: { phase: "valid", approvedAt: timestamp, builderAttemptId: finalBuilder.id, reviewerAttemptId: finalReviewer.id, subject: finalSubject, reviewerManifestPath: finalEvidence.manifestPath, reviewerManifestSha256: finalEvidence.manifestSha256, worktreeSnapshot: snapshot(11), verdict: "approved" } }] } };
+	const validated = validateRunJournal(result);
+	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
+	return validated.value;
 }
 
 async function makeRoot(): Promise<string> {
@@ -123,7 +177,7 @@ it.sequential("rejects malformed and invalid candidates without changing snapsho
 		journal(a.run.id, 4),
 	];
 	for (const candidate of candidates) {
-		const result = await store.replaceActive(root, candidate as RunJournal);
+		const result = await store.replaceActive(root, candidate as unknown as RunJournal);
 		ok(result.kind === "invalid-candidate" || result.kind === "storage-error");
 		equal(await readFile(paths.activePath, "utf8"), beforeActive);
 	}
@@ -131,6 +185,42 @@ it.sequential("rejects malformed and invalid candidates without changing snapsho
 	const invalidCurrent = await store.replaceActive(root, journal(a.run.id, 2));
 	equal(invalidCurrent.kind, "invalid-current");
 	equal(await readFile(paths.activePath, "utf8"), "{\"schemaVersion\":1}\n");
+});
+
+it.sequential("round-trips the valid 12-Attempt history and rejects impossible mutations without clobbering", async () => {
+	const root = await makeRoot();
+	const store = createRunJournalStore();
+	const maximum = maxHistoryJournal();
+	const initial = { ...maximum, journalRevision: 1, run: { ...maximum.run, updatedAt: maximum.run.createdAt, tasks: maximum.run.tasks.map(({ approval: _approval, ...task }) => ({ ...task, phase: "pending" as const, attention: "none" as const, attempts: [], reworkCycles: 0 })) } };
+	const created = await store.createActive(root, initial);
+	if (created.kind !== "created") throw new Error(`maximum journal seed failed: ${JSON.stringify(created)}`);
+	const replaced = await store.replaceActive(root, maximum);
+	if (replaced.kind !== "replaced") throw new Error(`maximum journal replace failed: ${JSON.stringify(replaced)}`);
+	const paths = store.resolvePaths(root);
+	const bytes = await readFile(paths.activePath, "utf8");
+	equal(bytes, serializeRunJournal(maximum));
+	const decoded = deserializeRunJournal(bytes, paths.activePath);
+	ok(decoded.value);
+	deepStrictEqual(decoded.value, maximum);
+	const mutations: Array<[string, (candidate: Record<string, unknown>) => void]> = [
+		["gap", (candidate) => { const attempts = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>; attempts[3]!.id = "attempt-99"; }],
+		["role-order", (candidate) => { const attempts = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>; attempts[1]!.role = "builder"; }],
+		["counter", (candidate) => { (((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!).reworkCycles = 4; }],
+		["cycle-limit", (candidate) => { const attempts = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>; (attempts[2]!.dispatch as Record<string, unknown>).cycle = 6; }],
+		["backlink", (candidate) => { const attempts = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>; (attempts[2]!.dispatch as Record<string, unknown>).priorReviewerAttemptId = "attempt-12"; }],
+		["approval-subject", (candidate) => { const task = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!; ((task.approval as Record<string, unknown>).subject as Record<string, unknown>).builderManifestSha256 = `sha256:${"f".repeat(64)}`; }],
+		["later-attempt", (candidate) => { const task = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!; const attempts = task.attempts as Array<Record<string, unknown>>; attempts.push({ ...attempts[0], id: "attempt-13" }); }],
+		["phase", (candidate) => { (((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!).phase = "reworking"; }],
+		["repair", (candidate) => { const attempts = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>; attempts[11]!.reportRepair = { phase: "requested" }; }],
+	];
+	for (const [name, mutate] of mutations) {
+		const candidate = JSON.parse(bytes) as Record<string, unknown>;
+		candidate.journalRevision = 3;
+		mutate(candidate);
+		const result = await store.replaceActive(root, candidate as unknown as RunJournal);
+		ok(result.kind === "invalid-candidate" || result.kind === "storage-error", `${name} mutation was accepted`);
+		equal(await readFile(paths.activePath, "utf8"), bytes, `${name} mutation clobbered the active journal`);
+	}
 });
 
 it.sequential("atomic reads observe only complete old or new snapshots", async () => {

@@ -40,6 +40,7 @@ import {
 	type BuilderAssignmentDocument,
 	type DispatchRecord,
 	type TaskRecord,
+	type TaskAttentionReason,
 	type BuilderEvidenceRecord,
 	type ReviewerEvidenceRecord,
 	type ReviewerAttemptRecord,
@@ -313,6 +314,8 @@ function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusVi
 	if (!task) return { kind: "present", markdown: `Run ${journal.run.id} is active; no Reviewer Task is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
 	const reviewer = latestReviewerAttempt(task);
 	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: reviewing`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, `Attention: ${task.attention}`];
+	if (task.attentionReason) lines.push(`Attention reason: ${task.attentionReason}`);
+	if (task.attentionDiagnostic) lines.push(`Attention diagnostic: ${task.attentionDiagnostic}`);
 	if (task.approval?.phase === "invalidated") lines.push(`Approval: invalidated (${task.approval.reason}); preserved exact facts require user attention.`);
 	if (!reviewer) {
 		lines.push("Review dispatch pending; no Reviewer Attempt has been launched.");
@@ -637,15 +640,30 @@ function reviewTaskCandidate(journal: RunJournal): { task: TaskRecord; index: nu
 	for (let index = 0; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
 		if (!task || !task.contract.reviewRequired) continue;
-		const builder = [...task.attempts].reverse().find((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder");
 		const latest = task.attempts[task.attempts.length - 1];
-		if ((task.phase === "reviewing" || task.phase === "reworking" || task.phase === "building") && (latest?.role === "builder" || latest?.role === "reviewer") && builder?.state === "reported" && builder.evidence?.phase === "finalized" && builder.evidence.status === "completed") return { task, index, builder };
+		const pausedBeforeReviewer = task.attention === "needs-user" && task.attempts.length === 1;
+		if ((task.attention !== "none" && !pausedBeforeReviewer) || (task.phase !== "reviewing" && task.phase !== "reworking" && task.phase !== "building") || latest?.role !== "builder") continue;
+		const builder = latest;
+		if (builder.state === "reported" && builder.evidence?.phase === "finalized" && builder.evidence.status === "completed") return { task, index, builder };
 	}
 	return undefined;
 }
 
 function reviewerForTask(task: TaskRecord): ReviewerAttemptRecord | undefined {
-	return latestReviewerAttempt(task);
+	const latest = task.attempts[task.attempts.length - 1];
+	return latest?.role === "reviewer" ? latest : undefined;
+}
+
+function reviewerTaskCandidate(journal: RunJournal): { task: TaskRecord; index: number; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord } | undefined {
+	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+		const task = journal.run.tasks[index];
+		if (!task || !task.contract.reviewRequired || task.phase !== "reviewing" || task.attention !== "none") continue;
+		const reviewer = reviewerForTask(task);
+		const preceding = task.attempts[task.attempts.length - 2];
+		if (!reviewer || !preceding || preceding.role !== "builder") continue;
+		if (preceding.state === "reported" && preceding.evidence?.phase === "finalized" && preceding.evidence.status === "completed") return { task, index, builder: preceding, reviewer };
+	}
+	return undefined;
 }
 
 function latestReviewerAttempt(task: TaskRecord): ReviewerAttemptRecord | undefined {
@@ -674,6 +692,12 @@ async function pauseReview(repositoryRoot: string, candidate: { task: TaskRecord
 			if (!task) throw new Error("Review Task disappeared while pausing.");
 			task.phase = "reviewing";
 			task.attention = "needs-user";
+			task.attentionDiagnostic = note.slice(0, 2_000);
+			const latest = task.attempts.at(-1);
+			if (latest?.role === "reviewer" && latest.evidence?.phase === "finalized" && latest.evidence.verdict === "changes-required") {
+				const reason: TaskAttentionReason = note.includes("frozen rework limit") ? "rework-exhausted" : note.startsWith("Rework") || note.startsWith("Automatic same-Builder") ? "rework-preflight" : "protected-evidence";
+				task.attentionReason = reason;
+			}
 		});
 	} catch (error: unknown) {
 		return { journal, note: `${note} Durable pause could not be built: ${error instanceof Error ? error.message : "Journal validation failed."}` };
@@ -939,6 +963,8 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 			if (!task || task.attempts.some((attempt) => attempt.id === attemptId)) throw new Error("Reviewer Attempt already exists.");
 			task.phase = "reviewing";
 			task.attention = "none";
+			delete task.attentionDiagnostic;
+			delete task.attentionReason;
 			task.attempts.push(prepared);
 		});
 	} catch (error: unknown) { return { journal, note: `Reviewer pane intent could not be built; no pane was created. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
@@ -1028,10 +1054,10 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 }
 
 async function advanceEligibleReview(repositoryRoot: string, controllerSessionId: string, journal: RunJournal, dependencies: StewardDependencies): Promise<ReviewDecision> {
+	const reviewerSelected = reviewerTaskCandidate(journal);
+	if (reviewerSelected) return validateActiveReviewerReport(repositoryRoot, journal, reviewerSelected, reviewerSelected.reviewer, dependencies);
 	const selected = reviewTaskCandidate(journal);
 	if (!selected) return { journal, note: "" };
-	const reviewer = reviewerForTask(selected.task);
-	if (reviewer) return validateActiveReviewerReport(repositoryRoot, journal, selected, reviewer, dependencies);
 	const derived = await deriveReviewSubject({ runId: journal.run.id, task: selected.task, builder: selected.builder }, dependencies);
 	if (!derived.subject || !derived.manifestPath || !derived.manifestSha256) return { journal, note: derived.message ?? "Review dispatch pending; immutable Builder evidence subject is unavailable." };
 	if (!dependencies.model.inspectModelChoice) return { journal, note: "Review dispatch pending; Reviewer model inspection is unavailable." };
@@ -1142,6 +1168,8 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 			if (!task || task.attempts.length !== candidate.task.attempts.length || task.reworkCycles !== candidate.task.reworkCycles) throw new Error("Rework predecessor changed before cycle reservation.");
 			task.phase = "reworking";
 			task.attention = "none";
+			delete task.attentionDiagnostic;
+			delete task.attentionReason;
 			task.reworkCycles = cycle;
 			task.attempts.push(prepared);
 		});

@@ -89,6 +89,33 @@ it.sequential("production Git evidence adapter fails closed for wrong range and 
 	equal(wrong.code, "base-not-ancestor");
 });
 
+it.sequential("production Git Builder preflight accepts the clean prior reviewed head and rejects moved or dirty state read-only", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-git-rework-preflight-"));
+	roots.push(root);
+	await git(root, ["init", "--initial-branch=main"]);
+	await git(root, ["config", "user.email", "test@example.invalid"]);
+	await git(root, ["config", "user.name", "Rework Preflight Test"]);
+	await writeFile(join(root, "change.txt"), "reviewed artifact\n");
+	await git(root, ["add", "change.txt"]);
+	await git(root, ["commit", "-m", "reviewed artifact"]);
+	const reviewedHead = await git(root, ["rev-parse", "HEAD"]);
+	const adapter = createGitAdapter(runner());
+	const clean = await adapter.inspectBuilderWorktree!(root, reviewedHead);
+	deepStrictEqual(clean, { kind: "ready", head: reviewedHead, clean: true });
+	const wrong = await adapter.inspectBuilderWorktree!(root, "0".repeat(40));
+	if (wrong.kind !== "unavailable") throw new Error("wrong prior reviewed head was accepted");
+	await writeFile(join(root, "change.txt"), "moved after Review\n");
+	const dirty = await adapter.inspectBuilderWorktree!(root, reviewedHead);
+	if (dirty.kind !== "unavailable") throw new Error("dirty rework worktree was accepted");
+	equal(await git(root, ["rev-parse", "HEAD"]), reviewedHead);
+	deepStrictEqual(await readFile(join(root, "change.txt")), Buffer.from("moved after Review\n"));
+	await writeFile(join(root, "change.txt"), "reviewed artifact\n");
+	await writeFile(join(root, "untracked.txt"), "untracked mutation\n");
+	const untracked = await adapter.inspectBuilderWorktree!(root, reviewedHead);
+	if (untracked.kind !== "unavailable") throw new Error("untracked rework worktree was accepted");
+	equal(await git(root, ["rev-parse", "HEAD"]), reviewedHead);
+});
+
 it.sequential("Review snapshots fingerprint clean, tracked, staged, untracked, operation, and HEAD changes without mutation", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-git-review-snapshot-"));
 	roots.push(root);
