@@ -87,7 +87,7 @@ type Fixture = {
 	order: string[];
 };
 
-async function makeFixture(options: { transientFailure: boolean; transientKind?: FunctionalTransientKind; singleTransientFailure?: boolean; noFallback?: boolean; preservationUnavailable?: boolean; stopFailure?: "throw" | "killed" | "wrong-identity"; stopAcknowledgementCasFailure?: boolean; reviewRequired?: boolean; builderTransientFailure?: boolean; reviewerTransientFailure?: boolean; reviewerTransientFailures?: number; reviewerPrimaryUnavailableAfterFailure?: boolean; reviewerPrimaryModel?: string; reviewerFallbackModels?: string[] }): Promise<Fixture> {
+async function makeFixture(options: { transientFailure: boolean; transientKind?: FunctionalTransientKind; singleTransientFailure?: boolean; noFallback?: boolean; preservationUnavailable?: boolean; stopFailure?: "throw" | "killed" | "wrong-identity"; stopAcknowledgementCasFailure?: boolean; reviewRequired?: boolean; builderTransientFailure?: boolean; reviewerTransientFailure?: boolean; reviewerTransientFailures?: number; reviewerPrimaryUnavailableAfterFailure?: boolean; reviewerSameFamilyApproval?: boolean; reviewerCrossFamilyFallbackUnavailableBeforeFailure?: boolean; reviewerPrimaryModel?: string; reviewerFallbackModels?: string[] }): Promise<Fixture> {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-retry-functional-"));
 	roots.push(root);
 	const activeModelPlans: ProjectModelPlans = {
@@ -106,6 +106,7 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 	let preservationUnavailable = options.preservationUnavailable ?? false;
 	let builderFailureArmed = options.builderTransientFailure ?? (!options.reviewRequired && options.transientFailure);
 	let reviewerFailuresRemaining = options.reviewerTransientFailures ?? (options.reviewerTransientFailure ? 1 : 0);
+	const initialReviewerFailures = options.reviewerTransientFailures ?? (options.reviewerTransientFailure ? 1 : 0);
 	const transientKind = options.transientKind ?? "provider-network-interruption";
 	let paneNumber = 1;
 	const started = new Set<string>();
@@ -243,6 +244,7 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		async editConfiguration() { return { kind: "cancelled" }; },
 		async draftRun() { return { kind: "drafted" as const, draft: draft(activeModelPlans, options.reviewRequired ?? false) }; },
 		async confirmRun() { return true; },
+		async confirmSameFamilyReview() { return options.reviewerSameFamilyApproval ?? false; },
 		presentConfigurationResult() {},
 		presentStartResult() {},
 		presentResumeResult() {},
@@ -257,7 +259,8 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 			async validateModelPlans() { return []; },
 			async inspectModelChoice(choice, role, index) {
 				if (role === "reviewer") {
-					const available = choice.model !== "provider/unavailable" && !choice.model.endsWith("/unavailable") && !(options.reviewerPrimaryUnavailableAfterFailure && reviewerFailuresRemaining < (options.reviewerTransientFailures ?? (options.reviewerTransientFailure ? 1 : 0)) && choice.model === activeModelPlans.reviewer.primary.model) && !(options.noFallback && choice.model !== activeModelPlans.reviewer.primary.model);
+					const crossFamilyFallbackUnavailable = options.reviewerCrossFamilyFallbackUnavailableBeforeFailure && reviewerFailuresRemaining === initialReviewerFailures && choice.model === activeModelPlans.reviewer.fallbacks.at(-1)?.model;
+					const available = choice.model !== "provider/unavailable" && !choice.model.endsWith("/unavailable") && !crossFamilyFallbackUnavailable && !(options.reviewerPrimaryUnavailableAfterFailure && reviewerFailuresRemaining < initialReviewerFailures && choice.model === activeModelPlans.reviewer.primary.model) && !(options.noFallback && choice.model !== activeModelPlans.reviewer.primary.model);
 					return { choice: { ...choice }, available, diagnostics: available ? [] : [{ code: "unavailable-model", role, index, reference: choice.model, message: "fixture unavailable" }] };
 				}
 				const available = choice.model === modelPlans.builder.primary.model || (!options.noFallback && choice.model !== "provider/unavailable");
@@ -537,6 +540,44 @@ it.sequential("registered Reviewer transient fallback persists the provider-fami
 	expect(fallback.state).toBe("active");
 	const assignment = deserializeReviewerAssignment(await readFile(fallback.assignmentPath, "utf8"));
 	expect(assignment.value?.assignment.actualModel).toEqual(fallback.actualModel);
+	expect(assignment.value?.assignment.continuation).toMatchObject({ predecessorAttemptId: sameModel.id, retryOrdinal: 2 });
+	const preservedIndex = fixture.order.indexOf("preserve");
+	const acknowledgedIndex = fixture.order.indexOf("stop-ack");
+	const reservedIndex = fixture.order.indexOf("reserve");
+	expect(preservedIndex).toBeGreaterThanOrEqual(0);
+	expect(acknowledgedIndex).toBeGreaterThan(preservedIndex);
+	expect(reservedIndex).toBeGreaterThan(acknowledgedIndex);
+});
+
+it.sequential("registered approved same-family Reviewer retry recomputes a truthful cross-family fallback", async () => {
+	const fixture = await makeFixture({ reviewRequired: true, transientFailure: false, reviewerTransientFailures: 2, reviewerSameFamilyApproval: true, reviewerCrossFamilyFallbackUnavailableBeforeFailure: true, reviewerPrimaryModel: "provider/reviewer-primary", reviewerFallbackModels: ["provider/unavailable", "other/fallback"] });
+	let journal = await fixture.load();
+	await writeReviewBuilderReport(fixture.root, journal);
+	for (let pass = 0; pass < 100; pass += 1) {
+		journal = await fixture.resume();
+		const attempts = journal.run.tasks[0]!.attempts;
+		if (attempts.filter((attempt) => attempt.replacement).length === 2 && attempts.at(-1)?.role === "reviewer" && attempts.at(-1)?.state === "active") break;
+	}
+	const task = journal.run.tasks[0]!;
+	const reviewers = task.attempts.filter((attempt) => attempt.role === "reviewer");
+	expect(reviewers).toHaveLength(3);
+	const initial = reviewers[0]!;
+	const sameModel = reviewers[1]!;
+	const fallback = reviewers[2]!;
+	expect(initial.actualModel.model).toBe("provider/reviewer-primary");
+	expect(initial.independence).toMatchObject({ kind: "same-provider-family-approved", provider: "provider", controllerSessionId: "retry-controller" });
+	expect(sameModel.replacement).toMatchObject({ retryOrdinal: 1, modelSelection: { kind: "same-model-first", planIndex: 0 } });
+	expect(sameModel.actualModel).toEqual(initial.actualModel);
+	expect(sameModel.independence).toEqual(initial.independence);
+	expect(fallback.replacement).toMatchObject({ retryOrdinal: 2, modelSelection: { kind: "approved-fallback", planIndex: 2, reason: "same-model-retry-failed" } });
+	expect(fallback.actualModel.model).toBe("other/fallback");
+	expect(fallback.independence).toEqual({ kind: "different-provider-family", builderProvider: "provider", reviewerProvider: "other" });
+	expect(fallback.state).toBe("active");
+	expect(fixture.effects.models.slice(-3)).toEqual(["provider/reviewer-primary", "provider/reviewer-primary", "other/fallback"]);
+	const assignment = deserializeReviewerAssignment(await readFile(fallback.assignmentPath, "utf8"));
+	expect(assignment.value?.assignment.attemptId).toBe(fallback.id);
+	expect(assignment.value?.assignment.actualModel).toEqual(fallback.actualModel);
+	expect(assignment.value?.assignment.independence).toEqual(fallback.independence);
 	expect(assignment.value?.assignment.continuation).toMatchObject({ predecessorAttemptId: sameModel.id, retryOrdinal: 2 });
 	const preservedIndex = fixture.order.indexOf("preserve");
 	const acknowledgedIndex = fixture.order.indexOf("stop-ack");

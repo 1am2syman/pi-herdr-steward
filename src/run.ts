@@ -1991,14 +1991,24 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 				};
 				const attemptFacts = lineageFacts(attempt, index);
 				const predecessorFacts = lineageFacts(predecessor, index - 1);
-					const replacementDispatch = attempt.dispatch;
+				const replacementDispatch = attempt.dispatch;
 				const sourcePaneMatches = !predecessor || replacementDispatch.phase !== "replacement-pane-intended" || (replacementDispatch.sourcePaneId === predecessorFacts.paneId && replacementDispatch.workspaceId === predecessorFacts.workspaceId);
+				const reviewerBuilder = precedingBuilder(index - 1);
+				const reviewerBuilderProvider = reviewerBuilder ? parseCanonicalModelReference(reviewerBuilder.actualModel.model)?.provider : undefined;
+				const predecessorReviewerProvider = predecessor?.role === "reviewer" ? parseCanonicalModelReference(predecessor.actualModel.model)?.provider : undefined;
+				const successorReviewerProvider = attempt.role === "reviewer" ? parseCanonicalModelReference(attempt.actualModel.model)?.provider : undefined;
 				const transientReviewerProviderChange = isTransient && attempt.role === "reviewer" && predecessor?.role === "reviewer"
-					? predecessor.independence.kind === "different-provider-family" && attempt.independence.kind === "different-provider-family"
-						&& attempt.independence.builderProvider === predecessor.independence.builderProvider
-						&& attempt.independence.reviewerProvider !== attempt.independence.builderProvider
-						&& parseCanonicalModelReference(attempt.actualModel.model)?.provider === attempt.independence.reviewerProvider
-						&& parseCanonicalModelReference(predecessor.actualModel.model)?.provider === predecessor.independence.reviewerProvider
+					? reviewerBuilderProvider !== undefined && predecessorReviewerProvider !== undefined && successorReviewerProvider !== undefined
+						&& attempt.independence.kind === "different-provider-family"
+						&& attempt.independence.builderProvider === reviewerBuilderProvider
+						&& attempt.independence.reviewerProvider === successorReviewerProvider
+						&& successorReviewerProvider !== reviewerBuilderProvider
+						&& ((predecessor.independence.kind === "different-provider-family"
+							&& predecessor.independence.builderProvider === reviewerBuilderProvider
+							&& predecessor.independence.reviewerProvider === predecessorReviewerProvider)
+							|| (predecessor.independence.kind === "same-provider-family-approved"
+								&& predecessor.independence.provider === reviewerBuilderProvider
+								&& predecessorReviewerProvider === reviewerBuilderProvider))
 					: false;
 				const reviewerIndependenceMatches = attempt.role === "reviewer" && predecessor?.role === "reviewer" && (JSON.stringify(attempt.independence) === JSON.stringify(predecessor.independence) || transientReviewerProviderChange);
 				const reviewerFactsMatch = attempt.role !== "reviewer" || !predecessor || (predecessor.role === "reviewer" && JSON.stringify(attempt.subject) === JSON.stringify(predecessor.subject) && reviewerIndependenceMatches && JSON.stringify(attempt.worktree.baseline) === JSON.stringify(predecessor.worktree.baseline));

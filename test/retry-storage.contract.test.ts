@@ -217,6 +217,20 @@ function builderThenReviewerReplacementJournal(): Record<string, any> {
 	return value;
 }
 
+function approvedSameFamilyReviewerReplacementJournal(): Record<string, any> {
+	const value = builderThenReviewerReplacementJournal();
+	const run = value.run as Record<string, any>;
+	const task = run.tasks[0] as Record<string, any>;
+	run.modelPlan.reviewer = { primary: { model: "provider/reviewer-primary", thinkingLevel: "medium" }, fallbacks: [{ model: "provider/unavailable", thinkingLevel: "medium" }, { model: "other/fallback", thinkingLevel: "low" }] };
+	const attempts = task.attempts as Array<Record<string, any>>;
+	const reviewer = attempts[2]!;
+	const reviewerReplacement = attempts[3]!;
+	reviewer.actualModel = { model: "provider/reviewer-primary", thinkingLevel: "medium" };
+	reviewer.independence = { kind: "same-provider-family-approved", provider: "provider", approvedAt: "2026-09-19T00:00:08.500Z", controllerSessionId: "retry-storage" };
+	reviewerReplacement.replacement.modelSelection.skipped[0].model = "provider/reviewer-primary";
+	return value;
+}
+
 	it.sequential.each(["provider-network-interruption", "agent-startup-failure", "herdr-command-failure", "unexpected-process-exit"] as const)("round-trips the %s outcome without changing schema version", (kind) => {
 	const journal = transientJournal(kind);
 	const cloned = cloneRunJournal(journal);
@@ -270,6 +284,22 @@ it("accepts a Builder replacement ordinal one followed by a Reviewer replacement
 		ok(decoded.value);
 		deepStrictEqual(decoded.value?.run.tasks[0]?.attempts.filter((attempt) => attempt.replacement).map((attempt) => attempt.replacement?.retryOrdinal), [1, 2]);
 	}
+});
+
+it("accepts an approved same-family Reviewer replacement that recomputes cross-family independence", () => {
+	const candidate = approvedSameFamilyReviewerReplacementJournal();
+	const validated = validateRunJournal(candidate);
+	ok(validated.value, validated.diagnostics.map((item) => `${item.path}: ${item.message}`).join("; "));
+});
+
+it("rejects an approved same-family Reviewer replacement with a mutated Builder or model family", () => {
+	const mutatedBuilder = approvedSameFamilyReviewerReplacementJournal();
+	mutatedBuilder.run.tasks[0].attempts[3].independence.builderProvider = "mutated-builder";
+	ok(validateRunJournal(mutatedBuilder).diagnostics.length > 0);
+
+	const mismatchedModelFamily = approvedSameFamilyReviewerReplacementJournal();
+	mismatchedModelFamily.run.tasks[0].attempts[3].independence.reviewerProvider = "third";
+	ok(validateRunJournal(mismatchedModelFamily).diagnostics.length > 0);
 });
 
 it("rejects a transient Reviewer provider-family change that mutates the Builder independence fact", () => {
