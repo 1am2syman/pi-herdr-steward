@@ -274,7 +274,7 @@ export type TransientInfrastructureKind = "provider-network-interruption" | "age
 export type TransientInfrastructureStage = "worktree-create" | "pane-split" | "agent-start" | "agent-prompt" | "agent-runtime";
 
 export type RecoveryStop =
-	| { phase: "not-required"; reason: "never-started" | "already-missing" }
+	| { phase: "not-required"; reason: "never-started" | "already-missing" | "preservation-unavailable" }
 	| { phase: "intended"; intendedAt: string; agent: RecoveryAgentIdentity }
 	| { phase: "acknowledged"; intendedAt: string; acknowledgedAt: string; agent: RecoveryAgentIdentity }
 	| { phase: "ambiguous"; intendedAt: string; observedAt: string; agent: RecoveryAgentIdentity; diagnostic: string };
@@ -1057,7 +1057,7 @@ function validateAttemptReplacement(value: unknown, path: string, attemptId: str
 
 function validateRecoveryStop(value: unknown, path: string): { value?: import("./run.ts").RecoveryStop; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Infrastructure stop record is invalid.", path)] };
-	if (value.phase === "not-required" && exactKeys(value, ["phase", "reason"]) && (value.reason === "never-started" || value.reason === "already-missing")) return { value: { phase: value.phase, reason: value.reason }, diagnostics: [] };
+	if (value.phase === "not-required" && exactKeys(value, ["phase", "reason"]) && (value.reason === "never-started" || value.reason === "already-missing" || value.reason === "preservation-unavailable")) return { value: { phase: value.phase, reason: value.reason }, diagnostics: [] };
 	const agent = validateRecoveryIdentity(value.agent, `${path}.agent`);
 	if (value.phase === "intended" && exactKeys(value, ["phase", "intendedAt", "agent"]) && canonicalTimestamp(value.intendedAt) && agent.value) return { value: { phase: value.phase, intendedAt: value.intendedAt, agent: agent.value }, diagnostics: [] };
 	if (value.phase === "acknowledged" && exactKeys(value, ["phase", "intendedAt", "acknowledgedAt", "agent"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.acknowledgedAt) && value.acknowledgedAt >= value.intendedAt && agent.value) return { value: { phase: value.phase, intendedAt: value.intendedAt, acknowledgedAt: value.acknowledgedAt, agent: agent.value }, diagnostics: [] };
@@ -1945,7 +1945,9 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 				const isTransient = attempt.replacement?.kind === "transient-recovery";
 				const predecessorEnded = isTransient ? (predecessor?.state === "ended-error" || predecessor?.state === "superseded") : predecessor?.state === "superseded";
 				const preserveAt = isTransient ? predecessor?.recovery?.infrastructure?.observedAt : replacementSilence?.intendedAt;
-				const sameModel = !isTransient || (attempt.replacement?.kind === "transient-recovery" && attempt.replacement.modelSelection.kind !== "same-model-first") || JSON.stringify(attempt.actualModel) === JSON.stringify(predecessor?.actualModel);
+				const sameModel = isTransient
+					? (attempt.replacement?.kind === "transient-recovery" && attempt.replacement.modelSelection.kind !== "same-model-first") || JSON.stringify(attempt.actualModel) === JSON.stringify(predecessor?.actualModel)
+					: JSON.stringify(attempt.actualModel) === JSON.stringify(predecessor?.actualModel);
 				if (!predecessor || predecessor.role !== attempt.role || !predecessorEnded || attempt.replacement?.replacesAttemptId !== predecessor.id || attempt.replacement.preservedAt < (preserveAt ?? predecessor.preparedAt) || attempt.preparedAt !== attempt.replacement?.preservedAt || attempt.specificationHash !== predecessor.specificationHash || !predecessor.recovery?.preservation || (!isTransient && !replacementSilence) || (!isTransient && replacementSilence?.intendedAt !== attempt.replacement?.preservedAt) || (isTransient && !predecessor.recovery.infrastructure) || !sameModel) diagnostics.push(diagnostic("invalid-task", "Replacement must immediately follow and exactly link the predecessor preservation, outcome, and same-role lineage.", `${path}.attempts[${index}].replacement`));
 				if (isTransient && attempt.replacement?.kind === "transient-recovery" && predecessor) {
 					const rolePlan = modelPlans?.[attempt.role];
@@ -1966,17 +1968,31 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 				}
 				if (attempt.replacement && predecessor?.replacement && attempt.replacement.retryOrdinal !== predecessor.replacement.retryOrdinal + 1) diagnostics.push(diagnostic("invalid-task", "Replacement ordinals must be contiguous.", `${path}.attempts[${index}].replacement.retryOrdinal`));
 				if (attempt.replacement && !predecessor?.replacement && attempt.replacement.retryOrdinal !== 1) diagnostics.push(diagnostic("invalid-task", "The first replacement must have retryOrdinal 1.", `${path}.attempts[${index}].replacement.retryOrdinal`));
-			const attemptWorktree = attempt.role === "builder" && "worktreePath" in attempt.dispatch ? attempt.dispatch.worktreePath : attempt.role === "reviewer" ? attempt.worktree.path : undefined;
-			const predecessorWorktree = predecessor?.role === "builder" && "worktreePath" in predecessor.dispatch ? predecessor.dispatch.worktreePath : predecessor?.role === "reviewer" ? predecessor.worktree.path : undefined;
-			const attemptBranch = attempt.role === "builder" && "branch" in attempt.dispatch ? attempt.dispatch.branch : attempt.role === "reviewer" && "branch" in attempt.dispatch ? attempt.dispatch.branch : undefined;
-			const predecessorBuilder = predecessor?.role === "reviewer" && index > 1 && attempts[index - 2]?.role === "builder" ? attempts[index - 2] : undefined;
-			const predecessorBranch = predecessor?.role === "builder" && "branch" in predecessor.dispatch ? predecessor.dispatch.branch : predecessor?.role === "reviewer" && "branch" in predecessor.dispatch ? predecessor.dispatch.branch : predecessorBuilder?.role === "builder" && "branch" in predecessorBuilder.dispatch ? predecessorBuilder.dispatch.branch : undefined;
-				const replacementDispatch = attempt.dispatch;
-				const predecessorPaneId = predecessor && "paneId" in predecessor.dispatch ? predecessor.dispatch.paneId : predecessor && "sourcePaneId" in predecessor.dispatch ? predecessor.dispatch.sourcePaneId : predecessorBuilder && "paneId" in predecessorBuilder.dispatch ? predecessorBuilder.dispatch.paneId : undefined;
-				const predecessorWorkspaceId = predecessor && "workspaceId" in predecessor.dispatch ? predecessor.dispatch.workspaceId : predecessorBuilder && "workspaceId" in predecessorBuilder.dispatch ? predecessorBuilder.dispatch.workspaceId : undefined;
-				const sourcePaneMatches = !predecessor || replacementDispatch.phase !== "replacement-pane-intended" || (replacementDispatch.sourcePaneId === predecessorPaneId && replacementDispatch.workspaceId === predecessorWorkspaceId);
-			const reviewerFactsMatch = attempt.role !== "reviewer" || !predecessor || (predecessor.role === "reviewer" && JSON.stringify(attempt.subject) === JSON.stringify(predecessor.subject) && JSON.stringify(attempt.independence) === JSON.stringify(predecessor.independence) && JSON.stringify(attempt.worktree.baseline) === JSON.stringify(predecessor.worktree.baseline));
-				if (attemptWorktree !== predecessorWorktree || attemptBranch !== predecessorBranch || !sourcePaneMatches || !reviewerFactsMatch) diagnostics.push(diagnostic("invalid-task", "Replacement must retain the predecessor identity, subject, worktree, and branch facts.", `${path}.attempts[${index}]`));
+				const precedingBuilder = (candidateIndex: number): BuilderAttemptRecord | undefined => {
+					for (let priorIndex = candidateIndex - 1; priorIndex >= 0; priorIndex -= 1) {
+						const candidate = attempts[priorIndex];
+						if (candidate?.role === "builder") return candidate;
+					}
+					return undefined;
+				};
+				const lineageFacts = (candidate: AttemptRecord | undefined, candidateIndex: number): { branch?: string; worktreePath?: string; paneId?: string; workspaceId?: string } => {
+					if (!candidate) return {};
+					const dispatch = candidate.dispatch;
+					const builder = precedingBuilder(candidateIndex);
+					const builderDispatch = builder?.dispatch;
+					return {
+						branch: "branch" in dispatch ? dispatch.branch : builderDispatch && "branch" in builderDispatch ? builderDispatch.branch : candidate.recovery?.preservation?.branch,
+						worktreePath: "worktreePath" in dispatch ? dispatch.worktreePath : candidate.role === "reviewer" ? candidate.worktree.path : candidate.recovery?.preservation?.worktreePath ?? (builderDispatch && "worktreePath" in builderDispatch ? builderDispatch.worktreePath : undefined),
+						paneId: "paneId" in dispatch ? dispatch.paneId : "sourcePaneId" in dispatch ? dispatch.sourcePaneId : builderDispatch && "paneId" in builderDispatch ? builderDispatch.paneId : undefined,
+						workspaceId: "workspaceId" in dispatch ? dispatch.workspaceId : builderDispatch && "workspaceId" in builderDispatch ? builderDispatch.workspaceId : undefined,
+					};
+				};
+				const attemptFacts = lineageFacts(attempt, index);
+				const predecessorFacts = lineageFacts(predecessor, index - 1);
+					const replacementDispatch = attempt.dispatch;
+				const sourcePaneMatches = !predecessor || replacementDispatch.phase !== "replacement-pane-intended" || (replacementDispatch.sourcePaneId === predecessorFacts.paneId && replacementDispatch.workspaceId === predecessorFacts.workspaceId);
+				const reviewerFactsMatch = attempt.role !== "reviewer" || !predecessor || (predecessor.role === "reviewer" && JSON.stringify(attempt.subject) === JSON.stringify(predecessor.subject) && JSON.stringify(attempt.independence) === JSON.stringify(predecessor.independence) && JSON.stringify(attempt.worktree.baseline) === JSON.stringify(predecessor.worktree.baseline));
+					if (attemptFacts.worktreePath !== predecessorFacts.worktreePath || attemptFacts.branch !== predecessorFacts.branch || !sourcePaneMatches || !reviewerFactsMatch) diagnostics.push(diagnostic("invalid-task", "Replacement must retain the predecessor identity, subject, worktree, and branch facts.", `${path}.attempts[${index}]`));
 		}
 		if (index === 0 && attempt.role === "builder" && isReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "The first Builder Attempt must use the initial dispatch variant.", `${path}.attempts[${index}].dispatch`));
 		if (index > 0 && attempt.role === "builder" && !isReplacement && !isReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "Later non-replacement Builder Attempts must use the rework dispatch variant.", `${path}.attempts[${index}].dispatch`));

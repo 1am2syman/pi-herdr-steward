@@ -73,11 +73,12 @@ type Fixture = {
 	resume(): Promise<RunJournal>;
 	setHerdrUnavailable(value: boolean): void;
 	setHerdrMissing(value: boolean): void;
+	setPreservationUnavailable(value: boolean): void;
 	effects: { panes: number; starts: number; prompts: number; stops: number; models: string[] };
 	order: string[];
 };
 
-async function makeFixture(options: { transientFailure: boolean; transientKind?: FunctionalTransientKind; singleTransientFailure?: boolean; noFallback?: boolean }): Promise<Fixture> {
+async function makeFixture(options: { transientFailure: boolean; transientKind?: FunctionalTransientKind; singleTransientFailure?: boolean; noFallback?: boolean; preservationUnavailable?: boolean; stopFailure?: "throw" | "killed" | "wrong-identity"; stopAcknowledgementCasFailure?: boolean }): Promise<Fixture> {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-retry-functional-"));
 	roots.push(root);
 	const config = createConfigStore();
@@ -86,6 +87,7 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 	let nowMs = Date.parse("2026-09-19T00:00:00.000Z");
 	let herdrUnavailable = false;
 	let herdrMissing = false;
+	let preservationUnavailable = options.preservationUnavailable ?? false;
 	let failureArmed = options.transientFailure;
 	const transientKind = options.transientKind ?? "provider-network-interruption";
 	let paneNumber = 1;
@@ -95,11 +97,26 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 	const order: string[] = [];
 	const builderPath = join(root, "managed-worktree");
 	const runJournal = createRunJournalAdapter();
+	const reservedAttemptIds = new Set<string>();
+	let stopAcknowledgementCasFailed = false;
 	const inspectPreservation = runJournal.inspectAttemptPreservation;
 	if (!inspectPreservation) throw new Error("preservation adapter missing");
 	runJournal.inspectAttemptPreservation = async (input) => {
 		order.push("preserve");
 		return inspectPreservation(input);
+	};
+	const replaceActive = runJournal.replaceActive.bind(runJournal);
+	runJournal.replaceActive = async (repositoryRoot, candidate) => {
+		const latest = candidate.run.tasks[0]?.attempts.at(-1);
+		if (options.stopAcknowledgementCasFailure && !stopAcknowledgementCasFailed && latest?.recovery?.infrastructure?.stop.phase === "acknowledged") {
+			stopAcknowledgementCasFailed = true;
+			throw new Error("fixture stop acknowledgement CAS failure");
+		}
+		if (latest?.replacement && latest.state === "prepared" && !reservedAttemptIds.has(latest.id)) {
+			reservedAttemptIds.add(latest.id);
+			order.push("reserve");
+		}
+		return replaceActive(repositoryRoot, candidate);
 	};
 	const clock = {
 		now: () => new Date(nowMs),
@@ -163,6 +180,10 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		async stopAgentGracefully(input) {
 			effects.stops += 1;
 			order.push("stop");
+			if (options.stopFailure === "throw") throw new Error("typed graceful stop failure");
+			if (options.stopFailure === "killed") return { kind: "failed", message: "graceful stop was killed" };
+			if (options.stopFailure === "wrong-identity") return { kind: "acknowledged", name: `${input.name}-wrong`, workspaceId: input.workspaceId, tabId: "tab-1", paneId: input.paneId, terminalId: input.terminalId };
+			order.push("stop-ack");
 			return { kind: "acknowledged", name: input.name, workspaceId: input.workspaceId, tabId: "tab-1", paneId: input.paneId, terminalId: input.terminalId };
 		},
 	};
@@ -170,7 +191,7 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		async inspectIntegrationBase() { return { kind: "ready", branch: "main", revision: baseRevision }; },
 		async branchExists() { return false; },
 		async inspectBuilderWorktree(_path, expectedRevision) { return { kind: "ready", head: expectedRevision, clean: true }; },
-		async inspectManagedWorktreeProgress() { return { kind: "observed", head: baseRevision, worktree: digest("worktree"), git: { head: baseRevision, digest: digest("git") } }; },
+		async inspectManagedWorktreeProgress() { return preservationUnavailable ? { kind: "unavailable", diagnostic: "fixture Git preservation is temporarily unavailable" } : { kind: "observed", head: baseRevision, worktree: digest("worktree"), git: { head: baseRevision, digest: digest("git") } }; },
 	};
 	const ui: StewardDependencies["ui"] = {
 		presentStatus() {},
@@ -219,6 +240,7 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		},
 		setHerdrUnavailable(value) { herdrUnavailable = value; },
 		setHerdrMissing(value) { herdrMissing = value; },
+		setPreservationUnavailable(value) { preservationUnavailable = value; },
 		effects,
 		order,
 	};
@@ -236,6 +258,12 @@ it.sequential("registered transient recovery classifies infrastructure, retries 
 	expect(firstReplacement.replacement).toMatchObject({ kind: "transient-recovery", retryOrdinal: 1, modelSelection: { kind: "same-model-first", planIndex: 0 } });
 	expect(firstReplacement.actualModel).toEqual(modelPlans.builder.primary);
 	expect(fixture.effects.panes + fixture.effects.starts + fixture.effects.prompts).toBe(1);
+	const preservedIndex = fixture.order.indexOf("preserve");
+	const stopAcknowledgedIndex = fixture.order.indexOf("stop-ack");
+	const reservationIndex = fixture.order.indexOf("reserve");
+	expect(preservedIndex).toBeGreaterThanOrEqual(0);
+	expect(stopAcknowledgedIndex).toBeGreaterThan(preservedIndex);
+	expect(reservationIndex).toBeGreaterThan(stopAcknowledgedIndex);
 
 	await fixture.resume(); // replacement pane
 	await fixture.resume(); // replacement agent start
@@ -300,6 +328,68 @@ it.sequential("registered no approved fallback pauses without mutating the activ
 	expect(fixture.effects.starts).toBe(1);
 });
 
+it.sequential("registered unavailable preservation stays retryable and resumes before stop or reservation", async () => {
+	const fixture = await makeFixture({ transientFailure: true, singleTransientFailure: true, preservationUnavailable: true });
+	let journal = await fixture.load();
+	let task = journal.run.tasks[0]!;
+	const degradedAttempt = task.attempts[0]!;
+	expect(task.attention).toBe("recovering");
+	expect(task.attentionReason).toBe("transient-infrastructure-recovery");
+	expect(degradedAttempt.state).toBe("ended-error");
+	expect(degradedAttempt.recovery?.infrastructure?.stop).toEqual({ phase: "not-required", reason: "preservation-unavailable" });
+	expect(degradedAttempt.recovery?.preservation?.git.head).toBeNull();
+	expect(fixture.effects.panes + fixture.effects.starts + fixture.effects.stops).toBe(0);
+	expect(task.attempts.filter((attempt) => attempt.replacement)).toHaveLength(0);
+
+	fixture.setPreservationUnavailable(false);
+	journal = await fixture.resume();
+	task = journal.run.tasks[0]!;
+	expect(task.attempts.filter((attempt) => attempt.replacement)).toHaveLength(1);
+	expect(task.attempts[0]?.recovery?.infrastructure?.stop.phase).toBe("acknowledged");
+	expect(fixture.effects.stops).toBe(1);
+	expect(fixture.effects.panes).toBe(0);
+	await fixture.resume();
+	expect(fixture.effects.panes).toBe(1);
+});
+
+it.sequential.each(["throw", "killed", "wrong-identity"] as const)("registered %s graceful-stop ambiguity pauses the controller without a successor or resend", async (stopFailure) => {
+	const fixture = await makeFixture({ transientFailure: true, stopFailure });
+	let journal = await fixture.load();
+	let task = journal.run.tasks[0]!;
+	const beforeResume = { panes: fixture.effects.panes, starts: fixture.effects.starts, prompts: fixture.effects.prompts, stops: fixture.effects.stops, models: [...fixture.effects.models] };
+	expect(task.attention).toBe("needs-user");
+	expect(task.attentionReason).toBe("transient-stop-ambiguous");
+	expect(task.attempts).toHaveLength(1);
+	expect(task.attempts[0]?.recovery?.infrastructure?.stop.phase).toBe("ambiguous");
+	expect(task.attempts[0]?.state).toBe("ended-error");
+
+	journal = await fixture.resume();
+	task = journal.run.tasks[0]!;
+	expect(task.attempts).toHaveLength(1);
+	expect(task.attempts.filter((attempt) => attempt.replacement)).toHaveLength(0);
+	expect(fixture.effects).toEqual(beforeResume);
+});
+
+it.sequential("registered stop-acknowledgement CAS loss retains intent, then records ambiguity without a successor", async () => {
+	const fixture = await makeFixture({ transientFailure: true, stopAcknowledgementCasFailure: true });
+	let journal = await fixture.load();
+	let task = journal.run.tasks[0]!;
+	expect(task.attention).toBe("recovering");
+	expect(task.attempts[0]?.recovery?.infrastructure?.stop.phase).toBe("intended");
+	expect(task.attempts).toHaveLength(1);
+	expect(fixture.effects.stops).toBe(1);
+
+	journal = await fixture.resume();
+	task = journal.run.tasks[0]!;
+	expect(task.attention).toBe("needs-user");
+	expect(task.attentionReason).toBe("transient-stop-ambiguous");
+	expect(task.attempts[0]?.recovery?.infrastructure?.stop.phase).toBe("ambiguous");
+	expect(task.attempts.filter((attempt) => attempt.replacement)).toHaveLength(0);
+	const effects = { ...fixture.effects, models: [...fixture.effects.models] };
+	await fixture.resume();
+	expect(fixture.effects).toEqual(effects);
+});
+
 it.sequential("registered Herdr observation loss degrades monitoring and resumes exact reconciliation without a retry", async () => {
 	const fixture = await makeFixture({ transientFailure: false });
 	let journal = await fixture.load();
@@ -326,6 +416,7 @@ it.sequential("registered correctness evidence wins over exact agent absence and
 	await writeFile(attempt.reportPath, "not a canonical Attempt Report\n", "utf8");
 	fixture.setHerdrMissing(true);
 	await fixture.resume(); // persist the malformed-report rejection first.
+	await rm(attempt.reportPath, { force: true });
 	journal = await fixture.resume(); // exact absence is now lower priority than the retained correctness fact.
 	const task = journal.run.tasks[0]!;
 	expect(task.attempts.filter((candidate) => candidate.replacement).length).toBe(0);

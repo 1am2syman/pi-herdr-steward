@@ -662,6 +662,7 @@ it.sequential("same-family Review pauses durably until exact Controller confirma
 	if (paused.kind !== "loaded") throw new Error("missing paused journal");
 	equal(paused.journal.run.tasks[0]!.phase, "reviewing");
 	equal(paused.journal.run.tasks[0]!.attention, "needs-user");
+	equal(paused.journal.run.tasks[0]!.attentionReason, "review-approval-required");
 	equal(paused.journal.run.tasks[0]!.attempts.length, 1);
 	dependencies.ui = { ...dependencies.ui, async confirmSameFamilyReview() { return true; } };
 	const resumedView = await invoke(root, dependencies, "status");

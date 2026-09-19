@@ -193,6 +193,117 @@ it("rejects a transient link with a backward or wrong frozen model-plan index", 
 	ok(validateRunJournal(invalid).diagnostics.some((item) => item.message.includes("frozen role plan") || item.message.includes("strictly forward")));
 });
 
+type InvalidRetryJournalCase = { name: string; candidate: () => Record<string, any> };
+
+const invalidRetryJournalCases: InvalidRetryJournalCase[] = [
+	{
+		name: "outcome plus finalized evidence",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientJournal("provider-network-interruption"))) as Record<string, any>;
+			value.run.tasks[0].attempts[0].evidence = { phase: "finalized" };
+			return value;
+		},
+	},
+	{
+		name: "superseded without an immediate successor",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientJournal("provider-network-interruption"))) as Record<string, any>;
+			value.run.tasks[0].attempts[0].state = "superseded";
+			return value;
+		},
+	},
+	{
+		name: "ordinal gap",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.tasks[0].attempts[1].replacement.retryOrdinal = 2;
+			return value;
+		},
+	},
+	{
+		name: "duplicate ordinal",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			const duplicate = JSON.parse(JSON.stringify(value.run.tasks[0].attempts[1])) as Record<string, any>;
+			duplicate.id = "attempt-03";
+			duplicate.preparedAt = "2026-09-19T00:00:07.000Z";
+			duplicate.replacement.replacesAttemptId = "attempt-02";
+			duplicate.replacement.preservedAt = duplicate.preparedAt;
+			value.run.tasks[0].attempts[1].state = "superseded";
+			value.run.tasks[0].attempts.push(duplicate);
+			return value;
+		},
+	},
+	{
+		name: "over-limit ordinal",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.effectiveSettings.transientRetryLimit = 0;
+			return value;
+		},
+	},
+	{
+		name: "successor model mismatch",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.tasks[0].attempts[1].actualModel = value.run.modelPlan.builder.primary;
+			return value;
+		},
+	},
+	{
+		name: "replacement continuation mismatch",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.tasks[0].attempts[1].replacement.preservedAt = "2026-09-19T00:00:05.000Z";
+			return value;
+		},
+	},
+	{
+		name: "changed subject",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.tasks[0].contract.requiredOutcome = "changed after reservation";
+			return value;
+		},
+	},
+	{
+		name: "changed worktree",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.tasks[0].attempts[1].dispatch.worktreePath = "/tmp/retry-storage/changed-worktree";
+			return value;
+		},
+	},
+	{
+		name: "changed specification",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.tasks[0].specificationHash = sha("f");
+			return value;
+		},
+	},
+	{
+		name: "changed base",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+			value.run.tasks[0].attempts[1].baseRevision = "1111111111111111111111111111111111111111";
+			return value;
+		},
+	},
+	{
+		name: "invalid attention",
+		candidate: () => {
+			const value = JSON.parse(JSON.stringify(transientJournal("provider-network-interruption"))) as Record<string, any>;
+			value.run.tasks[0].attention = "none";
+			return value;
+		},
+	},
+];
+
+it.each(invalidRetryJournalCases)("rejects the registered retry invariant: $name", ({ candidate }) => {
+	ok(validateRunJournal(candidate).diagnostics.length > 0);
+});
+
 it("rejects a stale replacement candidate without clobbering the active Journal", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-retry-storage-"));
 	roots.push(root);

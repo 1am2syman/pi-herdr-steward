@@ -1423,10 +1423,10 @@ async function advanceEligibleReview(repositoryRoot: string, controllerSessionId
 	if (selection.kind === "same-family-approval-required") {
 		if (automatic) return persistReviewApprovalRequired(repositoryRoot, journal, selected, selection.choice, selection.provider, dependencies);
 		let confirmed = false;
-		if (!dependencies.ui.confirmSameFamilyReview) return pauseReview(repositoryRoot, selected, journal, dependencies, "Same-provider Reviewer confirmation is unavailable; Review is paused for explicit Controller confirmation.");
+		if (!dependencies.ui.confirmSameFamilyReview) return persistReviewApprovalRequired(repositoryRoot, journal, selected, selection.choice, selection.provider, dependencies);
 		try { confirmed = await dependencies.ui.confirmSameFamilyReview({ builderModel: selected.builder.actualModel, reviewerModel: selection.choice, subject: derived.subject, provider: selection.provider }); }
 		catch { confirmed = false; }
-		if (!confirmed) return pauseReview(repositoryRoot, selected, journal, dependencies, `Same-provider Reviewer ${selection.choice.model} was not approved for this exact subject; Review is paused for explicit Controller confirmation.`);
+		if (!confirmed) return persistReviewApprovalRequired(repositoryRoot, journal, selected, selection.choice, selection.provider, dependencies);
 		independence = { kind: "same-provider-family-approved", provider: selection.provider, approvedAt: dependencies.clock.now().toISOString(), controllerSessionId };
 	} else independence = { kind: "different-provider-family", builderProvider: selection.builderProvider, reviewerProvider: selection.reviewerProvider };
 	if (!dependencies.git.inspectReviewWorktree) return { journal, note: "Review dispatch pending; read-only Git snapshot inspection is unavailable." };
@@ -2373,18 +2373,26 @@ async function inspectTransientPreservation(repositoryRoot: string, task: TaskRe
 		dependencies.runJournal.inspectAttemptPreservation({ repositoryRoot, attempt }).catch(() => undefined),
 		dependencies.git.inspectManagedWorktreeProgress(worktreePath).catch(() => undefined),
 	]);
-	if (!preserved || preserved.kind !== "inspected" || !progress || progress.kind !== "observed" || progress.git.digest.kind !== "observed") return undefined;
+	if (!preserved || preserved.kind !== "inspected") return undefined;
+	const worktree = progress?.kind === "observed" ? progress.worktree : { kind: "unavailable" as const, diagnostic: progress?.diagnostic ?? "Managed worktree inspection was unavailable." };
+	const git = progress?.kind === "observed"
+		? { head: progress.git.head, digest: progress.git.digest.kind === "observed" ? progress.git.digest.sha256 : null, ...(progress.git.digest.kind === "unavailable" ? { diagnostic: progress.git.digest.diagnostic } : {}) }
+		: { head: null, digest: null, diagnostic: progress?.diagnostic ?? "Managed Git inspection was unavailable." };
 	return {
 		observedAt,
 		worktreePath,
 		branch,
-		head: progress.head,
-		worktree: progress.worktree,
-		git: { head: progress.git.head, digest: progress.git.digest.sha256 },
+		head: progress?.kind === "observed" ? progress.head : null,
+		worktree,
+		git,
 		assignment: preserved.assignment,
 		report: preserved.report,
 		evidence: preserved.evidence,
 	};
+}
+
+function transientPreservationReady(preservation: RecoveryPreservation): boolean {
+	return preservation.worktree.kind === "observed" && preservation.git.head !== null && preservation.git.digest !== null && preservation.assignment.kind !== "unavailable" && preservation.report.kind !== "unavailable";
 }
 
 function infrastructureOutcome(input: ClassifiedInfrastructureFact, observedAt: string, stop: InfrastructureOutcome["stop"]): InfrastructureOutcome {
@@ -2427,7 +2435,8 @@ async function applyTransientInfrastructureRecovery(input: {
 
 	const observedAt = transitionTimestamp(journal, dependencies.clock.now());
 	const preserved = await inspectTransientPreservation(repositoryRoot, task, attempt, dependencies, observedAt);
-	const failureLive = recoveryLiveRecord({ observedAt, kind: input.alreadyMissing || fact.kind === "unexpected-process-exit" ? "missing" : "unclear", diagnostic: fact.diagnostic });
+	const preservationReady = preserved !== undefined && transientPreservationReady(preserved);
+	const failureLive = recoveryLiveRecord({ observedAt, kind: input.alreadyMissing || fact.kind === "unexpected-process-exit" ? preservationReady ? "missing" : "unclear" : "unclear", diagnostic: fact.diagnostic });
 	const identity = recoveryIdentityFor(attempt);
 	const existingOutcome = attempt.recovery?.infrastructure;
 	if (existingOutcome?.stop.phase === "ambiguous") return { kind: "degraded", journal, note: existingOutcome.stop.diagnostic, diagnostic: "Transient stop ambiguity is durable; no effect will be repeated." };
@@ -2444,20 +2453,27 @@ async function applyTransientInfrastructureRecovery(input: {
 		return changed ? { kind: "changed", journal, note: diagnostic } : { kind: "degraded", journal, note: diagnostic, diagnostic: "Transient stop ambiguity CAS failed." };
 	}
 	const stopRequired = identity !== undefined && !input.alreadyMissing && !(fact.kind === "agent-startup-failure" && attempt.state === "prepared") && fact.kind !== "unexpected-process-exit";
-	if (!preserved) {
-		const stop: InfrastructureOutcome["stop"] = identity ? { phase: "ambiguous", intendedAt: observedAt, observedAt, agent: identity, diagnostic: "Typed transient infrastructure failure was observed, but exact worktree, report, Assignment, or evidence preservation was unavailable; no stop or replacement effect was attempted." } : { phase: "not-required", reason: "never-started" };
+	if (!preservationReady) {
+		if (existingOutcome?.stop.phase === "not-required" && existingOutcome.stop.reason === "preservation-unavailable") return { kind: "degraded", journal, note: "Typed transient infrastructure recovery remains retryable; fresh preservation is still unavailable, so no stop or replacement effect was attempted.", diagnostic: "Transient preservation is unavailable." };
+		const stop: InfrastructureOutcome["stop"] = input.alreadyMissing || fact.kind === "unexpected-process-exit"
+			? { phase: "not-required", reason: "already-missing" }
+			: !stopRequired
+				? { phase: "not-required", reason: "never-started" }
+				: { phase: "not-required", reason: "preservation-unavailable" };
 		const outcome = infrastructureOutcome(fact, observedAt, stop);
 		const changed = await persist((nextTask, nextAttempt) => {
 			nextAttempt.state = "ended-error";
-			nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, infrastructure: outcome };
-			nextTask.attention = "needs-user";
-			nextTask.attentionReason = "transient-stop-ambiguous";
-			nextTask.attentionDiagnostic = outcome.diagnostic;
+			nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, ...(nextAttempt.recovery?.reportRequest ? { reportRequest: nextAttempt.recovery.reportRequest } : {}), ...(nextAttempt.recovery?.blockedAnswer ? { blockedAnswer: nextAttempt.recovery.blockedAnswer } : {}), ...(preserved ? { preservation: preserved } : nextAttempt.recovery?.preservation ? { preservation: nextAttempt.recovery.preservation } : {}), ...(nextAttempt.recovery?.silence ? { silence: nextAttempt.recovery.silence } : {}), infrastructure: outcome };
+			nextTask.attention = "recovering";
+			nextTask.attentionReason = "transient-infrastructure-recovery";
+			nextTask.attentionDiagnostic = "Typed transient infrastructure recovery is retained, but fresh bounded preservation is unavailable; no stop or replacement effect was attempted.";
 		});
-		return changed ? { kind: "changed", journal, note: "Typed transient failure was durably retained, but exact preservation was unavailable; no stop or replacement effect was attempted." } : { kind: "degraded", journal, note: "Typed transient failure was observed, but its preservation and no-effect needs-user state could not be persisted.", diagnostic: "Transient recovery CAS failed." };
+		return changed ? { kind: "changed", journal, note: "Typed transient failure was durably retained in retryable recovery, but fresh preservation was unavailable; no stop or replacement effect was attempted." } : { kind: "degraded", journal, note: "Typed transient failure was observed, but its retryable preservation-unavailable state could not be persisted; no stop or replacement effect was attempted.", diagnostic: "Transient recovery CAS failed." };
 	}
 
-	let stop: InfrastructureOutcome["stop"] = existingOutcome?.stop ?? (fact.kind === "unexpected-process-exit" || input.alreadyMissing ? { phase: "not-required", reason: "already-missing" } : !stopRequired ? { phase: "not-required", reason: "never-started" } : { phase: "intended", intendedAt: observedAt, agent: identity! });
+	const storedStop = existingOutcome?.stop;
+	const reusableStoredStop = storedStop && !(storedStop.phase === "not-required" && storedStop.reason === "preservation-unavailable") ? storedStop : undefined;
+	let stop: InfrastructureOutcome["stop"] = reusableStoredStop ?? (fact.kind === "unexpected-process-exit" || input.alreadyMissing ? { phase: "not-required", reason: "already-missing" } : !stopRequired ? { phase: "not-required", reason: "never-started" } : { phase: "intended", intendedAt: observedAt, agent: identity! });
 	let outcome = infrastructureOutcome(fact, observedAt, stop);
 	if (!(await persist((nextTask, nextAttempt) => {
 		nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, preservation: preserved, infrastructure: outcome };
@@ -2515,7 +2531,7 @@ async function applyTransientInfrastructureRecovery(input: {
 	const predecessor = task.attempts.slice(0, task.attempts.findIndex((candidate) => candidate.id === attempt.id)).reverse().find((candidate) => candidate.role === attempt.role || (attempt.role === "reviewer" && candidate.role === "builder"));
 	const sourcePaneId = "paneId" in dispatch ? dispatch.paneId : "sourcePaneId" in dispatch ? dispatch.sourcePaneId : predecessor && "paneId" in predecessor.dispatch ? predecessor.dispatch.paneId : undefined;
 	const workspaceId = "workspaceId" in dispatch ? dispatch.workspaceId : predecessor && "workspaceId" in predecessor.dispatch ? predecessor.dispatch.workspaceId : undefined;
-	if (!sourcePaneId || !workspaceId) return finishNeedsUser("transient-stop-ambiguous", "The typed transient recovery has no exact source pane/workspace identity for a no-focus successor; no successor was reserved.");
+	if (!sourcePaneId || !workspaceId) return finishNeedsUser(stop.phase === "not-required" ? "transient-fallback-unavailable" : "transient-stop-ambiguous", "The typed transient recovery has no exact source pane/workspace identity for a no-focus successor; no successor was reserved.");
 	const nextAttemptId = `attempt-${String(task.attempts.length + 1).padStart(2, "0")}`;
 	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, task.contract.id, nextAttemptId);
 	const replacementName = `${attempt.role === "builder" ? "steward-b" : "steward-r"}-${compactUuid(dependencies.clock)}-${nextAttemptId.replace(/[^0-9]/g, "")}`;
@@ -2992,6 +3008,10 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 		if (!refreshed) return { kind: "degraded", journal, note: "The current Attempt disappeared during report reconciliation; no later effect was attempted." };
 		attempt = refreshed;
 		task = journal.run.tasks[index] ?? task;
+		const retainedCorrectnessRejection = attempt.evidence?.phase === "rejected"
+			|| (attempt.role === "reviewer" && attempt.integrity?.kind === "violated")
+			|| (attempt.role === "reviewer" && attempt.reportRepair?.phase === "blocked");
+		if (retainedCorrectnessRejection) reportState = "invalid";
 
 	const dispatch = attempt.dispatch;
 	const liveIdentity = recoveryIdentityFor(attempt);

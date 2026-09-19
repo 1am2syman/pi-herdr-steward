@@ -80,4 +80,16 @@ describe("ticket-12 typed retry policy", () => {
 		expect(decideReconciliation({ report: "valid", live: { kind: "missing" } })).toEqual({ kind: "report" });
 		expect(decideReconciliation({ report: "invalid", live: { kind: "working", lifecycle: "working" } })).toEqual({ kind: "working-or-blocked", lifecycle: "working" });
 	});
+
+	it.each([
+		["Builder failed tests", "tests_failed"],
+		["Builder blocked criteria", "criteria-not-met"],
+		["scope violation", "scope-violation"],
+		["missing Artifact", "missing-artifact"],
+		["Reviewer changes-required", "review-changes-required"],
+		["Reviewer read-only violation", "reviewer-modified-worktree"],
+		["dirty or in-progress Git", "dirty-worktree"],
+	] as const)("correctness outcome %s consumes no transient retry", (_label, code) => {
+		expect(classifyInfrastructureFact({ stage: "agent-runtime", code, diagnostic: "durable correctness/evidence result" })).toBeUndefined();
+	});
 });
