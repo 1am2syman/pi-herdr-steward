@@ -5,7 +5,7 @@ import { deepStrictEqual, equal, ok } from "node:assert/strict";
 import { afterEach, it } from "vitest";
 
 import { createRunJournalStore } from "../src/run-journal-store.ts";
-import { advanceRunJournal, buildInitialRunJournal, cloneRunJournal, deserializeRunJournal, serializeRunJournal, validateRunJournal, type BuilderAttemptRecord, type InfrastructureOutcome, type RunJournal } from "../src/run.ts";
+import { advanceRunJournal, buildInitialRunJournal, cloneRunJournal, deserializeRunJournal, serializeRunJournal, specificationHash, validateRunJournal, type BuilderAttemptRecord, type InfrastructureOutcome, type RunJournal } from "../src/run.ts";
 import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 
 const roots: string[] = [];
@@ -149,6 +149,74 @@ function transientReplacementJournal(): RunJournal {
 	return result.value;
 }
 
+function builderThenReviewerReplacementJournal(): Record<string, any> {
+	const value = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
+	const run = value.run as Record<string, any>;
+	const task = run.tasks[0] as Record<string, any>;
+	task.contract.reviewRequired = true;
+	task.contract.expectedArtifacts = [{ kind: "git-commit" }, { kind: "file", path: "src/change.ts" }];
+	task.specificationHash = specificationHash(task.contract);
+	run.modelPlan.reviewer = { primary: { model: "reviewer/primary", thinkingLevel: "medium" }, fallbacks: [{ model: "provider/unavailable", thinkingLevel: "medium" }, { model: "other/fallback", thinkingLevel: "low" }] };
+	const attempts = task.attempts as Array<Record<string, any>>;
+	const builder = attempts[0]!;
+	const builderReplacement = attempts[1]!;
+	builder.state = "superseded";
+	builder.specificationHash = task.specificationHash;
+	builderReplacement.state = "reported";
+	builderReplacement.specificationHash = task.specificationHash;
+	delete builderReplacement.recovery;
+	builderReplacement.evidence = { phase: "finalized", finalizedAt: "2026-09-19T00:00:07.000Z", status: "completed", reportSha256: sha("f"), manifestPath: "/tmp/retry-storage/run/tasks/task-01/attempts/attempt-02/finalized/manifest.json", manifestSha256: sha("7"), producedRevision: revision };
+	const subject = { kind: "git", baseRevision: revision, headRevision: revision, commits: ["1111111111111111111111111111111111111111", revision], builderManifestSha256: sha("7") };
+	const reviewerIdentity = { name: "steward-r-abcdef12-01-03", workspaceId: "workspace-1", paneId: "reviewer-pane-1", terminalId: "reviewer-terminal-1" };
+	const reviewerPath = "/tmp/retry-storage/run/tasks/task-01/attempts/attempt-03";
+	const reviewerObservedAt = "2026-09-19T00:00:10.000Z";
+	const reviewer = {
+		id: "attempt-03",
+		role: "reviewer",
+		state: "ended-error",
+		preparedAt: "2026-09-19T00:00:08.000Z",
+		activatedAt: "2026-09-19T00:00:09.000Z",
+		actualModel: { model: "reviewer/primary", thinkingLevel: "medium" },
+		specificationHash: task.specificationHash,
+		assignmentPath: `${reviewerPath}/assignment.json`,
+		reportPath: `${reviewerPath}/report.md`,
+		evidenceDirectory: `${reviewerPath}/evidence`,
+		subject,
+		independence: { kind: "different-provider-family", builderProvider: "provider", reviewerProvider: "reviewer" },
+		worktree: { path: "/tmp/retry-storage/worktree", baseline: { head: revision, dirtyStateFingerprint: sha("a"), dirtyPaths: [], operationMarkers: [] } },
+		dispatch: { phase: "prompted", agentName: reviewerIdentity.name, worktreePath: "/tmp/retry-storage/worktree", workspaceId: reviewerIdentity.workspaceId, paneId: reviewerIdentity.paneId, terminalId: reviewerIdentity.terminalId, assignmentSha256: sha("b"), promptedAt: reviewerObservedAt },
+		recovery: {
+			live: { observedAt: reviewerObservedAt, kind: "unclear", lifecycle: "unknown", diagnostic: "typed Reviewer failure" },
+			preservation: { observedAt: reviewerObservedAt, worktreePath: "/tmp/retry-storage/worktree", branch: builder.dispatch.branch, head: revision, worktree: { kind: "observed", byteCount: 0, sha256: sha("c") }, git: { head: revision, digest: sha("d") }, assignment: { path: `${reviewerPath}/assignment.json`, sha256: sha("e"), size: 10 }, report: { kind: "missing" }, evidence: { directory: `${reviewerPath}/evidence`, count: 0, byteCount: 0, sha256: sha("f"), entries: [] } },
+			infrastructure: { ...outcome("provider-network-interruption"), observedAt: reviewerObservedAt, stop: { phase: "acknowledged", intendedAt: reviewerObservedAt, acknowledgedAt: "2026-09-19T00:00:11.000Z", agent: reviewerIdentity } },
+		},
+	};
+	const reviewerReplacementPath = "/tmp/retry-storage/run/tasks/task-01/attempts/attempt-04";
+	const reviewerReplacement = {
+		id: "attempt-04",
+		role: "reviewer",
+		state: "prepared",
+		preparedAt: "2026-09-19T00:00:11.000Z",
+		actualModel: { model: "other/fallback", thinkingLevel: "low" },
+		specificationHash: task.specificationHash,
+		assignmentPath: `${reviewerReplacementPath}/assignment.json`,
+		reportPath: `${reviewerReplacementPath}/report.md`,
+		evidenceDirectory: `${reviewerReplacementPath}/evidence`,
+		subject,
+		independence: { kind: "different-provider-family", builderProvider: "provider", reviewerProvider: "other" },
+		worktree: { path: "/tmp/retry-storage/worktree", baseline: { head: revision, dirtyStateFingerprint: sha("a"), dirtyPaths: [], operationMarkers: [] } },
+		dispatch: { phase: "replacement-pane-intended", sourcePaneId: reviewerIdentity.paneId, worktreePath: "/tmp/retry-storage/worktree", agentName: "steward-r-abcdef12-01-04", branch: builder.dispatch.branch, workspaceId: reviewerIdentity.workspaceId },
+		replacement: { kind: "transient-recovery", trigger: "provider-network-interruption", replacesAttemptId: reviewer.id, retryOrdinal: 2, preservedAt: "2026-09-19T00:00:11.000Z", modelSelection: { kind: "approved-fallback", planIndex: 2, reason: "same-model-retry-failed", skipped: [{ planIndex: 0, model: "reviewer/primary", codes: ["same-model-retry-failed"] }, { planIndex: 1, model: "provider/unavailable", codes: ["unavailable-model"] }] } },
+	};
+	task.attempts = [builder, builderReplacement, reviewer, reviewerReplacement];
+	task.phase = "reviewing";
+	task.attention = "none";
+	delete task.attentionReason;
+	delete task.attentionDiagnostic;
+	run.updatedAt = "2026-09-19T00:00:12.000Z";
+	return value;
+}
+
 	it.sequential.each(["provider-network-interruption", "agent-startup-failure", "herdr-command-failure", "unexpected-process-exit"] as const)("round-trips the %s outcome without changing schema version", (kind) => {
 	const journal = transientJournal(kind);
 	const cloned = cloneRunJournal(journal);
@@ -191,6 +259,23 @@ it("rejects a transient link with a backward or wrong frozen model-plan index", 
 	const invalid = JSON.parse(JSON.stringify(transientReplacementJournal())) as Record<string, any>;
 	invalid.run.tasks[0].attempts[1].replacement.modelSelection.planIndex = 0;
 	ok(validateRunJournal(invalid).diagnostics.some((item) => item.message.includes("frozen role plan") || item.message.includes("strictly forward")));
+});
+
+it("accepts a Builder replacement ordinal one followed by a Reviewer replacement ordinal two", () => {
+	const candidate = builderThenReviewerReplacementJournal();
+	const validated = validateRunJournal(candidate);
+	ok(validated.value, validated.diagnostics.map((item) => `${item.path}: ${item.message}`).join("; "));
+	if (validated.value) {
+		const decoded = deserializeRunJournal(serializeRunJournal(validated.value));
+		ok(decoded.value);
+		deepStrictEqual(decoded.value?.run.tasks[0]?.attempts.filter((attempt) => attempt.replacement).map((attempt) => attempt.replacement?.retryOrdinal), [1, 2]);
+	}
+});
+
+it("rejects a transient Reviewer provider-family change that mutates the Builder independence fact", () => {
+	const invalid = builderThenReviewerReplacementJournal();
+	invalid.run.tasks[0].attempts[3].independence.builderProvider = "mutated-builder";
+	ok(validateRunJournal(invalid).diagnostics.length > 0);
 });
 
 type InvalidRetryJournalCase = { name: string; candidate: () => Record<string, any> };

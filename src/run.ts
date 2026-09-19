@@ -1966,8 +1966,10 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 						diagnostics.push(diagnostic("invalid-task", "Approved fallback must move strictly forward through the frozen model plan and retain each skipped choice.", `${path}.attempts[${index}].replacement.modelSelection`));
 					}
 				}
-				if (attempt.replacement && predecessor?.replacement && attempt.replacement.retryOrdinal !== predecessor.replacement.retryOrdinal + 1) diagnostics.push(diagnostic("invalid-task", "Replacement ordinals must be contiguous.", `${path}.attempts[${index}].replacement.retryOrdinal`));
-				if (attempt.replacement && !predecessor?.replacement && attempt.replacement.retryOrdinal !== 1) diagnostics.push(diagnostic("invalid-task", "The first replacement must have retryOrdinal 1.", `${path}.attempts[${index}].replacement.retryOrdinal`));
+				if (attempt.replacement) {
+					const expectedOrdinal = attempts.slice(0, index).filter((candidate) => candidate.replacement !== undefined).length + 1;
+					if (attempt.replacement.retryOrdinal !== expectedOrdinal) diagnostics.push(diagnostic("invalid-task", "Replacement ordinal must equal the global replacement link position in Task order.", `${path}.attempts[${index}].replacement.retryOrdinal`));
+				}
 				const precedingBuilder = (candidateIndex: number): BuilderAttemptRecord | undefined => {
 					for (let priorIndex = candidateIndex - 1; priorIndex >= 0; priorIndex -= 1) {
 						const candidate = attempts[priorIndex];
@@ -1991,7 +1993,15 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 				const predecessorFacts = lineageFacts(predecessor, index - 1);
 					const replacementDispatch = attempt.dispatch;
 				const sourcePaneMatches = !predecessor || replacementDispatch.phase !== "replacement-pane-intended" || (replacementDispatch.sourcePaneId === predecessorFacts.paneId && replacementDispatch.workspaceId === predecessorFacts.workspaceId);
-				const reviewerFactsMatch = attempt.role !== "reviewer" || !predecessor || (predecessor.role === "reviewer" && JSON.stringify(attempt.subject) === JSON.stringify(predecessor.subject) && JSON.stringify(attempt.independence) === JSON.stringify(predecessor.independence) && JSON.stringify(attempt.worktree.baseline) === JSON.stringify(predecessor.worktree.baseline));
+				const transientReviewerProviderChange = isTransient && attempt.role === "reviewer" && predecessor?.role === "reviewer"
+					? predecessor.independence.kind === "different-provider-family" && attempt.independence.kind === "different-provider-family"
+						&& attempt.independence.builderProvider === predecessor.independence.builderProvider
+						&& attempt.independence.reviewerProvider !== attempt.independence.builderProvider
+						&& parseCanonicalModelReference(attempt.actualModel.model)?.provider === attempt.independence.reviewerProvider
+						&& parseCanonicalModelReference(predecessor.actualModel.model)?.provider === predecessor.independence.reviewerProvider
+					: false;
+				const reviewerIndependenceMatches = attempt.role === "reviewer" && predecessor?.role === "reviewer" && (JSON.stringify(attempt.independence) === JSON.stringify(predecessor.independence) || transientReviewerProviderChange);
+				const reviewerFactsMatch = attempt.role !== "reviewer" || !predecessor || (predecessor.role === "reviewer" && JSON.stringify(attempt.subject) === JSON.stringify(predecessor.subject) && reviewerIndependenceMatches && JSON.stringify(attempt.worktree.baseline) === JSON.stringify(predecessor.worktree.baseline));
 					if (attemptFacts.worktreePath !== predecessorFacts.worktreePath || attemptFacts.branch !== predecessorFacts.branch || !sourcePaneMatches || !reviewerFactsMatch) diagnostics.push(diagnostic("invalid-task", "Replacement must retain the predecessor identity, subject, worktree, and branch facts.", `${path}.attempts[${index}]`));
 		}
 		if (index === 0 && attempt.role === "builder" && isReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "The first Builder Attempt must use the initial dispatch variant.", `${path}.attempts[${index}].dispatch`));

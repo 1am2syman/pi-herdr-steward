@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -9,17 +9,22 @@ import { createConfigStore } from "../src/config-store.ts";
 import { createRunJournalAdapter } from "../src/adapters.ts";
 import { registerStewardExtension, type StewardCommandContext, type StewardCommandHandler } from "../src/extension.ts";
 import { createSteward, type ManagedAgentIdentity, type MonitorDigest, type ResumeResult, type StewardDependencies, type StewardHerdrAdapter } from "../src/steward.ts";
+import { serializeBuilderAttemptReport, type BuilderAttemptReport } from "../src/attempt-report.ts";
+import { deserializeReviewerAssignment } from "../src/review.ts";
 import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
+import { builderAssignmentSha256 } from "../src/run.ts";
 import type { RunDraft, RunJournal } from "../src/run.ts";
 
 const roots: string[] = [];
 const baseRevision = "0123456789abcdef0123456789abcdef01234567";
+const headRevision = "2222222222222222222222222222222222222222";
+const commits = ["1111111111111111111111111111111111111111", headRevision];
 const modelPlans: ProjectModelPlans = {
 	builder: {
 		primary: { model: "provider/primary", thinkingLevel: "high" },
 		fallbacks: [{ model: "provider/unavailable", thinkingLevel: "medium" }, { model: "other/fallback", thinkingLevel: "low" }],
 	},
-	reviewer: { primary: { model: "reviewer/primary", thinkingLevel: "medium" }, fallbacks: [] },
+	reviewer: { primary: { model: "reviewer/primary", thinkingLevel: "medium" }, fallbacks: [{ model: "provider/unavailable", thinkingLevel: "medium" }, { model: "other/fallback", thinkingLevel: "low" }] },
 };
 const settings: RecoveryDefaults = {
 	passiveInspectionIntervalSeconds: 10,
@@ -40,11 +45,15 @@ function digest(label: string): MonitorDigest {
 	return { kind: "observed", byteCount: label.length, sha256: `sha256:${createHash("sha256").update(label, "utf8").digest("hex")}` };
 }
 
-function draft(): RunDraft {
+function sha(label: string): string {
+	return `sha256:${createHash("sha256").update(label, "utf8").digest("hex")}`;
+}
+
+function draft(modelPlan: ProjectModelPlans = modelPlans, reviewRequired = false): RunDraft {
 	return {
 		declaredOutcome: "Recover transient Builder execution without losing work",
-		tasks: [{ requiredOutcome: "Keep the exact managed change", allowedScope: ["src"], expectedArtifacts: [{ kind: "git-commit" }], verification: { kind: "command", command: "npm test" }, reviewRequired: false }],
-		modelPlan: modelPlans,
+		tasks: [{ requiredOutcome: "Keep the exact managed change", allowedScope: ["src"], expectedArtifacts: [{ kind: "git-commit" }, ...(reviewRequired ? [{ kind: "file" as const, path: "src/change.ts" }] : [])], verification: { kind: "command", command: "npm test" }, reviewRequired }],
+		modelPlan,
 		effectiveSettings: settings,
 		finalVerification: { kind: "command", command: "npm test" },
 	};
@@ -78,17 +87,25 @@ type Fixture = {
 	order: string[];
 };
 
-async function makeFixture(options: { transientFailure: boolean; transientKind?: FunctionalTransientKind; singleTransientFailure?: boolean; noFallback?: boolean; preservationUnavailable?: boolean; stopFailure?: "throw" | "killed" | "wrong-identity"; stopAcknowledgementCasFailure?: boolean }): Promise<Fixture> {
+async function makeFixture(options: { transientFailure: boolean; transientKind?: FunctionalTransientKind; singleTransientFailure?: boolean; noFallback?: boolean; preservationUnavailable?: boolean; stopFailure?: "throw" | "killed" | "wrong-identity"; stopAcknowledgementCasFailure?: boolean; reviewRequired?: boolean; builderTransientFailure?: boolean; reviewerTransientFailure?: boolean; reviewerTransientFailures?: number; reviewerPrimaryUnavailableAfterFailure?: boolean; reviewerPrimaryModel?: string; reviewerFallbackModels?: string[] }): Promise<Fixture> {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-retry-functional-"));
 	roots.push(root);
+	const activeModelPlans: ProjectModelPlans = {
+		...modelPlans,
+		reviewer: {
+			primary: { ...modelPlans.reviewer.primary, ...(options.reviewerPrimaryModel ? { model: options.reviewerPrimaryModel } : {}) },
+			fallbacks: options.reviewerFallbackModels ? options.reviewerFallbackModels.map((model, index) => ({ model, thinkingLevel: index === 0 ? "medium" as const : "low" as const })) : modelPlans.reviewer.fallbacks.map((choice) => ({ ...choice })),
+		},
+	};
 	const config = createConfigStore();
 	await config.saveRecoveryDefaults(settings);
-	await config.saveModelPlans(root, modelPlans);
+	await config.saveModelPlans(root, activeModelPlans);
 	let nowMs = Date.parse("2026-09-19T00:00:00.000Z");
 	let herdrUnavailable = false;
 	let herdrMissing = false;
 	let preservationUnavailable = options.preservationUnavailable ?? false;
-	let failureArmed = options.transientFailure;
+	let builderFailureArmed = options.builderTransientFailure ?? (!options.reviewRequired && options.transientFailure);
+	let reviewerFailuresRemaining = options.reviewerTransientFailures ?? (options.reviewerTransientFailure ? 1 : 0);
 	const transientKind = options.transientKind ?? "provider-network-interruption";
 	let paneNumber = 1;
 	const started = new Set<string>();
@@ -129,8 +146,8 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		async checkAvailability() { return { kind: "available", status: "running", running: true, compatible: true, endpointCompatible: true }; },
 		async createBuilderWorktree(input) { await mkdir(builderPath, { recursive: true }); return { kind: "created", branch: input.branch, path: builderPath, workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1", terminalId: "terminal-1" }; },
 		async startBuilder(input) {
-			if (transientKind === "agent-startup-failure" && failureArmed) {
-				if (options.singleTransientFailure) failureArmed = false;
+			if (transientKind === "agent-startup-failure" && builderFailureArmed) {
+				if (options.singleTransientFailure) builderFailureArmed = false;
 				missing.add(input.name);
 				return { kind: "failed", stage: "agent-start", code: "agent-startup-failure", message: "typed startup failure" };
 			}
@@ -140,13 +157,13 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		},
 		async promptBuilder(input) {
 			effects.prompts += 1;
-			if (transientKind === "unexpected-process-exit" && failureArmed) {
-				if (options.singleTransientFailure) failureArmed = false;
+			if (transientKind === "unexpected-process-exit" && builderFailureArmed) {
+				if (options.singleTransientFailure) builderFailureArmed = false;
 				missing.add(input.name);
 				return { kind: "prompted", name: input.name, workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1", terminalId: "terminal-1" };
 			}
-			if (failureArmed && (transientKind === "provider-network-interruption" || transientKind === "herdr-command-failure")) {
-				if (options.singleTransientFailure) failureArmed = false;
+			if (builderFailureArmed && (transientKind === "provider-network-interruption" || transientKind === "herdr-command-failure")) {
+				if (options.singleTransientFailure) builderFailureArmed = false;
 				return { kind: "failed", stage: "agent-prompt", code: transientKind, message: `typed ${transientKind}` };
 			}
 			return { kind: "prompted", name: input.name, workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1", terminalId: "terminal-1" };
@@ -163,6 +180,28 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 			paneNumber += 1;
 			return { kind: "created", workspaceId: "workspace-1", tabId: `tab-${paneNumber}`, paneId: `pane-${paneNumber}`, terminalId: `terminal-${paneNumber}`, sourcePaneId: input.sourcePaneId, worktreePath: input.worktreePath };
 		},
+		async createReviewerPane(input) {
+			effects.panes += 1;
+			paneNumber += 1;
+			return { kind: "created", workspaceId: input.workspaceId, tabId: `tab-${paneNumber}`, paneId: `reviewer-pane-${paneNumber}`, terminalId: `reviewer-terminal-${paneNumber}`, sourcePaneId: input.sourcePaneId, worktreePath: input.worktreePath };
+		},
+		async startReviewer(input) {
+			effects.starts += 1;
+			started.add(input.name);
+			effects.models.push(input.model.model);
+			return { kind: "started", name: input.name, agentKind: "pi", workspaceId: "workspace-1", tabId: `tab-${paneNumber}`, paneId: `reviewer-pane-${paneNumber}`, terminalId: `reviewer-terminal-${paneNumber}` };
+		},
+		async promptReviewer(input) {
+			effects.prompts += 1;
+			if (reviewerFailuresRemaining > 0) {
+				reviewerFailuresRemaining -= 1;
+				return { kind: "failed", stage: "agent-prompt", code: transientKind, message: `typed ${transientKind}` };
+			}
+			const active = await runJournal.loadActive(root);
+			const reviewer = active.kind === "loaded" ? [...active.journal.run.tasks[0]!.attempts].reverse().find((attempt) => attempt.role === "reviewer") : undefined;
+			if (!reviewer || reviewer.role !== "reviewer" || reviewer.dispatch.phase === "pane-intended" || reviewer.dispatch.phase === "replacement-pane-intended") throw new Error("Reviewer identity missing during prompt");
+			return { kind: "prompted", name: input.name, workspaceId: reviewer.dispatch.workspaceId, tabId: `tab-${paneNumber}`, paneId: reviewer.dispatch.paneId, terminalId: reviewer.dispatch.terminalId };
+		},
 		async startReplacementAgent(input) {
 			effects.starts += 1;
 			started.add(input.name);
@@ -171,8 +210,12 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		},
 		async promptReplacementAgent(input) {
 			effects.prompts += 1;
+			const active = await runJournal.loadActive(root);
+			const latest = active.kind === "loaded" ? active.journal.run.tasks[0]?.attempts.at(-1) : undefined;
+			const failureArmed = latest?.role === "reviewer" ? reviewerFailuresRemaining > 0 : builderFailureArmed;
 			if (failureArmed && (transientKind === "provider-network-interruption" || transientKind === "herdr-command-failure")) {
-				if (options.singleTransientFailure) failureArmed = false;
+				if (latest?.role === "reviewer") reviewerFailuresRemaining -= 1;
+				else if (options.singleTransientFailure) builderFailureArmed = false;
 				return { kind: "failed", stage: "agent-prompt", code: transientKind, message: `typed ${transientKind}` };
 			}
 			return { kind: "prompted", name: input.identity.name, workspaceId: input.identity.workspaceId, tabId: `tab-${paneNumber}`, paneId: input.identity.paneId, terminalId: input.identity.terminalId };
@@ -191,12 +234,14 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		async inspectIntegrationBase() { return { kind: "ready", branch: "main", revision: baseRevision }; },
 		async branchExists() { return false; },
 		async inspectBuilderWorktree(_path, expectedRevision) { return { kind: "ready", head: expectedRevision, clean: true }; },
-		async inspectManagedWorktreeProgress() { return preservationUnavailable ? { kind: "unavailable", diagnostic: "fixture Git preservation is temporarily unavailable" } : { kind: "observed", head: baseRevision, worktree: digest("worktree"), git: { head: baseRevision, digest: digest("git") } }; },
+		async inspectProducedCodeArtifact(input) { return { kind: "inspected", base: baseRevision, head: input.producedHead, commits, changedPaths: [{ status: "M", paths: ["src/change.ts"] }], clean: true }; },
+		async inspectReviewWorktree() { return { head: headRevision, dirtyStateFingerprint: sha("review-worktree"), dirtyPaths: [], operationMarkers: [] }; },
+		async inspectManagedWorktreeProgress() { return preservationUnavailable ? { kind: "unavailable", diagnostic: "fixture Git preservation is temporarily unavailable" } : { kind: "observed", head: headRevision, worktree: digest("worktree"), git: { head: headRevision, digest: digest("git") } }; },
 	};
 	const ui: StewardDependencies["ui"] = {
 		presentStatus() {},
 		async editConfiguration() { return { kind: "cancelled" }; },
-		async draftRun() { return { kind: "drafted" as const, draft: draft() }; },
+		async draftRun() { return { kind: "drafted" as const, draft: draft(activeModelPlans, options.reviewRequired ?? false) }; },
 		async confirmRun() { return true; },
 		presentConfigurationResult() {},
 		presentStartResult() {},
@@ -210,9 +255,13 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		model: {
 			listModelChoices: () => [],
 			async validateModelPlans() { return []; },
-		async inspectModelChoice(choice) {
+			async inspectModelChoice(choice, role, index) {
+				if (role === "reviewer") {
+					const available = choice.model !== "provider/unavailable" && !choice.model.endsWith("/unavailable") && !(options.reviewerPrimaryUnavailableAfterFailure && reviewerFailuresRemaining < (options.reviewerTransientFailures ?? (options.reviewerTransientFailure ? 1 : 0)) && choice.model === activeModelPlans.reviewer.primary.model) && !(options.noFallback && choice.model !== activeModelPlans.reviewer.primary.model);
+					return { choice: { ...choice }, available, diagnostics: available ? [] : [{ code: "unavailable-model", role, index, reference: choice.model, message: "fixture unavailable" }] };
+				}
 				const available = choice.model === modelPlans.builder.primary.model || (!options.noFallback && choice.model !== "provider/unavailable");
-				return { choice: { ...choice }, available, diagnostics: available ? [] : [{ code: "unavailable-model", role: "builder", index: 1, reference: choice.model, message: "fixture unavailable" }] };
+				return { choice: { ...choice }, available, diagnostics: available ? [] : [{ code: "unavailable-model", role, index, reference: choice.model, message: "fixture unavailable" }] };
 			},
 		},
 		clock,
@@ -244,6 +293,40 @@ async function makeFixture(options: { transientFailure: boolean; transientKind?:
 		effects,
 		order,
 	};
+}
+
+async function writeReviewBuilderReport(root: string, journal: RunJournal): Promise<void> {
+	const task = journal.run.tasks[0]!;
+	const builder = [...task.attempts].reverse().find((attempt) => attempt.role === "builder");
+	if (!builder || builder.role !== "builder") throw new Error("Builder Attempt missing for Reviewer flow");
+	const assignmentBytes = await readFile(builder.assignmentPath, "utf8");
+	const assignment = JSON.parse(assignmentBytes) as { assignment: { actualModel: BuilderAttemptReport["actualModel"] } };
+	const artifact = Buffer.from(`${builder.id}: approved\n`, "utf8");
+	const worktreePath = "worktreePath" in builder.dispatch ? builder.dispatch.worktreePath : join(root, "managed-worktree");
+	const sourcePath = join(worktreePath, "src", "change.ts");
+	const evidencePath = join(builder.evidenceDirectory, "artifact.snapshot");
+	const logPath = join(builder.evidenceDirectory, "check.log");
+	await mkdir(builder.evidenceDirectory, { recursive: true });
+	await mkdir(join(worktreePath, "src"), { recursive: true });
+	await writeFile(sourcePath, artifact);
+	await writeFile(evidencePath, artifact);
+	await writeFile(logPath, "pass\n", "utf8");
+	const report: BuilderAttemptReport = {
+		schemaVersion: 1,
+		identity: { runId: journal.run.id, taskId: task.contract.id, attemptId: builder.id, role: "builder", specificationHash: builder.specificationHash, assignmentSha256: builderAssignmentSha256(assignmentBytes) },
+		status: "completed",
+		summary: "Builder completed for the Reviewer retry flow.",
+		blockers: [],
+		producedArtifacts: [
+			{ kind: "git-commit", baseRevision, headRevision, commits },
+			{ kind: "file", path: "src/change.ts", evidencePath, size: artifact.length, sha256: sha(artifact.toString("utf8")) },
+		],
+		actualModel: assignment.assignment.actualModel,
+		checks: [{ kind: "command", command: "npm test", exitCode: 0, summary: "pass", logId: "check-1" }],
+		logReferences: [{ id: "check-1", path: logPath, size: 5, sha256: sha("pass\n") }],
+		producedRevision: headRevision,
+	};
+	await writeFile(builder.reportPath, serializeBuilderAttemptReport(report), "utf8");
 }
 
 it.sequential("registered transient recovery classifies infrastructure, retries same-model first, follows approved fallback, and stops at two links", async () => {
@@ -424,4 +507,78 @@ it.sequential("registered correctness evidence wins over exact agent absence and
 	expect(task.attempts[0]?.evidence?.phase).toBe("rejected");
 	expect(task.attentionReason).toBe("reconciliation-agent-missing");
 	expect(fixture.effects.panes + fixture.effects.starts + fixture.effects.prompts).toBe(1);
+});
+
+it.sequential("registered Reviewer transient fallback persists the provider-family change and continues the immutable Assignment", async () => {
+	const fixture = await makeFixture({ reviewRequired: true, transientFailure: false, reviewerTransientFailures: 2, reviewerPrimaryModel: "other/primary", reviewerFallbackModels: ["provider/unavailable", "third/fallback"] });
+	let journal = await fixture.load();
+	await writeReviewBuilderReport(fixture.root, journal);
+	for (let pass = 0; pass < 100; pass += 1) {
+		journal = await fixture.resume();
+		const attempts = journal.run.tasks[0]!.attempts;
+		if (attempts.filter((attempt) => attempt.replacement).length === 2 && attempts.at(-1)?.role === "reviewer" && attempts.at(-1)?.state === "active") break;
+	}
+	const task = journal.run.tasks[0]!;
+	const reviewers = task.attempts.filter((attempt) => attempt.role === "reviewer");
+	expect(reviewers).toHaveLength(3);
+	const initial = reviewers[0]!;
+	const sameModel = reviewers[1]!;
+	const fallback = reviewers[2]!;
+	expect(initial.actualModel.model).toBe("other/primary");
+	expect(sameModel.replacement).toMatchObject({ retryOrdinal: 1, modelSelection: { kind: "same-model-first", planIndex: 0 } });
+	expect(sameModel.actualModel).toEqual(initial.actualModel);
+	expect(fallback.replacement).toMatchObject({ retryOrdinal: 2, modelSelection: { kind: "approved-fallback", planIndex: 2, reason: "same-model-retry-failed" } });
+	expect(fallback.actualModel.model).toBe("third/fallback");
+	expect(initial.role === "reviewer" && sameModel.role === "reviewer" && fallback.role === "reviewer").toBe(true);
+	if (initial.role !== "reviewer" || sameModel.role !== "reviewer" || fallback.role !== "reviewer") throw new Error("Reviewer transient lineage missing");
+	expect(initial.independence).toEqual({ kind: "different-provider-family", builderProvider: "provider", reviewerProvider: "other" });
+	expect(sameModel.independence).toEqual(initial.independence);
+	expect(fallback.independence).toEqual({ kind: "different-provider-family", builderProvider: "provider", reviewerProvider: "third" });
+	expect(fallback.state).toBe("active");
+	const assignment = deserializeReviewerAssignment(await readFile(fallback.assignmentPath, "utf8"));
+	expect(assignment.value?.assignment.actualModel).toEqual(fallback.actualModel);
+	expect(assignment.value?.assignment.continuation).toMatchObject({ predecessorAttemptId: sameModel.id, retryOrdinal: 2 });
+	const preservedIndex = fixture.order.indexOf("preserve");
+	const acknowledgedIndex = fixture.order.indexOf("stop-ack");
+	const reservedIndex = fixture.order.indexOf("reserve");
+	expect(preservedIndex).toBeGreaterThanOrEqual(0);
+	expect(acknowledgedIndex).toBeGreaterThan(preservedIndex);
+	expect(reservedIndex).toBeGreaterThan(acknowledgedIndex);
+});
+
+it.sequential("registered Builder link one precedes Reviewer link two in the global replacement budget", async () => {
+	const fixture = await makeFixture({ reviewRequired: true, transientFailure: false, builderTransientFailure: true, singleTransientFailure: true, reviewerTransientFailures: 1, reviewerPrimaryUnavailableAfterFailure: true, reviewerPrimaryModel: "other/primary", reviewerFallbackModels: ["third/fallback"] });
+	let journal = await fixture.load();
+	for (let pass = 0; pass < 12; pass += 1) {
+		journal = await fixture.resume();
+		const task = journal.run.tasks[0]!;
+		if (task.attempts.filter((attempt) => attempt.role === "builder" && attempt.replacement).length === 1 && task.attempts.at(-1)?.role === "builder" && task.attempts.at(-1)?.state === "active") break;
+	}
+	await writeReviewBuilderReport(fixture.root, journal);
+	for (let pass = 0; pass < 16; pass += 1) {
+		journal = await fixture.resume();
+		if (journal.run.tasks[0]!.attempts.filter((attempt) => attempt.replacement).length === 2) break;
+	}
+	const task = journal.run.tasks[0]!;
+	expect(task.attempts.filter((attempt) => attempt.replacement).map((attempt) => attempt.replacement?.retryOrdinal)).toEqual([1, 2]);
+	const reviewer = task.attempts.at(-1);
+	expect(reviewer?.role).toBe("reviewer");
+	expect(reviewer?.replacement?.retryOrdinal).toBe(2);
+	expect(reviewer?.actualModel.model).toBe("third/fallback");
+});
+
+it.sequential("registered Reviewer same-family fallback without approval pauses with no successor or budget use", async () => {
+	const fixture = await makeFixture({ reviewRequired: true, transientFailure: false, reviewerTransientFailures: 1, reviewerPrimaryUnavailableAfterFailure: true, reviewerPrimaryModel: "other/primary", reviewerFallbackModels: ["provider/fallback"] });
+	let journal = await fixture.load();
+	await writeReviewBuilderReport(fixture.root, journal);
+	for (let pass = 0; pass < 12; pass += 1) journal = await fixture.resume();
+	const task = journal.run.tasks[0]!;
+	expect(task.attention).toBe("needs-user");
+	expect(task.attentionReason).toBe("transient-fallback-unavailable");
+	expect(task.attempts).toHaveLength(2);
+	expect(task.attempts.filter((attempt) => attempt.replacement)).toHaveLength(0);
+	expect(fixture.order).not.toContain("reserve");
+	const pausedEffects = { ...fixture.effects, models: [...fixture.effects.models] };
+	await fixture.resume();
+	expect(fixture.effects).toEqual(pausedEffects);
 });

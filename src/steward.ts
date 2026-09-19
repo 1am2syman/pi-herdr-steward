@@ -2326,8 +2326,11 @@ function currentReconciliationAttempt(journal: RunJournal, index: number, attemp
 function branchForAttempt(task: TaskRecord, attempt: AttemptRecord): string | undefined {
 	if ("branch" in attempt.dispatch && typeof attempt.dispatch.branch === "string") return attempt.dispatch.branch;
 	const attemptIndex = task.attempts.findIndex((candidate) => candidate.id === attempt.id);
-	const preceding = attemptIndex > 0 ? task.attempts[attemptIndex - 1] : undefined;
-	return preceding && preceding.role === "builder" && "branch" in preceding.dispatch ? preceding.dispatch.branch : undefined;
+	for (let priorIndex = attemptIndex - 1; priorIndex >= 0; priorIndex -= 1) {
+		const preceding = task.attempts[priorIndex];
+		if (preceding?.role === "builder" && "branch" in preceding.dispatch) return preceding.dispatch.branch;
+	}
+	return undefined;
 }
 
 function continuationForReplacement(task: TaskRecord, attempt: AttemptRecord): AttemptContinuation {
@@ -2853,7 +2856,7 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 				if (nextAttempt.state !== "prepared" || nextAttempt.dispatch.phase !== "replacement-pane-intended") throw new Error("Reserved silent replacement changed before pane identity persistence.");
 				nextAttempt.dispatch = nextAttempt.role === "builder"
 					? { phase: "agent-intended", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId }
-					: { phase: "agent-intended", agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId, branch: dispatch.branch };
+					: { phase: "agent-intended", agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId } as ReviewerAttemptRecord["dispatch"];
 			});
 			if (changed) return { kind: "changed", journal, note: `Reserved silent replacement Attempt ${attempt.id} now records its exact no-focus pane; no agent was started in this pass.`, action: "record-observation" };
 			const ambiguous = await markReplacementAmbiguous("The recovery pane was created but its exact identity could not be persisted.");
@@ -2943,8 +2946,13 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 				} else {
 					const attemptIndex = task.attempts.findIndex((candidateAttempt) => candidateAttempt.id === attempt.id);
 					const predecessor = attemptIndex > 0 ? task.attempts[attemptIndex - 1] : undefined;
-					const builderIndex = attempt.replacement ? attemptIndex - 2 : attemptIndex - 1;
-					const builder = builderIndex >= 0 ? task.attempts[builderIndex] : undefined;
+					let builder: AttemptRecord | undefined;
+					for (let priorIndex = attemptIndex - 1; priorIndex >= 0; priorIndex -= 1) {
+						if (task.attempts[priorIndex]?.role === "builder") {
+							builder = task.attempts[priorIndex];
+							break;
+						}
+					}
 					if (attempt.replacement && (!predecessor || predecessor.role !== "reviewer")) return { kind: "degraded", journal, note: "Prepared Reviewer replacement is missing its immediately preceding superseded Reviewer; no prompt was attempted." };
 					if (!builder || builder.role !== "builder" || builder.evidence?.phase !== "finalized") return { kind: "degraded", journal, note: "Prepared Reviewer Assignment cannot be rebuilt without the exact finalized Builder subject; no prompt was attempted." };
 					assignment = buildReviewerAssignment({ runId: journal.run.id, task: task.contract, attempt, manifestPath: builder.evidence.manifestPath, manifestSha256: builder.evidence.manifestSha256, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name, ...(attempt.replacement ? { continuation: continuationForReplacement(task, attempt) } : {}) });
