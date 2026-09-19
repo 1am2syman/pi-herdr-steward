@@ -369,6 +369,58 @@ it.sequential("round-trips ticket-10 recovery branches and rejects impossible re
 	ok(!deserializeRunJournal(JSON.stringify(awaitingWithFinalizedEvidence), "active-run.json").value, "awaiting-report with finalized evidence was accepted");
 });
 
+it.sequential("keeps schema-v1 journals additive and rejects impossible silence attention/state combinations", async () => {
+	const legacy = journal("run-20260917T180000000Z-schema-v1");
+	const legacyBytes = serializeRunJournal(legacy);
+	const legacyDecoded = deserializeRunJournal(legacyBytes, "active-run.json");
+	ok(legacyDecoded.value, "schema-v1 journal without ticket-11 keys did not decode");
+	if (legacyDecoded.value) deepStrictEqual(legacyDecoded.value, legacy);
+
+	const candidate = JSON.parse(serializeRunJournal(recoveryJournal("working"))) as Record<string, unknown>;
+	const run = candidate.run as Record<string, unknown>;
+	const task = (run.tasks as Array<Record<string, unknown>>)[0]!;
+	const attempt = (task.attempts as Array<Record<string, unknown>>)[0]!;
+	const sha = `sha256:${"a".repeat(64)}`;
+	task.attention = "suspected-stall";
+	task.attentionReason = "silence-passive-inspection";
+	(attempt.recovery as Record<string, unknown>).silence = {
+		phase: "suspected",
+		lastProgressAt: "2026-09-18T00:00:03.000Z",
+		phaseAt: "2026-09-18T00:00:04.000Z",
+		inspection: {
+			attemptId: "attempt-01",
+			role: "builder",
+			agent: { name: "steward-b-abcdef12-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" },
+			lifecycle: "working",
+			stateChangeSequence: null,
+			terminal: { kind: "observed", byteCount: 0, sha256: sha },
+			worktree: { kind: "observed", byteCount: 0, sha256: sha },
+			git: { head: "0".repeat(40), digest: sha },
+			assignment: { path: "/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-01/assignment.json", size: 1, sha256: sha },
+			report: { kind: "missing" },
+			evidence: { directory: "/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-01/evidence", count: 0, byteCount: 0, sha256: sha, entries: [] },
+			process: { kind: "none", paneId: "pane-1", shellPid: 101, foregroundProcessGroupId: 101, processCount: 1, digest: sha },
+		},
+	};
+	const valid = validateRunJournal(candidate);
+	ok(valid.value, valid.diagnostics.map((item) => item.message).join("; "));
+
+	const unknown = JSON.parse(JSON.stringify(candidate)) as Record<string, unknown>;
+	const unknownAttempt = ((unknown.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>;
+	((unknownAttempt[0]!.recovery as Record<string, unknown>).silence as Record<string, unknown>).unexpected = true;
+	ok(!validateRunJournal(unknown).value, "unknown silence fields were accepted");
+
+	const impossibleAttention = JSON.parse(JSON.stringify(candidate)) as Record<string, unknown>;
+	const impossibleTask = ((impossibleAttention.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!;
+	impossibleTask.attention = "waiting-external";
+	ok(!validateRunJournal(impossibleAttention).value, "waiting-external attention without an external phase was accepted");
+
+	const impossibleSuperseded = JSON.parse(JSON.stringify(candidate)) as Record<string, unknown>;
+	const impossibleAttempt = ((impossibleSuperseded.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>;
+	impossibleAttempt[0]!.state = "superseded";
+	ok(!validateRunJournal(impossibleSuperseded).value, "superseded Attempt without replacement-intended state was accepted");
+});
+
 it.sequential("accepts an optional strict monitor checkpoint, clones it, and rejects unknown monitor keys", async () => {
 	const root = await makeRoot();
 	const store = createRunJournalStore();

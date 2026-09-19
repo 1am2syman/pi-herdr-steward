@@ -440,6 +440,59 @@ it.sequential("uses the exact lifecycle wait first and the frozen passive interv
 	equal(fallbackWaits, 3);
 }, 60_000);
 
+it.sequential("schedules the lifecycle wait from the earliest durable silence deadline", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-silence-deadline-"));
+	roots.push(root);
+	const dependencies = makeDependencies(root, [], { builderPrompts: 0, reviewerStarts: 0, reviewerPrompts: 0 }, {});
+	const { journal } = await startDormantRegisteredRun(root, dependencies);
+	const task = journal.run.tasks[0]!;
+	const attempt = task.attempts[0]!;
+	if (attempt.role !== "builder" || attempt.dispatch.phase !== "prompted") throw new Error("silence deadline fixture lacks a prompted Builder");
+	const stamp = attempt.activatedAt ?? attempt.preparedAt;
+	const hash = `sha256:${"a".repeat(64)}`;
+	const identity = { name: attempt.dispatch.agentName, workspaceId: attempt.dispatch.workspaceId, paneId: attempt.dispatch.paneId, terminalId: attempt.dispatch.terminalId };
+	const silence = {
+		phase: "suspected" as const,
+		lastProgressAt: stamp,
+		phaseAt: stamp,
+		inspection: {
+			attemptId: attempt.id,
+			role: "builder" as const,
+			agent: identity,
+			lifecycle: "working" as const,
+			stateChangeSequence: 8,
+			terminal: { kind: "observed" as const, byteCount: 0, sha256: hash },
+			worktree: { kind: "observed" as const, byteCount: 0, sha256: hash },
+			git: { head: baseRevision, digest: hash },
+			assignment: { path: attempt.assignmentPath, size: 1, sha256: hash },
+			report: { kind: "missing" as const },
+			evidence: { directory: attempt.evidenceDirectory, count: 0, byteCount: 0, sha256: hash, entries: [] },
+			process: { kind: "none" as const, paneId: identity.paneId, shellPid: 101, foregroundProcessGroupId: 101, processCount: 1, digest: hash },
+		},
+	};
+	const candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+		const nextTask = next.run.tasks[0]!;
+		const nextAttempt = nextTask.attempts[0]!;
+		nextTask.attention = "suspected-stall";
+		nextTask.attentionReason = "silence-passive-inspection";
+		nextAttempt.recovery = { live: { observedAt: stamp, kind: "working", lifecycle: "working", stateChangeSequence: 8 }, silence };
+	});
+	const replaced = await dependencies.runJournal.replaceActive(root, candidate);
+	equal(replaced.kind, "replaced");
+	const expected = Date.parse(stamp) + settings.secondInspectionAndNudgeIntervalSeconds * 1_000 - dependencies.clock.now().getTime();
+	let requestedTimeout = 0;
+	let fallbackWait = 0;
+	dependencies.herdr.waitForManagedAgent = async (_resource, timeout) => {
+		requestedTimeout = timeout;
+		return { kind: "timeout" };
+	};
+	dependencies.clock.wait = async (milliseconds) => { fallbackWait = milliseconds; };
+	const result = await createSteward(dependencies).waitForMonitorSignal(root, "monitor-controller", new AbortController().signal);
+	equal(result.kind, "timeout");
+	equal(requestedTimeout, Math.min(expected, 30_000));
+	equal(fallbackWait, expected);
+}, 60_000);
+
 it.sequential("keeps foreign, stale, and wrong-resource observations read-only", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-authority-"));
 	roots.push(root);

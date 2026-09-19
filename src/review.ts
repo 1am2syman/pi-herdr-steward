@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { isThinkingLevel, parseCanonicalModelReference, type ConfigDiagnostic, type ModelChoice } from "./config.ts";
 import type {
 	AttemptRecord,
+	AttemptContinuation,
 	FinalizedEvidenceManifest,
 	ReviewWorktreeSnapshot,
 	ReviewerAttemptRecord,
@@ -191,6 +192,7 @@ export interface ReviewerAssignmentDocument {
 		independence: ReviewerIndependence;
 		worktree: { path: string; baseline: ReviewWorktreeSnapshot };
 		herdr: { workspaceId: string; paneId: string; terminalId: string; agentName: string };
+		continuation?: AttemptContinuation;
 	};
 }
 
@@ -330,7 +332,8 @@ export function serializeReviewerAssignment(document: ReviewerAssignmentDocument
 export function validateReviewerAssignment(value: unknown, path = "assignment.json"): { value?: ReviewerAssignmentDocument; diagnostics: ReviewDiagnostic[] } {
 	if (!isRecord(value) || !exactKeys(value, ["schemaVersion", "assignment"]) || value.schemaVersion !== 1 || !isRecord(value.assignment)) return { diagnostics: [{ code: "invalid-assignment", message: "Reviewer Assignment must contain exactly schemaVersion and assignment.", path }] };
 	const a = value.assignment;
-	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "reportPath", "evidenceDirectory", "actualModel", "specificationHash", "subject", "builderEvidence", "independence", "worktree", "herdr"];
+	const hasContinuation = Object.prototype.hasOwnProperty.call(a, "continuation");
+	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "reportPath", "evidenceDirectory", "actualModel", "specificationHash", "subject", "builderEvidence", "independence", "worktree", "herdr", ...(hasContinuation ? ["continuation"] : [])];
 	if (!exactKeys(a, keys) || !safeIdentifier(a.runId) || !safeIdentifier(a.taskId) || !safeIdentifier(a.attemptId) || a.role !== "reviewer" || !text(a.requiredOutcome, 8_000) || !absolutePath(a.reportPath) || !absolutePath(a.evidenceDirectory) || !sha(a.specificationHash)) return { diagnostics: [{ code: "invalid-assignment", message: "Reviewer Assignment identity, paths, or specification hash is invalid.", path }] };
 	const actualModel = model(a.actualModel, `${path}.assignment.actualModel`);
 	const reviewedSubject = subject(a.subject, `${path}.assignment.subject`);
@@ -344,8 +347,17 @@ export function validateReviewerAssignment(value: unknown, path = "assignment.js
 	if (!isRecord(herdr) || !exactKeys(herdr, ["workspaceId", "paneId", "terminalId", "agentName"]) || !text(herdr.workspaceId, 256) || !text(herdr.paneId, 256) || !text(herdr.terminalId, 256) || !/^[a-z][a-z0-9_-]{0,31}$/.test(String(herdr.agentName))) diagnostics.push({ code: "invalid-assignment", message: "Reviewer Herdr identities are invalid.", path: `${path}.assignment.herdr` });
 	const baseline = isRecord(worktree) ? parseSnapshot(worktree.baseline, `${path}.assignment.worktree.baseline`) : { diagnostics: [] };
 	diagnostics.push(...baseline.diagnostics);
-	if (diagnostics.length > 0 || !actualModel.value || !reviewedSubject.value || !independence.value || !isRecord(builderEvidence) || !isRecord(worktree) || !isRecord(herdr) || !baseline.value) return { diagnostics };
-	return { value: { schemaVersion: 1, assignment: { runId: a.runId as string, taskId: a.taskId as string, attemptId: a.attemptId as string, role: "reviewer", requiredOutcome: a.requiredOutcome as string, reportPath: a.reportPath as string, evidenceDirectory: a.evidenceDirectory as string, actualModel: actualModel.value, specificationHash: a.specificationHash as string, subject: reviewedSubject.value, builderEvidence: { manifestPath: builderEvidence.manifestPath as string, manifestSha256: builderEvidence.manifestSha256 as string }, independence: independence.value, worktree: { path: worktree.path as string, baseline: baseline.value }, herdr: { workspaceId: herdr.workspaceId as string, paneId: herdr.paneId as string, terminalId: herdr.terminalId as string, agentName: herdr.agentName as string } } }, diagnostics: [] };
+	const continuation = hasContinuation ? parseContinuation(a.continuation, `${path}.assignment.continuation`) : { value: undefined, diagnostics: [] };
+	diagnostics.push(...continuation.diagnostics);
+	if (diagnostics.length > 0 || !actualModel.value || !reviewedSubject.value || !independence.value || !isRecord(builderEvidence) || !isRecord(worktree) || !isRecord(herdr) || !baseline.value || (hasContinuation && !continuation.value)) return { diagnostics };
+	return { value: { schemaVersion: 1, assignment: { runId: a.runId as string, taskId: a.taskId as string, attemptId: a.attemptId as string, role: "reviewer", requiredOutcome: a.requiredOutcome as string, reportPath: a.reportPath as string, evidenceDirectory: a.evidenceDirectory as string, actualModel: actualModel.value, specificationHash: a.specificationHash as string, subject: reviewedSubject.value, builderEvidence: { manifestPath: builderEvidence.manifestPath as string, manifestSha256: builderEvidence.manifestSha256 as string }, independence: independence.value, worktree: { path: worktree.path as string, baseline: baseline.value }, herdr: { workspaceId: herdr.workspaceId as string, paneId: herdr.paneId as string, terminalId: herdr.terminalId as string, agentName: herdr.agentName as string }, ...(continuation.value ? { continuation: continuation.value } : {}) } }, diagnostics: [] };
+}
+
+function parseContinuation(value: unknown, path: string): { value?: AttemptContinuation; diagnostics: ReviewDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["predecessorAttemptId", "retryOrdinal", "preservedWorktree", "priorAssignmentPath", "priorReportPath", "priorEvidenceDirectory"]) || !safeIdentifier(value.predecessorAttemptId) || (value.retryOrdinal !== 1 && value.retryOrdinal !== 2) || !absolutePath(value.priorAssignmentPath) || !absolutePath(value.priorReportPath) || !absolutePath(value.priorEvidenceDirectory)) return { diagnostics: [{ code: "invalid-assignment", message: "Assignment continuation has invalid exact identity or paths.", path }] };
+	const worktree = value.preservedWorktree;
+	if (!isRecord(worktree) || !exactKeys(worktree, ["path", "branch", "head"]) || !absolutePath(worktree.path) || !safePath(worktree.branch) || (worktree.head !== null && !revision(worktree.head))) return { diagnostics: [{ code: "invalid-assignment", message: "Assignment continuation preserved worktree is invalid.", path: `${path}.preservedWorktree` }] };
+	return { value: { predecessorAttemptId: value.predecessorAttemptId, retryOrdinal: value.retryOrdinal as 1 | 2, preservedWorktree: { path: worktree.path, branch: worktree.branch, head: worktree.head as string | null }, priorAssignmentPath: value.priorAssignmentPath, priorReportPath: value.priorReportPath, priorEvidenceDirectory: value.priorEvidenceDirectory }, diagnostics: [] };
 }
 
 function parseSnapshot(value: unknown, path: string): { value?: ReviewWorktreeSnapshot; diagnostics: ReviewDiagnostic[] } {
@@ -369,9 +381,10 @@ export function buildReviewerAssignment(input: {
 	paneId: string;
 	terminalId: string;
 	agentName: string;
+	continuation?: AttemptContinuation;
 }): ReviewerAssignmentDocument {
 	if (input.attempt.dispatch.phase !== "agent-intended" && input.attempt.dispatch.phase !== "prompt-intended" && input.attempt.dispatch.phase !== "prompted" && input.attempt.dispatch.phase !== "reconciled-active") throw new Error("Reviewer Assignment requires actual Reviewer identities.");
-	const assignment: ReviewerAssignmentDocument = { schemaVersion: 1, assignment: { runId: input.runId, taskId: input.task.id, attemptId: input.attempt.id, role: "reviewer", requiredOutcome: input.task.requiredOutcome, reportPath: input.attempt.reportPath, evidenceDirectory: input.attempt.evidenceDirectory, actualModel: { ...input.attempt.actualModel }, specificationHash: input.attempt.specificationHash, subject: cloneSubject(input.attempt.subject), builderEvidence: { manifestPath: input.manifestPath, manifestSha256: input.manifestSha256 }, independence: { ...input.attempt.independence }, worktree: { path: input.attempt.worktree.path, baseline: { ...input.attempt.worktree.baseline, dirtyPaths: [...input.attempt.worktree.baseline.dirtyPaths], operationMarkers: [...input.attempt.worktree.baseline.operationMarkers] } }, herdr: { workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, agentName: input.agentName } } };
+	const assignment: ReviewerAssignmentDocument = { schemaVersion: 1, assignment: { runId: input.runId, taskId: input.task.id, attemptId: input.attempt.id, role: "reviewer", requiredOutcome: input.task.requiredOutcome, reportPath: input.attempt.reportPath, evidenceDirectory: input.attempt.evidenceDirectory, actualModel: { ...input.attempt.actualModel }, specificationHash: input.attempt.specificationHash, subject: cloneSubject(input.attempt.subject), builderEvidence: { manifestPath: input.manifestPath, manifestSha256: input.manifestSha256 }, independence: { ...input.attempt.independence }, worktree: { path: input.attempt.worktree.path, baseline: { ...input.attempt.worktree.baseline, dirtyPaths: [...input.attempt.worktree.baseline.dirtyPaths], operationMarkers: [...input.attempt.worktree.baseline.operationMarkers] } }, herdr: { workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, agentName: input.agentName }, ...(input.continuation ? { continuation: { ...input.continuation, preservedWorktree: { ...input.continuation.preservedWorktree } } } : {}) } };
 	const validation = validateReviewerAssignment(assignment);
 	if (!validation.value || validation.diagnostics.length > 0) throw new Error(`Cannot build Reviewer Assignment: ${validation.diagnostics.map((item) => item.message).join("; ")}`);
 	return validation.value;

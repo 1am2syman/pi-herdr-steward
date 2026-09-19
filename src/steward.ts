@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ConfigLoadResult, ConfigSaveResult } from "./config-store.ts";
 import {
 	formatModelPlans,
@@ -63,6 +64,11 @@ import {
 	type MonitorDigest,
 	type MonitorLifecycle,
 	type MonitorReportObservation,
+	type SilenceProcessObservation,
+	type SilenceInspectionSnapshot,
+	type SilencePhase,
+	type AttemptReplacement,
+	type AttemptContinuation,
 } from "./run.ts";
 import {
 	buildReviewerAssignment,
@@ -108,9 +114,9 @@ import type {
 	VerificationEvidenceInput,
 	VerificationFinalizeResult,
 } from "./completion-store.ts";
-import { decideReconciliation, parseTaskFactRequest, resolveTaskFactAnswer, taskFactValue, type ReconciliationDecision, type TaskFactKey } from "./reconciliation.ts";
+import { decideReconciliation, decideSilenceRecovery, parseTaskFactRequest, resolveTaskFactAnswer, taskFactValue, type ReconciliationDecision, type TaskFactKey, type SilenceRecoveryDecision } from "./reconciliation.ts";
 
-export type { MonitorDigest, MonitorLifecycle } from "./run.ts";
+export type { MonitorDigest, MonitorLifecycle, SilenceProcessObservation } from "./run.ts";
 
 type ProvenDispatch = Extract<AttemptRecord["dispatch"], { phase: "prompted" | "reconciled-active" }>;
 type ProvenAttempt = AttemptRecord & { dispatch: ProvenDispatch };
@@ -232,6 +238,12 @@ export interface StewardHerdrAdapter {
 	inspectManagedAgent?(identity: ManagedAgentIdentity): Promise<ManagedAgentInspection>;
 	waitForManagedAgent?(identity: ManagedAgentIdentity, timeoutMs: number, signal: AbortSignal): Promise<MonitorWaitResult>;
 	readManagedTerminal?(identity: ManagedAgentIdentity): Promise<MonitorDigest>;
+	nudgeAgent?(input: { repositoryRoot: string; identity: ManagedAgentIdentity; prompt: string }): Promise<HerdrPromptResult>;
+	interruptAgent?(input: { repositoryRoot: string; identity: ManagedAgentIdentity }): Promise<HerdrInputResult>;
+	resumeAgent?(input: { repositoryRoot: string; identity: ManagedAgentIdentity; prompt: string }): Promise<HerdrPromptResult>;
+	createRecoveryPane?(input: { repositoryRoot: string; sourcePaneId: string; workspaceId: string; worktreePath: string; branch: string; agentName: string }): Promise<HerdrReviewerPaneResult>;
+	startReplacementAgent?(input: { repositoryRoot: string; name: string; paneId: string; model: import("./config.ts").ModelChoice }): Promise<HerdrAgentStartResult>;
+	promptReplacementAgent?(input: { repositoryRoot: string; identity: ManagedAgentIdentity; assignmentPrompt: string }): Promise<HerdrPromptResult>;
 }
 
 export type HerdrWorktreeCreateResult =
@@ -258,6 +270,10 @@ export type HerdrReviewerPaneResult =
 
 export type HerdrStopResult =
 	| { kind: "acknowledged"; name: string; workspaceId: string; tabId: string; paneId: string; terminalId: string }
+	| { kind: "failed" | "ambiguous"; message: string };
+
+export type HerdrInputResult =
+	| { kind: "acknowledged"; identity: ManagedAgentIdentity }
 	| { kind: "failed" | "ambiguous"; message: string };
 
 export type HerdrAvailability =
@@ -302,6 +318,7 @@ export type VerificationProcessOutcome =
 
 export interface StewardProcessAdapter {
 	runApprovedVerification?(input: { cwd: string; command: string }): Promise<VerificationProcessOutcome>;
+	inspectAttemptProcesses?(input: { repositoryRoot: string; identity: ManagedAgentIdentity }): Promise<SilenceProcessObservation>;
 }
 
 export type IntegrationBaseInspection =
@@ -346,7 +363,7 @@ export type ManagedWorktreeProgress =
 
 export type MonitorTrigger = "start" | "lifecycle" | "fallback" | "settled" | "turn" | "compaction" | "prompt" | "manual";
 
-export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "none" | "approval-required" | "blocked" | "degraded";
+export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "silence-nudge" | "silence-interrupt" | "silence-resume" | "reserve-silent-replacement" | "none" | "approval-required" | "blocked" | "degraded";
 
 export type MonitorCondition = "completed" | "approval-required" | "blocked" | "degraded" | "ordinary";
 
@@ -417,7 +434,7 @@ export interface ActiveAttemptStatusView {
 	taskPhase: "building" | "reworking" | "reviewing" | "approved";
 	attemptId: string;
 	role: "builder";
-	attemptState: "prepared" | "active" | "awaiting-report" | "reported";
+	attemptState: "prepared" | "active" | "awaiting-report" | "reported" | "superseded";
 	assignmentPath?: string;
 	assignmentHash?: string;
 	actualModel?: import("./config.ts").ModelChoice;
@@ -427,7 +444,7 @@ export interface ActiveAttemptStatusView {
 	paneId?: string;
 	workspaceId?: string;
 	reportPath: string;
-	attention: "none" | "blocked" | "recovering" | "needs-user";
+	attention: "none" | "blocked" | "waiting-external" | "suspected-stall" | "recovering" | "needs-user";
 	dispatchPhase: DispatchRecord["phase"] | "assignment-intended";
 	evidence?: BuilderEvidenceRecord;
 }
@@ -492,6 +509,7 @@ function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusVi
 	if (!task) return { kind: "present", markdown: `Run ${journal.run.id} is active; no Reviewer Task is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
 	const reviewer = latestReviewerAttempt(task);
 	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: reviewing`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, `Attention: ${task.attention}`];
+	if (reviewer) lines.push(...silenceStatusLines(journal, task, reviewer));
 	if (task.attentionReason) lines.push(`Attention reason: ${task.attentionReason}`);
 	if (task.attentionDiagnostic) lines.push(`Attention diagnostic: ${task.attentionDiagnostic}`);
 	if (task.approval?.phase === "invalidated") lines.push(`Approval: invalidated (${task.approval.reason}); preserved exact facts require user attention.`);
@@ -509,7 +527,7 @@ function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusVi
 	}
 	if (note) lines.push(note);
 	const attentionCount = task.attention === "none" ? 0 : 1;
-	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · reviewing · ${attentionCount} attention` } };
+	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · reviewing · ${attentionCount} attention${reviewer?.recovery?.silence ? ` · silence ${reviewer.recovery.silence.phase}` : ""}` } };
 }
 
 function presentApprovedStatus(journal: RunJournal, note?: string): ActiveStatusView {
@@ -551,7 +569,7 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 	}
 	if (attempt.role !== "builder") return { kind: "present", markdown: `Run ${journal.run.id} is active; Review is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · reviewing · 0 attention` } };
 	const dispatch = attempt.dispatch;
-	const actual = dispatch.phase === "worktree-intended" ? {} : {
+	const actual = dispatch.phase === "worktree-intended" || dispatch.phase === "replacement-pane-intended" ? { worktreeBranch: dispatch.branch, ...(dispatch.phase === "replacement-pane-intended" ? { worktreePath: dispatch.worktreePath, agentName: dispatch.agentName } : {}) } : {
 		worktreeBranch: dispatch.branch,
 		worktreePath: dispatch.worktreePath,
 		agentName: dispatch.agentName,
@@ -575,6 +593,7 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 		...(attempt.evidence ? { evidence: { ...attempt.evidence, ...(attempt.evidence.phase === "rejected" ? { codes: [...attempt.evidence.codes] } : {}) } } : {}),
 	};
 	const evidence = attempt.evidence;
+	const silenceLines = silenceStatusLines(journal, task, attempt);
 	const evidenceLines = evidence?.phase === "rejected"
 		? [`Evidence: rejected (${evidence.codes.join(", ")})`, `Evidence detail: ${evidence.summary}`, "Review: blocked; evidence is not valid."]
 		: evidence?.phase === "finalization-intended"
@@ -593,15 +612,24 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 		...(activeAttempt.worktreeBranch ? [`Worktree: ${activeAttempt.worktreeBranch} @ ${activeAttempt.worktreePath}`] : []),
 		...(activeAttempt.agentName ? [`Herdr Builder: ${activeAttempt.agentName} (pane=${activeAttempt.paneId}, workspace=${activeAttempt.workspaceId})`] : []),
 		`Attention: ${task.attention}`,
+		...silenceLines,
 		...(evidenceLines.length > 0 ? evidenceLines : [task.phase === "reworking" ? "Rework: awaiting the same Builder's validated Attempt Report." : "Completion: not inferred from Herdr activity; awaiting a validated Attempt Report."]),
 		...(note ? [note] : []),
 	];
 	return {
 		kind: "present",
 		markdown: lines.join("\n"),
-		footer: { run: "active", attentionCount: task.attention === "needs-user" || task.attention === "blocked" ? 1 : 0, text: `steward: ${journal.run.id} · ${task.phase} · ${task.attention === "needs-user" || task.attention === "blocked" ? 1 : 0} attention` },
+		footer: { run: "active", attentionCount: task.attention === "none" ? 0 : 1, text: `steward: ${journal.run.id} · ${task.phase} · ${task.attention === "none" ? 0 : 1} attention${attempt.recovery?.silence ? ` · silence ${attempt.recovery.silence.phase}` : ""}` },
 		activeAttempt,
 	};
+}
+
+function silenceStatusLines(journal: RunJournal, task: TaskRecord, attempt: AttemptRecord): string[] {
+	const silence = attempt.recovery?.silence;
+	if (!silence) return [];
+	const used = task.attempts.filter((candidate) => candidate.replacement !== undefined).length;
+	const deadline = new Date(nextSilenceDeadline(journal, attempt, new Date(journal.run.updatedAt).getTime())).toISOString();
+	return [`Silence recovery: ${silence.phase}`, `Silent replacements: ${used}/${journal.run.effectiveSettings.transientRetryLimit}`, `Next silence deadline: ${deadline}`];
 }
 
 function resultForSaveFailure(scope: ConfigurationScope, save: ConfigSaveResult): ConfigureResult {
@@ -1389,6 +1417,21 @@ function currentMonitorAttempt(journal: RunJournal): { task: TaskRecord; index: 
 	return candidates.length === 1 ? candidates[0] : undefined;
 }
 
+function nextSilenceDeadline(journal: RunJournal, attempt: AttemptRecord, now: number): number {
+	const passiveInspectionMs = Math.max(1, journal.run.effectiveSettings.passiveInspectionIntervalSeconds) * 1_000;
+	const secondInspectionMs = Math.max(1, journal.run.effectiveSettings.secondInspectionAndNudgeIntervalSeconds) * 1_000;
+	const nudgeGraceMs = Math.max(1, journal.run.effectiveSettings.nudgeGracePeriodSeconds) * 1_000;
+	const externalWarningMs = Math.max(1, journal.run.effectiveSettings.externalCommandWarningThresholdSeconds) * 1_000;
+	const silence = attempt.recovery?.silence;
+	if (!silence) return now + passiveInspectionMs;
+	if (silence.phase === "waiting-external") return silence.warnedAt ? now + passiveInspectionMs : Date.parse(silence.firstObservedAt) + externalWarningMs;
+	if (silence.phase === "external-grace") return Date.parse(silence.exitedAt) + nudgeGraceMs;
+	if (silence.phase === "suspected" || silence.phase === "inspection-incomplete") return Date.parse(silence.phaseAt) + secondInspectionMs;
+	if (silence.phase === "nudged" || silence.phase === "resumed") return Date.parse(silence.phaseAt) + nudgeGraceMs;
+	if (silence.phase === "interrupted") return now;
+	return now + passiveInspectionMs;
+}
+
 function monitorIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
 	const dispatch = attempt.dispatch;
 	return dispatch.phase === "prompted" || dispatch.phase === "reconciled-active" ? { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId } : undefined;
@@ -1411,7 +1454,10 @@ function monitorFooter(journal: RunJournal, condition: MonitorCondition, diagnos
 	const attention = journal.run.tasks.filter((candidate) => candidate.attention !== "none").length;
 	const phase = task?.phase ?? journal.run.status;
 	const suffix = diagnostic ? ` · ${diagnostic.slice(0, 160)}` : "";
-	return `steward: ${journal.run.id} · ${phase} · ${attention} attention${suffix}`;
+	const attempt = task?.attempts.at(-1);
+	const silence = task && attempt?.recovery?.silence;
+	const silenceSuffix = silence ? ` · silence ${silence.phase} · ${task.attempts.filter((candidate) => candidate.replacement !== undefined).length}/${journal.run.effectiveSettings.transientRetryLimit} · next ${new Date(nextSilenceDeadline(journal, attempt, Date.parse(journal.run.updatedAt))).toISOString()}` : "";
+	return `steward: ${journal.run.id} · ${phase} · ${attention} attention${silenceSuffix}${suffix}`;
 }
 
 async function validateApprovedTasks(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<ReviewDecision> {
@@ -2209,6 +2255,31 @@ function branchForAttempt(task: TaskRecord, attempt: AttemptRecord): string | un
 	return preceding && preceding.role === "builder" && "branch" in preceding.dispatch ? preceding.dispatch.branch : undefined;
 }
 
+function continuationForReplacement(task: TaskRecord, attempt: AttemptRecord): AttemptContinuation {
+	if (!attempt.replacement) throw new Error("Replacement Attempt is missing its durable replacement link.");
+	const predecessor = task.attempts.find((candidate) => candidate.id === attempt.replacement!.replacesAttemptId);
+	if (!predecessor || predecessor.state !== "superseded" || !predecessor.recovery?.preservation) throw new Error("Replacement Attempt is missing the predecessor preservation inspection.");
+	const preservation = predecessor.recovery.preservation;
+	const branch = branchForAttempt(task, predecessor);
+	if (!branch) throw new Error("Replacement Attempt is missing the predecessor branch identity.");
+	return { predecessorAttemptId: predecessor.id, retryOrdinal: attempt.replacement.retryOrdinal, preservedWorktree: { path: preservation.worktreePath, branch, head: preservation.head }, priorAssignmentPath: preservation.assignment.path, priorReportPath: predecessor.reportPath, priorEvidenceDirectory: preservation.evidence.directory };
+}
+
+function continuationMatchesReplacement(task: TaskRecord, attempt: AttemptRecord, continuation: AttemptContinuation | undefined): boolean {
+	if (!attempt.replacement || !continuation) return false;
+	const predecessor = task.attempts.find((candidate) => candidate.id === attempt.replacement?.replacesAttemptId);
+	const preservation = predecessor?.recovery?.preservation;
+	const branch = predecessor ? branchForAttempt(task, predecessor) : undefined;
+	return Boolean(predecessor && preservation && branch && predecessor.state === "superseded" && continuation.predecessorAttemptId === predecessor.id && continuation.retryOrdinal === attempt.replacement.retryOrdinal && continuation.preservedWorktree.path === preservation.worktreePath && continuation.preservedWorktree.branch === branch && continuation.preservedWorktree.head === preservation.head && continuation.priorAssignmentPath === preservation.assignment.path && continuation.priorReportPath === predecessor.reportPath && continuation.priorEvidenceDirectory === preservation.evidence.directory);
+}
+
+function preservationForSilenceSnapshot(task: TaskRecord, attempt: AttemptRecord, snapshot: SilenceInspectionSnapshot, observedAt: string): import("./run.ts").RecoveryPreservation | undefined {
+	const branch = branchForAttempt(task, attempt);
+	const worktreePath = "worktreePath" in attempt.dispatch ? attempt.dispatch.worktreePath : attempt.role === "reviewer" ? attempt.worktree.path : undefined;
+	if (!branch || !worktreePath) return undefined;
+	return { observedAt, worktreePath, branch, head: snapshot.git.head, worktree: snapshot.worktree, git: snapshot.git, assignment: snapshot.assignment, report: snapshot.report, evidence: snapshot.evidence };
+}
+
 function sameFact(left: unknown, right: unknown): boolean {
 	return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -2275,8 +2346,98 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 	};
 
 	const continuePreparedDispatch = async (): Promise<ReconciliationWorkflowResult | undefined> => {
-		if (attempt.state !== "prepared" || attempt.dispatch.phase === "prompt-intended") return undefined;
+		if (attempt.state !== "prepared") return undefined;
+		const markReplacementAmbiguous = async (diagnostic: string): Promise<RunJournal | undefined> => {
+			if (!attempt.replacement) return undefined;
+			const loaded = await dependencies.runJournal.loadActive(repositoryRoot).catch(() => undefined);
+			if (!loaded || loaded.kind !== "loaded") return undefined;
+			const predecessorId = attempt.replacement.replacesAttemptId;
+			const observedAt = transitionTimestamp(loaded.journal, dependencies.clock.now());
+			let candidate: RunJournal;
+			try {
+				candidate = advanceRunJournal(loaded.journal, dependencies.clock.now(), (next) => {
+					const nextTask = next.run.tasks[index];
+					const nextAttempt = nextTask?.attempts.find((item) => item.id === attempt.id);
+					const predecessor = nextTask?.attempts.find((item) => item.id === predecessorId);
+					const existing = predecessor?.recovery?.silence;
+					if (!nextTask || !nextAttempt || nextAttempt.state !== "prepared" || !nextAttempt.replacement || nextAttempt.replacement.replacesAttemptId !== predecessorId || !predecessor || predecessor.state !== "superseded" || !existing) throw new Error("Replacement ambiguity target changed before persistence.");
+					if (existing.phase === "replacement-ambiguous") return;
+					if (existing.phase !== "replacement-intended") throw new Error("Replacement reservation disappeared before ambiguity persistence.");
+					predecessor.recovery = { ...(predecessor.recovery ?? { live: recoveryLiveRecord({ observedAt, kind: "unclear", diagnostic: "Replacement ambiguity recovery observation." }) }), silence: { ...existing, phase: "replacement-ambiguous", phaseAt: observedAt, observedAt, diagnostic: diagnostic.slice(0, 2_000) } };
+					nextTask.attention = "needs-user";
+					nextTask.attentionReason = "silence-effect-ambiguous";
+					nextTask.attentionDiagnostic = "A reserved replacement effect may have occurred without an exact acknowledgement; no replacement effect will be repeated.";
+				});
+		} catch { return undefined; }
+			const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate).catch(() => undefined);
+			return replaced?.kind === "replaced" ? replaced.journal : undefined;
+		};
+		if (attempt.replacement) {
+			const predecessor = task.attempts.find((candidate) => candidate.id === attempt.replacement?.replacesAttemptId);
+			if (predecessor?.recovery?.silence?.phase === "replacement-ambiguous") return { kind: "degraded", journal, note: "The linked replacement has an ambiguity tombstone; no pane, start, Assignment, or prompt effect will be repeated." };
+		}
+		if (attempt.dispatch.phase === "prompt-intended") {
+			if (!attempt.replacement) return undefined;
+			const dispatch = attempt.dispatch;
+			if (!("workspaceId" in dispatch) || !("paneId" in dispatch) || !("terminalId" in dispatch) || !("assignmentSha256" in dispatch)) return { kind: "degraded", journal, note: "The reserved replacement prompt intent lacks an exact resource identity; no prompt was resent." };
+			const identity = { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
+			if (!dependencies.runJournal.inspectAttemptAssignment) return { kind: "degraded", journal, note: "The reserved replacement Assignment cannot be reloaded; no prompt was attempted." };
+			const observed = await dependencies.runJournal.inspectAttemptAssignment({ repositoryRoot, attempt }).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Replacement Assignment inspection failed." } as import("./run-journal-store.ts").AttemptAssignmentInspection));
+			if (observed.kind !== "loaded" || observed.sha256 !== dispatch.assignmentSha256) return { kind: "degraded", journal, note: "The reserved replacement Assignment bytes do not match its prompt intent; no prompt was attempted." };
+			let prompt: string;
+			try {
+				if (attempt.role === "builder") {
+					const assignment = deserializeBuilderAssignment(observed.bytes.toString("utf8"), attempt.assignmentPath).value;
+					if (!assignment) throw new Error("Replacement Builder Assignment is invalid.");
+					prompt = formatBuilderPrompt(assignment);
+				} else {
+					const assignment = deserializeReviewerAssignment(observed.bytes.toString("utf8"), attempt.assignmentPath).value;
+					if (!assignment) throw new Error("Replacement Reviewer Assignment is invalid.");
+					prompt = formatReviewerPrompt(assignment);
+				}
+			} catch (error: unknown) { return { kind: "degraded", journal, note: `The reserved replacement Assignment could not be formatted; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment decode failed."}` }; }
+			let prompted: HerdrPromptResult;
+			try { prompted = dependencies.herdr.promptReplacementAgent ? await dependencies.herdr.promptReplacementAgent({ repositoryRoot, identity, assignmentPrompt: prompt }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Replacement prompt adapter is unavailable." }; }
+			catch (error: unknown) { prompted = { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Replacement prompt failed." }; }
+			const exact = prompted.kind === "prompted" && prompted.name === identity.name && prompted.workspaceId === identity.workspaceId && prompted.paneId === identity.paneId && prompted.terminalId === identity.terminalId;
+			if (!exact) {
+				const ambiguous = await markReplacementAmbiguous(prompted.kind === "failed" ? prompted.message : "Wrong-identity or malformed replacement prompt acknowledgement.");
+				return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? `Replacement Attempt ${attempt.id} prompt delivery is ambiguous; its durable tombstone forbids a resend.` : `Replacement Attempt ${attempt.id} prompt was not proven for the exact identity; its prompt intent is retained and will not be resent.` };
+			}
+			const activatedAt = transitionTimestamp(journal, dependencies.clock.now());
+			const changed = await persist((_nextTask, nextAttempt) => {
+				if (nextAttempt.role !== attempt.role || nextAttempt.state !== "prepared" || nextAttempt.dispatch.phase !== "prompt-intended") throw new Error("Replacement prompt intent disappeared before activation.");
+				nextAttempt.state = "active";
+				nextAttempt.activatedAt = activatedAt;
+				nextAttempt.dispatch = { ...nextAttempt.dispatch, phase: "prompted", promptedAt: activatedAt } as AttemptRecord["dispatch"];
+			});
+			if (changed) return { kind: "changed", journal, note: `Prompted linked replacement Attempt ${attempt.id} once with its immutable continuation Assignment.`, action: "record-observation" };
+			const ambiguous = await markReplacementAmbiguous("Replacement prompt succeeded but activation persistence was ambiguous.");
+			return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "Replacement prompt activation is ambiguous; its durable tombstone forbids a resend." : "Replacement prompt succeeded, but activation could not be persisted; no prompt will be resent." };
+		}
 		const dispatch = attempt.dispatch;
+		if (dispatch.phase === "replacement-pane-intended") {
+			if (!dependencies.herdr.createRecoveryPane || !dependencies.herdr.inspectManagedAgent || !("sourcePaneId" in dispatch) || !("worktreePath" in dispatch)) return { kind: "degraded", journal, note: "The reserved silent replacement is missing its exact no-focus recovery-pane adapter; no pane or agent effect was attempted." };
+			let pane: HerdrReviewerPaneResult;
+			try { pane = await dependencies.herdr.createRecoveryPane({ repositoryRoot, sourcePaneId: dispatch.sourcePaneId, workspaceId: dispatch.workspaceId, worktreePath: dispatch.worktreePath, branch: dispatch.branch, agentName: dispatch.agentName }); }
+			catch (error: unknown) {
+				const ambiguous = await markReplacementAmbiguous(error instanceof Error ? error.message : "Recovery pane split failed.");
+				return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The reserved replacement pane effect is ambiguous; its durable tombstone forbids a second pane split." : "The reserved silent replacement pane could not be created; the same prepared Attempt remains pending." };
+			}
+			if (pane.kind !== "created" || pane.sourcePaneId !== dispatch.sourcePaneId || pane.worktreePath !== dispatch.worktreePath || pane.workspaceId !== dispatch.workspaceId || !validIdentity(pane.paneId) || !validIdentity(pane.terminalId) || !validIdentity(pane.tabId)) {
+				const ambiguous = await markReplacementAmbiguous("Herdr returned a malformed or contradictory recovery-pane identity.");
+				return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The reserved replacement pane acknowledgement is ambiguous; its durable tombstone forbids a second pane split." : "The reserved silent replacement returned a malformed or contradictory pane identity; no resource was adopted." };
+			}
+			const changed = await persist((_nextTask, nextAttempt) => {
+				if (nextAttempt.state !== "prepared" || nextAttempt.dispatch.phase !== "replacement-pane-intended") throw new Error("Reserved silent replacement changed before pane identity persistence.");
+				nextAttempt.dispatch = nextAttempt.role === "builder"
+					? { phase: "agent-intended", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId }
+					: { phase: "agent-intended", agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId, branch: dispatch.branch };
+			});
+			if (changed) return { kind: "changed", journal, note: `Reserved silent replacement Attempt ${attempt.id} now records its exact no-focus pane; no agent was started in this pass.`, action: "record-observation" };
+			const ambiguous = await markReplacementAmbiguous("The recovery pane was created but its exact identity could not be persisted.");
+			return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The replacement pane was created but its identity persistence was ambiguous; no second pane split will occur." : "The replacement pane was created, but its exact identity could not be persisted; no later effect was attempted." };
+		}
 		if (dispatch.phase === "pane-intended") return { kind: "degraded", journal, note: "Reviewer pane creation was interrupted before an exact returned pane identity; the same prepared Attempt is preserved and no second pane was split." };
 
 		if (attempt.role === "builder" && dispatch.phase === "worktree-intended") {
@@ -2311,9 +2472,17 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 			catch (error: unknown) { return { kind: "degraded", journal, note: `Prepared Agent-intended identity inspection failed; no start or Assignment effect was attempted. ${error instanceof Error ? error.message : "Herdr inspection failed."}` }; }
 			if (inspected.kind === "unclear") return { kind: "degraded", journal, note: `Prepared Agent-intended identity is unclear; the same Attempt remains pending. ${inspected.diagnostic}` };
 			if (inspected.kind === "missing") {
-				const started = attempt.role === "builder"
-					? dependencies.herdr.startBuilder ? await dependencies.herdr.startBuilder({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel }) : { kind: "failed", stage: "agent-start", code: "adapter-unavailable", message: "Builder start adapter is unavailable." } as HerdrAgentStartResult
-					: dependencies.herdr.startReviewer ? await dependencies.herdr.startReviewer({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel }) : { kind: "failed", stage: "agent-start", code: "adapter-unavailable", message: "Reviewer start adapter is unavailable." } as HerdrAgentStartResult;
+				let started: HerdrAgentStartResult;
+				try {
+					started = dependencies.herdr.startReplacementAgent && attempt.replacement
+						? await dependencies.herdr.startReplacementAgent({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel })
+						: attempt.role === "builder"
+							? dependencies.herdr.startBuilder ? await dependencies.herdr.startBuilder({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel }) : { kind: "failed", stage: "agent-start", code: "adapter-unavailable", message: "Builder start adapter is unavailable." } as HerdrAgentStartResult
+							: dependencies.herdr.startReviewer ? await dependencies.herdr.startReviewer({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel }) : { kind: "failed", stage: "agent-start", code: "adapter-unavailable", message: "Reviewer start adapter is unavailable." } as HerdrAgentStartResult;
+				} catch (error: unknown) {
+					const ambiguous = await markReplacementAmbiguous(error instanceof Error ? error.message : "Replacement agent start failed.");
+					return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The replacement start effect is ambiguous; its durable tombstone forbids another start." : "The prepared replacement start failed; no later effect was attempted." };
+				}
 				if (started.kind === "name-collision") {
 					const replacement = `${attempt.role === "builder" ? "steward-b" : "steward-r"}-${compactUuid(dependencies.clock)}-${attempt.id.replace(/[^0-9]/g, "") || "01"}`;
 					if (!safeHerdrName(replacement)) return { kind: "degraded", journal, note: "The prepared Attempt's exact name collided, but a safe same-Attempt name could not be derived." };
@@ -2323,7 +2492,10 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 					});
 					return changed ? { kind: "changed", journal, note: `The prepared ${attempt.role} name collided; a new Steward-owned name was retained inside Attempt ${attempt.id} and no other Attempt was created.`, action: "record-observation" } : { kind: "degraded", journal, note: "The prepared Attempt name collision could not be durably reconciled; no second Attempt was created." };
 				}
-				if (started.kind !== "started" || started.name !== identity.name || started.agentKind !== "pi" || started.workspaceId !== identity.workspaceId || started.paneId !== identity.paneId || started.terminalId !== identity.terminalId || !validIdentity(started.tabId)) return { kind: "degraded", journal, note: "The prepared Attempt start envelope was malformed or contradictory; no resource was adopted." };
+				if (started.kind !== "started" || started.name !== identity.name || started.agentKind !== "pi" || started.workspaceId !== identity.workspaceId || started.paneId !== identity.paneId || started.terminalId !== identity.terminalId || !validIdentity(started.tabId)) {
+					const ambiguous = await markReplacementAmbiguous(started.kind === "failed" ? started.message : "The replacement agent start acknowledgement was malformed or contradictory.");
+					return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The replacement start acknowledgement is ambiguous; its durable tombstone forbids another start." : "The prepared Attempt start envelope was malformed or contradictory; no resource was adopted." };
+				}
 				return { kind: "changed", journal, note: `The exact recorded ${attempt.role} resource was missing during its prepared start phase; its same-Attempt start was attempted once and will be re-inspected before any later effect.`, action: "record-observation" };
 			}
 			if (inspected.kind !== "observed" || !exactIdentity(inspected.identity, identity)) return { kind: "degraded", journal, note: "The prepared Attempt resource did not match its exact recorded identity; no adoption or later effect was attempted." };
@@ -2331,14 +2503,19 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 			let assignment: BuilderAssignmentDocument | ReviewerAssignmentDocument;
 			try {
 				if (attempt.role === "builder") {
-					assignment = buildBuilderAssignment({ run: journal.run, task, attempt, worktreePath: dispatch.worktreePath, branch: dispatch.branch, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name });
+					assignment = buildBuilderAssignment({ run: journal.run, task, attempt, worktreePath: dispatch.worktreePath, branch: dispatch.branch, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name, ...(attempt.replacement ? { continuation: continuationForReplacement(task, attempt) } : {}) });
 				} else {
 					const attemptIndex = task.attempts.findIndex((candidateAttempt) => candidateAttempt.id === attempt.id);
-					const builder = attemptIndex > 0 ? task.attempts[attemptIndex - 1] : undefined;
+					const predecessor = attemptIndex > 0 ? task.attempts[attemptIndex - 1] : undefined;
+					const builderIndex = attempt.replacement ? attemptIndex - 2 : attemptIndex - 1;
+					const builder = builderIndex >= 0 ? task.attempts[builderIndex] : undefined;
+					if (attempt.replacement && (!predecessor || predecessor.role !== "reviewer")) return { kind: "degraded", journal, note: "Prepared Reviewer replacement is missing its immediately preceding superseded Reviewer; no prompt was attempted." };
 					if (!builder || builder.role !== "builder" || builder.evidence?.phase !== "finalized") return { kind: "degraded", journal, note: "Prepared Reviewer Assignment cannot be rebuilt without the exact finalized Builder subject; no prompt was attempted." };
-					assignment = buildReviewerAssignment({ runId: journal.run.id, task: task.contract, attempt, manifestPath: builder.evidence.manifestPath, manifestSha256: builder.evidence.manifestSha256, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name });
+					assignment = buildReviewerAssignment({ runId: journal.run.id, task: task.contract, attempt, manifestPath: builder.evidence.manifestPath, manifestSha256: builder.evidence.manifestSha256, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name, ...(attempt.replacement ? { continuation: continuationForReplacement(task, attempt) } : {}) });
 				}
 			} catch (error: unknown) { return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment could not be rebuilt; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment validation failed."}` }; }
+			const continuation = assignment.assignment.continuation;
+			if ((attempt.replacement && !continuationMatchesReplacement(task, attempt, continuation)) || (!attempt.replacement && continuation !== undefined)) return { kind: "degraded", journal, note: "The prepared Assignment continuation did not match the exact replacement predecessor and preservation facts; no prompt was attempted." };
 			let created: AssignmentCreateResult;
 			try { created = await dependencies.runJournal.createAssignment(repositoryRoot, assignment); }
 			catch (error: unknown) { return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment could not be persisted; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment storage failed."}` }; }
@@ -2562,6 +2739,62 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 	}
 
 	return { kind: "none", journal, note: "No reconciliation effect was selected." };
+}
+
+type SilenceInspectionResult =
+	| { kind: "complete"; snapshot: SilenceInspectionSnapshot }
+	| { kind: "incomplete"; snapshot?: SilenceInspectionSnapshot; diagnostic: string };
+
+function silenceHash(value: string): string {
+	return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function silencePrompt(kind: "nudge" | "resume", attempt: AttemptRecord): string {
+	return kind === "nudge"
+		? `STEWARD_SILENCE_NUDGE ${attempt.id}: continue the existing Assignment and write the Attempt Report; do not restart, change scope, or dispatch another agent.`
+		: `STEWARD_SILENCE_RESUME ${attempt.id}: resume the existing Assignment from the preserved worktree and continue the same Attempt; do not restart, change scope, or dispatch another agent.`;
+}
+
+function silenceSourceFacts(snapshot: SilenceInspectionSnapshot): string {
+	return JSON.stringify({ lifecycle: snapshot.lifecycle, stateChangeSequence: snapshot.stateChangeSequence, terminal: snapshot.terminal, worktree: snapshot.worktree, git: snapshot.git, assignment: snapshot.assignment, report: snapshot.report, evidence: snapshot.evidence });
+}
+
+function silenceSnapshotsChanged(previous: SilenceInspectionSnapshot | undefined, next: SilenceInspectionSnapshot): boolean {
+	return previous === undefined || silenceSourceFacts(previous) !== silenceSourceFacts(next);
+}
+
+function silenceProcessChanged(left: SilenceProcessObservation | undefined, right: SilenceProcessObservation): boolean {
+	if (!left || left.kind !== right.kind) return true;
+	if (left.kind === "live-external" && right.kind === "live-external") return left.digest !== right.digest || left.paneId !== right.paneId || left.foregroundProcessGroupId !== right.foregroundProcessGroupId;
+	if (left.kind === "none" && right.kind === "none") return left.digest !== right.digest || left.paneId !== right.paneId;
+	return left.kind !== right.kind;
+}
+
+async function inspectSilenceAttempt(repositoryRoot: string, task: TaskRecord, attempt: AttemptRecord, identity: ManagedAgentIdentity, dependencies: StewardDependencies): Promise<SilenceInspectionResult> {
+	const inspectedAgent = dependencies.herdr.inspectManagedAgent ? await dependencies.herdr.inspectManagedAgent(identity).catch((error: unknown) => ({ kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr inspection failed." } as ManagedAgentInspection)) : { kind: "unclear", diagnostic: "Herdr inspection adapter is unavailable." } as ManagedAgentInspection;
+	const lifecycle = inspectedAgent.kind === "observed" && exactIdentity(inspectedAgent.identity, identity) ? inspectedAgent.lifecycle : "unavailable";
+	const stateChangeSequence = inspectedAgent.kind === "observed" && exactIdentity(inspectedAgent.identity, identity) ? inspectedAgent.stateChangeSequence : null;
+	const diagnostics: string[] = [];
+	if (inspectedAgent.kind !== "observed" || !exactIdentity(inspectedAgent.identity, identity)) diagnostics.push(inspectedAgent.kind === "observed" ? "Herdr returned a different identity." : inspectedAgent.diagnostic);
+	let terminal: MonitorDigest = { kind: "unavailable", diagnostic: "Herdr terminal observation is unavailable." };
+	if (dependencies.herdr.readManagedTerminal) terminal = await dependencies.herdr.readManagedTerminal(identity).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr terminal inspection failed." }));
+	else diagnostics.push("Herdr terminal inspection adapter is unavailable.");
+	let worktree: MonitorDigest = { kind: "unavailable", diagnostic: "Managed worktree inspection is unavailable." };
+	let git: { head: string | null; digest: string | null; diagnostic?: string } = { head: null, digest: null, diagnostic: "Managed Git inspection is unavailable." };
+	const worktreePath = "worktreePath" in attempt.dispatch ? attempt.dispatch.worktreePath : attempt.role === "reviewer" ? attempt.worktree.path : "";
+	if (dependencies.git.inspectManagedWorktreeProgress && worktreePath.length > 0) {
+		const progress = await dependencies.git.inspectManagedWorktreeProgress(worktreePath).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Managed worktree inspection failed." } as ManagedWorktreeProgress));
+		if (progress.kind === "observed") { worktree = progress.worktree; git = { head: progress.git.head, digest: progress.git.digest.kind === "observed" ? progress.git.digest.sha256 : null, ...(progress.git.digest.kind === "unavailable" ? { diagnostic: progress.git.digest.diagnostic } : {}) }; }
+		else { worktree = { kind: "unavailable", diagnostic: progress.diagnostic }; git = { head: null, digest: null, diagnostic: progress.diagnostic }; }
+	} else diagnostics.push("Managed worktree inspection adapter is unavailable.");
+	const preserved = dependencies.runJournal.inspectAttemptPreservation ? await dependencies.runJournal.inspectAttemptPreservation({ repositoryRoot, attempt }).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Attempt preservation inspection failed." } as import("./run-journal-store.ts").AttemptPreservationInspection)) : { kind: "unavailable", diagnostic: "Attempt preservation inspection adapter is unavailable." } as import("./run-journal-store.ts").AttemptPreservationInspection;
+	if (preserved.kind !== "inspected") diagnostics.push(preserved.diagnostic);
+	const process = dependencies.process.inspectAttemptProcesses ? await dependencies.process.inspectAttemptProcesses({ repositoryRoot, identity }).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Process inspection failed." } as SilenceProcessObservation)) : { kind: "unavailable", diagnostic: "Process inspection adapter is unavailable." } as SilenceProcessObservation;
+	if (process.kind === "unavailable") diagnostics.push(process.diagnostic);
+	if (preserved.kind !== "inspected") return { kind: "incomplete", diagnostic: diagnostics.join(" ").slice(0, 2_000) };
+	const snapshot: SilenceInspectionSnapshot = { attemptId: attempt.id, role: attempt.role, agent: { ...identity }, lifecycle, stateChangeSequence, terminal, worktree, git, assignment: preserved.assignment, report: preserved.report, evidence: preserved.evidence, process };
+	if (diagnostics.length > 0 || terminal.kind === "unavailable" || worktree.kind === "unavailable" || git.diagnostic) return { kind: "incomplete", snapshot, diagnostic: diagnostics.join(" ").slice(0, 2_000) || "One or more passive inspection sources were unavailable." };
+	return { kind: "complete", snapshot };
 }
 
 /** Assemble the plain-function orchestration seam without adding lifecycle machinery. */
@@ -2910,14 +3143,236 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	const monitorDependencies: StewardDependencies = { runJournal, herdr, git, process, model, clock, ui };
 
-	function monitorResult(action: MonitorWorkflowAction, journal: RunJournal | undefined, note: string, diagnostic?: string, completed = false, changedSources?: readonly string[]): MonitorPassResult {
+	type SilencePass = { kind: "none" | "changed" | "degraded" | "effect"; journal: RunJournal; note: string; action?: MonitorWorkflowAction; diagnostic?: string; notification?: boolean };
+
+	async function persistSilence(repositoryRoot: string, journal: RunJournal, taskIndex: number, attemptId: string, update: (task: TaskRecord, attempt: AttemptRecord) => void): Promise<RunJournal | undefined> {
+		let candidate: RunJournal;
+		try {
+			candidate = advanceRunJournal(journal, clock.now(), (next) => {
+				const task = next.run.tasks[taskIndex];
+				const attempt = task?.attempts.find((item) => item.id === attemptId);
+				if (!task || !attempt) throw new Error("Silence Attempt disappeared before the durable transition.");
+				update(task, attempt);
+			});
+			} catch { return undefined; }
+		const replaced = await runJournal.replaceActive(repositoryRoot, candidate).catch(() => undefined);
+		return replaced?.kind === "replaced" ? replaced.journal : undefined;
+	}
+
+	function silenceAttention(task: TaskRecord, attention: TaskRecord["attention"], reason?: TaskAttentionReason, diagnostic?: string): void {
+		task.attention = attention;
+		if (reason) task.attentionReason = reason; else delete task.attentionReason;
+		if (diagnostic) task.attentionDiagnostic = diagnostic.slice(0, 2_000); else delete task.attentionDiagnostic;
+	}
+
+	function ticket11Attention(task: TaskRecord): boolean {
+		return task.attention === "waiting-external" || task.attention === "suspected-stall" || (task.attention === "recovering" && task.attentionReason === "silence-effect-ambiguous") || (task.attention === "needs-user" && task.attentionReason === "silence-recovery-exhausted");
+	}
+
+	async function advanceSilenceRecovery(repositoryRoot: string, journalInput: RunJournal, taskIndex: number, taskInput: TaskRecord, attemptInput: AttemptRecord): Promise<SilencePass> {
+		if (!process.inspectAttemptProcesses) return { kind: "none", journal: journalInput, note: "Process observer is not available; ticket-11 silence policy remains dormant for this adapter." };
+		if (!hasProvenAgentIdentity(attemptInput) || attemptInput.state !== "active") return { kind: "none", journal: journalInput, note: "The current Attempt is not an active proven resource for silence recovery." };
+		const identity = attemptIdentity(attemptInput);
+		if (!identity) return { kind: "none", journal: journalInput, note: "The current Attempt has no exact identity for silence recovery." };
+		const inspected = await inspectSilenceAttempt(repositoryRoot, taskInput, attemptInput, identity, monitorDependencies);
+		const existingSilence = attemptInput.recovery?.silence;
+		if (inspected.kind === "incomplete" && !inspected.snapshot) return { kind: "degraded", journal: journalInput, note: `Passive silence inspection was incomplete; no recovery input was attempted. ${inspected.diagnostic}`, diagnostic: inspected.diagnostic };
+		const snapshot = inspected.snapshot;
+		if (!snapshot) return { kind: "degraded", journal: journalInput, note: "Passive silence inspection returned no bounded snapshot; no recovery input was attempted.", diagnostic: "Missing passive silence snapshot." };
+		const now = clock.now().getTime();
+		const nowIso = transitionTimestamp(journalInput, clock.now());
+		const previousSnapshot = existingSilence?.inspection;
+		const sourceChanged = previousSnapshot !== undefined && silenceSnapshotsChanged(previousSnapshot, snapshot);
+		const processObservation = snapshot.process;
+		const priorProcess = previousSnapshot?.process;
+		const processChanged = previousSnapshot !== undefined && silenceProcessChanged(priorProcess, processObservation);
+		const progressChanged = sourceChanged || processChanged;
+		const baseLive = attemptInput.recovery?.live ?? recoveryLiveRecord({ observedAt: nowIso, kind: "working", lifecycle: "working", stateChangeSequence: snapshot.stateChangeSequence });
+		const persistPhase = async (phase: SilencePhase, attention: TaskRecord["attention"], reason?: TaskAttentionReason, diagnostic?: string, preserve?: import("./run.ts").RecoveryPreservation): Promise<RunJournal | undefined> => persistSilence(repositoryRoot, journalInput, taskIndex, attemptInput.id, (task, attempt) => {
+			const existing = attempt.recovery;
+			attempt.recovery = { live: { ...baseLive, observedAt: nowIso, lifecycle: "working", stateChangeSequence: snapshot.stateChangeSequence }, ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), ...(preserve ? { preservation: preserve } : existing?.preservation ? { preservation: existing.preservation } : {}), silence: phase };
+			silenceAttention(task, attention, reason, diagnostic);
+		});
+		if (existingSilence && ["nudge-intended", "nudge-ambiguous", "interrupt-intended", "interrupt-ambiguous", "resume-intended", "resume-ambiguous"].includes(existingSilence.phase)) {
+			if (existingSilence.phase.endsWith("ambiguous") || existingSilence.phase.endsWith("intended") && (inspected.kind !== "complete" || snapshot.process.kind !== "none")) {
+				return { kind: "none", journal: journalInput, note: existingSilence.phase.endsWith("ambiguous") ? "A silence recovery effect is ambiguous; its durable tombstone forbids any resend." : "A silence recovery effect remains unresolved while passive inspection is incomplete or an external process is live; no duplicate input will be sent." };
+			}
+			const observedAt = transitionTimestamp(journalInput, clock.now());
+			const diagnostic = "A prior silence recovery effect has no durable acknowledgement; its external result is ambiguous and will not be repeated.";
+			const ambiguous = await persistSilence(repositoryRoot, journalInput, taskIndex, attemptInput.id, (task, attempt) => {
+				const current = attempt.recovery?.silence;
+				if (!current || current.phase !== existingSilence.phase) throw new Error("Silence effect intent disappeared before ambiguity persistence.");
+				const silence: SilencePhase = current.phase === "nudge-intended"
+					? { ...current, phase: "nudge-ambiguous", phaseAt: observedAt, observedAt, diagnostic }
+					: current.phase === "interrupt-intended"
+						? { ...current, phase: "interrupt-ambiguous", phaseAt: observedAt, observedAt, diagnostic }
+					: current.phase === "resume-intended"
+						? { ...current, phase: "resume-ambiguous", phaseAt: observedAt, observedAt, diagnostic }
+					: current;
+				attempt.recovery = { ...(attempt.recovery ?? { live: baseLive }), live: { ...baseLive, observedAt }, silence };
+				silenceAttention(task, "recovering", "silence-effect-ambiguous", diagnostic);
+			});
+			return ambiguous ? { kind: "changed", journal: ambiguous, note: "A silence recovery intent lacked a durable acknowledgement; ambiguity was recorded and no effect was repeated.", action: "record-observation", diagnostic } : { kind: "degraded", journal: journalInput, note: "A silence recovery intent lacked a durable acknowledgement, but its ambiguity could not be persisted; no effect will be repeated.", diagnostic };
+		}
+
+		if (inspected.kind === "incomplete") {
+			const phase: SilencePhase = { phase: "inspection-incomplete", lastProgressAt: existingSilence?.lastProgressAt ?? attemptInput.activatedAt ?? attemptInput.preparedAt, phaseAt: existingSilence?.phaseAt ?? nowIso, inspection: snapshot, diagnostic: inspected.diagnostic };
+			if (existingSilence?.phase === "inspection-incomplete" && existingSilence.diagnostic === inspected.diagnostic && !sourceChanged) return { kind: "degraded", journal: journalInput, note: `Passive silence inspection remains incomplete; no recovery input was attempted. ${inspected.diagnostic}`, diagnostic: inspected.diagnostic };
+			const persisted = await persistPhase(phase, "suspected-stall", "silence-passive-inspection", inspected.diagnostic);
+			return persisted ? { kind: "changed", journal: persisted, note: `Passive silence inspection is incomplete; recovery effects are forbidden. ${inspected.diagnostic}`, diagnostic: inspected.diagnostic } : { kind: "degraded", journal: journalInput, note: "Incomplete passive silence inspection could not be persisted; no recovery input was attempted.", diagnostic: inspected.diagnostic };
+		}
+
+		if (processObservation.kind === "live-external") {
+			const priorExternalPhase = existingSilence?.phase === "waiting-external" || existingSilence?.phase === "external-grace" ? existingSilence : undefined;
+			const priorLive = priorExternalPhase?.process;
+			const sameProcess = priorLive && priorLive.digest === processObservation.digest && priorLive.paneId === processObservation.paneId && priorLive.foregroundProcessGroupId === processObservation.foregroundProcessGroupId;
+			const firstObservedAt = sameProcess && priorExternalPhase ? priorExternalPhase.firstObservedAt : nowIso;
+			const warnedAt = sameProcess ? priorExternalPhase?.warnedAt : undefined;
+			const warningDue = !warnedAt && now >= new Date(firstObservedAt).getTime() + journalInput.run.effectiveSettings.externalCommandWarningThresholdSeconds * 1_000;
+			const phase: SilencePhase = { phase: "waiting-external", lastProgressAt: existingSilence?.lastProgressAt ?? nowIso, phaseAt: sameProcess && priorExternalPhase ? priorExternalPhase.phaseAt : nowIso, inspection: snapshot, firstObservedAt, lastObservedAt: nowIso, process: processObservation, ...(warningDue ? { warnedAt: nowIso } : warnedAt ? { warnedAt } : {}) };
+			if (!sameProcess || existingSilence?.phase !== "waiting-external" || warningDue) {
+				const persisted = await persistPhase(phase, "waiting-external", "external-process-live", "A foreground external process is live; Steward is waiting without sending input.");
+				return persisted ? { kind: "changed", journal: persisted, note: warningDue ? `External ${processObservation.classification} process remains live; warning threshold reached and no input was sent.` : `External ${processObservation.classification} process is live; deadlines are suspended without input.`, notification: warningDue } : { kind: "degraded", journal: journalInput, note: "External-process waiting state could not be persisted; no input was sent.", diagnostic: "Silence journal CAS failed." };
+			}
+			return { kind: "none", journal: journalInput, note: "The same external process remains live; no input or replacement effect was attempted." };
+		}
+
+		if ((existingSilence?.phase === "waiting-external" || existingSilence?.phase === "external-grace") && priorProcess?.kind === "live-external" && processObservation.kind === "none" && processChanged) {
+			const phase: SilencePhase = { phase: "external-grace", lastProgressAt: existingSilence.lastProgressAt, phaseAt: nowIso, inspection: snapshot, firstObservedAt: existingSilence.firstObservedAt, lastObservedAt: existingSilence.lastObservedAt, exitedAt: nowIso, process: priorProcess, ...(existingSilence.warnedAt ? { warnedAt: existingSilence.warnedAt } : {}) };
+			const persisted = await persistPhase(phase, "waiting-external", "external-process-grace", "The exact external process exited; the grace period is active and no input was sent.");
+			return persisted ? { kind: "changed", journal: persisted, note: "The external process exited; no recovery input is permitted until the grace period ends." } : { kind: "degraded", journal: journalInput, note: "External-process grace could not be persisted; no input was sent.", diagnostic: "Silence journal CAS failed." };
+		}
+
+		const priorPhase = existingSilence?.phase;
+		if (priorPhase === "external-grace") {
+			const graceDeadline = new Date(existingSilence.exitedAt).getTime() + journalInput.run.effectiveSettings.nudgeGracePeriodSeconds * 1_000;
+			if (now < graceDeadline) return { kind: "none", journal: journalInput, note: "External-process grace remains active; no recovery input was attempted." };
+			if (!sourceChanged && existingSilence.inspection.process.kind === "none") {
+				const phase: SilencePhase = { phase: "suspected", lastProgressAt: existingSilence.lastProgressAt, phaseAt: nowIso, inspection: snapshot };
+				const persisted = await persistPhase(phase, "suspected-stall", "silence-passive-inspection", "External-process grace ended; a fresh unchanged passive inspection found no external process.");
+				return persisted ? { kind: "changed", journal: persisted, note: "External-process grace ended; suspected-stall was durably recorded without input." } : { kind: "degraded", journal: journalInput, note: "Post-grace suspected-stall state could not be persisted; no input was sent." };
+			}
+		}
+		if (progressChanged && priorPhase && priorPhase !== "external-grace") {
+			const cleared = await persistSilence(repositoryRoot, journalInput, taskIndex, attemptInput.id, (task, attempt) => {
+				const existing = attempt.recovery;
+				if (existing) { delete existing.silence; attempt.recovery = { ...existing, live: { ...existing.live, observedAt: nowIso, stateChangeSequence: snapshot.stateChangeSequence } }; }
+				else attempt.recovery = { live: { ...baseLive, observedAt: nowIso, stateChangeSequence: snapshot.stateChangeSequence } };
+				if (ticket11Attention(task)) silenceAttention(task, "none");
+			});
+			return cleared ? { kind: "changed", journal: cleared, note: "Authoritative progress changed during passive inspection; the silence ladder was reset without input." } : { kind: "degraded", journal: journalInput, note: "Authoritative progress changed, but the silence reset could not be persisted; no input was attempted." };
+		}
+
+		const lastProgressAt = existingSilence?.lastProgressAt ?? attemptInput.recovery?.live.observedAt ?? attemptInput.activatedAt ?? attemptInput.preparedAt;
+		const phaseAt = existingSilence?.phaseAt ?? lastProgressAt;
+		const base = { now, passiveInspectionMs: journalInput.run.effectiveSettings.passiveInspectionIntervalSeconds * 1_000, secondInspectionMs: journalInput.run.effectiveSettings.secondInspectionAndNudgeIntervalSeconds * 1_000, nudgeGraceMs: journalInput.run.effectiveSettings.nudgeGracePeriodSeconds * 1_000, externalWarningMs: journalInput.run.effectiveSettings.externalCommandWarningThresholdSeconds * 1_000, lastProgressAt: new Date(lastProgressAt).getTime(), phaseAt: new Date(phaseAt).getTime(), retryOrdinal: journalInput.run.tasks[taskIndex]?.attempts.filter((item) => item.replacement).length ?? 0, retryLimit: journalInput.run.effectiveSettings.transientRetryLimit, process: "none" as const, unchanged: !sourceChanged && !processChanged };
+		const decision = decideSilenceRecovery({ ...base, phase: priorPhase === "suspected" ? "suspected" : priorPhase === "nudged" ? "nudged" : priorPhase === "interrupted" ? "interrupted" : priorPhase === "resumed" ? "resumed" : "none" });
+		if (decision.kind === "wait" || decision.kind === "inspection-incomplete") return { kind: "none", journal: journalInput, note: "Passive inspection is unchanged but no silence recovery deadline is due." };
+		if (decision.kind === "suspect") {
+			const phase: SilencePhase = { phase: "suspected", lastProgressAt, phaseAt: nowIso, inspection: snapshot };
+			const persisted = await persistPhase(phase, "suspected-stall", "silence-passive-inspection", "No authoritative progress was observed after the passive inspection interval.");
+			return persisted ? { kind: "changed", journal: persisted, note: "No authoritative progress was observed; suspected-stall was recorded without input." } : { kind: "degraded", journal: journalInput, note: "Suspected-stall could not be persisted; no input was sent." };
+		}
+		if (decision.kind === "nudge") {
+			const prompt = silencePrompt("nudge", attemptInput);
+			const intended: SilencePhase = { phase: "nudge-intended", lastProgressAt, phaseAt: nowIso, inspection: snapshot, target: identity, intendedAt: nowIso, promptSha256: silenceHash(prompt) };
+			const intentJournal = await persistPhase(intended, "suspected-stall", "silence-passive-inspection");
+			if (!intentJournal) return { kind: "degraded", journal: journalInput, note: "Status-nudge intent could not be persisted; no input was sent.", diagnostic: "Silence journal CAS failed." };
+			let result: HerdrPromptResult;
+			try { result = herdr.nudgeAgent ? await herdr.nudgeAgent({ repositoryRoot, identity, prompt }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Status-nudge adapter is unavailable." }; }
+			catch (error: unknown) { result = { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Status nudge failed." }; }
+			const exact = result.kind === "prompted" && result.name === identity.name && result.workspaceId === identity.workspaceId && result.paneId === identity.paneId && result.terminalId === identity.terminalId;
+			const observedAt = transitionTimestamp(intentJournal, clock.now());
+			const recorded = await persistSilence(repositoryRoot, intentJournal, taskIndex, attemptInput.id, (task, attempt) => {
+				const current = attempt.recovery?.silence;
+				if (!current || current.phase !== "nudge-intended") throw new Error("Status-nudge intent disappeared before acknowledgement.");
+				attempt.recovery = { ...(attempt.recovery ?? { live: baseLive }), live: { ...baseLive, observedAt }, silence: exact ? { ...current, phase: "nudged", phaseAt: observedAt, nudgedAt: observedAt } : { ...current, phase: "nudge-ambiguous", phaseAt: observedAt, observedAt, diagnostic: result.kind === "failed" ? result.message : "Wrong-identity status-nudge acknowledgement." } };
+				if (!exact) silenceAttention(task, "recovering", "silence-effect-ambiguous", "Status-nudge acknowledgement was not proven; no duplicate nudge will be sent.");
+			});
+			return recorded ? { kind: "effect", journal: recorded, note: exact ? "One exact same-agent status nudge was acknowledged; no retry was consumed." : "Status-nudge delivery is ambiguous; its durable tombstone forbids a resend.", action: "silence-nudge" } : { kind: "degraded", journal: intentJournal, note: "Status nudge was attempted, but its acknowledgement state could not be persisted; no resend will occur.", diagnostic: "Silence acknowledgement CAS failed." };
+		}
+		if (decision.kind === "interrupt") {
+			const intended: SilencePhase = { phase: "interrupt-intended", lastProgressAt, phaseAt: nowIso, inspection: snapshot, target: identity, intendedAt: nowIso };
+			const intentJournal = await persistPhase(intended, "suspected-stall", "silence-passive-inspection");
+			if (!intentJournal) return { kind: "degraded", journal: journalInput, note: "Logical Escape intent could not be persisted; no input was sent.", diagnostic: "Silence journal CAS failed." };
+			let result: HerdrInputResult;
+			try { result = herdr.interruptAgent ? await herdr.interruptAgent({ repositoryRoot, identity }) : { kind: "failed", message: "Logical Escape adapter is unavailable." }; }
+			catch (error: unknown) { result = { kind: "ambiguous", message: error instanceof Error ? error.message : "Logical Escape failed." }; }
+			const exact = result.kind === "acknowledged" && exactIdentity(result.identity, identity);
+			const observedAt = transitionTimestamp(intentJournal, clock.now());
+			const recorded = await persistSilence(repositoryRoot, intentJournal, taskIndex, attemptInput.id, (task, attempt) => {
+				const current = attempt.recovery?.silence;
+				if (!current || current.phase !== "interrupt-intended") throw new Error("Logical Escape intent disappeared before acknowledgement.");
+				attempt.recovery = { ...(attempt.recovery ?? { live: baseLive }), live: { ...baseLive, observedAt }, silence: exact ? { ...current, phase: "interrupted", phaseAt: observedAt, interruptedAt: observedAt } : { ...current, phase: "interrupt-ambiguous", phaseAt: observedAt, observedAt, diagnostic: result.kind !== "acknowledged" ? result.message : "Wrong-identity Logical Escape acknowledgement." } };
+				if (!exact) silenceAttention(task, "recovering", "silence-effect-ambiguous", "Logical Escape acknowledgement was not proven; no duplicate input will be sent.");
+			});
+			return recorded ? { kind: "effect", journal: recorded, note: exact ? "One logical Escape was acknowledged for the exact same agent; no signal or process kill was used." : "Logical Escape delivery is ambiguous; its durable tombstone forbids a resend.", action: "silence-interrupt" } : { kind: "degraded", journal: intentJournal, note: "Logical Escape was attempted, but its acknowledgement state could not be persisted; no resend will occur.", diagnostic: "Silence acknowledgement CAS failed." };
+		}
+		if (decision.kind === "resume") {
+			const prompt = silencePrompt("resume", attemptInput);
+			const intended: SilencePhase = { phase: "resume-intended", lastProgressAt, phaseAt: nowIso, inspection: snapshot, target: identity, intendedAt: nowIso, promptSha256: silenceHash(prompt) };
+			const intentJournal = await persistPhase(intended, "suspected-stall", "silence-passive-inspection");
+			if (!intentJournal) return { kind: "degraded", journal: journalInput, note: "Same-agent resume intent could not be persisted; no input was sent.", diagnostic: "Silence journal CAS failed." };
+			let result: HerdrPromptResult;
+			try { result = herdr.resumeAgent ? await herdr.resumeAgent({ repositoryRoot, identity, prompt }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Same-agent resume adapter is unavailable." }; }
+			catch (error: unknown) { result = { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Same-agent resume failed." }; }
+			const exact = result.kind === "prompted" && result.name === identity.name && result.workspaceId === identity.workspaceId && result.paneId === identity.paneId && result.terminalId === identity.terminalId;
+			const observedAt = transitionTimestamp(intentJournal, clock.now());
+			const recorded = await persistSilence(repositoryRoot, intentJournal, taskIndex, attemptInput.id, (task, attempt) => {
+				const current = attempt.recovery?.silence;
+				if (!current || current.phase !== "resume-intended") throw new Error("Same-agent resume intent disappeared before acknowledgement.");
+				attempt.recovery = { ...(attempt.recovery ?? { live: baseLive }), live: { ...baseLive, observedAt }, silence: exact ? { ...current, phase: "resumed", phaseAt: observedAt, resumedAt: observedAt } : { ...current, phase: "resume-ambiguous", phaseAt: observedAt, observedAt, diagnostic: result.kind === "failed" ? result.message : "Wrong-identity same-agent resume acknowledgement." } };
+				if (!exact) silenceAttention(task, "recovering", "silence-effect-ambiguous", "Same-agent resume acknowledgement was not proven; no duplicate resume will be sent.");
+			});
+			return recorded ? { kind: "effect", journal: recorded, note: exact ? "The same exact agent was resumed once; no retry was consumed." : "Same-agent resume delivery is ambiguous; its durable tombstone forbids a resend.", action: "silence-resume" } : { kind: "degraded", journal: intentJournal, note: "Same-agent resume was attempted, but its acknowledgement state could not be persisted; no resend will occur.", diagnostic: "Silence acknowledgement CAS failed." };
+		}
+		if (decision.kind === "exhausted") {
+			const phase: SilencePhase = { phase: "exhausted", lastProgressAt, phaseAt, inspection: snapshot, retryOrdinal: (base.retryOrdinal ?? 0) + 1 };
+			const persisted = await persistPhase(phase, "needs-user", "silence-recovery-exhausted", "The frozen silent-agent replacement limit is exhausted; all existing work and resources were retained.");
+			return persisted ? { kind: "changed", journal: persisted, note: "Silent-agent recovery is exhausted; no replacement or destructive effect was attempted." } : { kind: "degraded", journal: journalInput, note: "Silent-agent exhaustion could not be persisted; no replacement was attempted." };
+		}
+		if (decision.kind === "replace") {
+			const predecessor = attemptInput;
+			const ordinal = decision.retryOrdinal;
+			const preserved = preservationForSilenceSnapshot(taskInput, predecessor, snapshot, nowIso);
+			const branch = branchForAttempt(taskInput, predecessor);
+			if (!preserved || !branch) return { kind: "degraded", journal: journalInput, note: "Replacement was due, but exact preservation/worktree identity was unavailable; no replacement was reserved." };
+			const nextAttemptId = `attempt-${String(taskInput.attempts.length + 1).padStart(2, "0")}`;
+			const paths = runJournal.resolveAssignmentPaths(repositoryRoot, journalInput.run.id, taskInput.contract.id, nextAttemptId);
+			const replacementName = `${predecessor.role === "builder" ? "steward-b" : "steward-r"}-${compactUuid(clock)}-${nextAttemptId.replace(/[^0-9]/g, "")}`;
+			if (!safeHerdrName(replacementName)) return { kind: "degraded", journal: journalInput, note: "A safe Steward-owned replacement name could not be derived; no replacement was reserved." };
+			const replacement: AttemptReplacement = { kind: "silent-agent-recovery", replacesAttemptId: predecessor.id, retryOrdinal: ordinal as 1 | 2, preservedAt: nowIso };
+			const replacementDispatch = predecessor.role === "builder"
+				? { phase: "replacement-pane-intended" as const, branch, worktreePath: preserved.worktreePath, agentName: replacementName, sourcePaneId: predecessor.dispatch.paneId, workspaceId: predecessor.dispatch.workspaceId }
+				: { phase: "replacement-pane-intended" as const, sourcePaneId: predecessor.dispatch.paneId, worktreePath: preserved.worktreePath, agentName: replacementName, branch, workspaceId: predecessor.dispatch.workspaceId };
+			let reserved: RunJournal | undefined;
+			try {
+				reserved = await persistSilence(repositoryRoot, journalInput, taskIndex, predecessor.id, (task, attempt) => {
+					if (attempt.role !== predecessor.role || attempt.state !== predecessor.state || attempt.id !== predecessor.id) throw new Error("Replacement predecessor changed before reservation.");
+					attempt.state = "superseded";
+					const existing = attempt.recovery;
+					attempt.recovery = { live: { ...baseLive, observedAt: nowIso }, ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), preservation: preserved, silence: { phase: "replacement-intended", lastProgressAt, phaseAt, inspection: snapshot, target: identity, intendedAt: nowIso, retryOrdinal: ordinal } };
+					const nextAttempt: AttemptRecord = predecessor.role === "builder"
+						? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, specificationHash: predecessor.specificationHash, baseRevision: predecessor.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
+						: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, specificationHash: predecessor.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: predecessor.subject, independence: { ...predecessor.independence }, worktree: { path: predecessor.worktree.path, baseline: { ...predecessor.worktree.baseline, dirtyPaths: [...predecessor.worktree.baseline.dirtyPaths], operationMarkers: [...predecessor.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
+					task.attempts.push(nextAttempt);
+					silenceAttention(task, "none");
+				});
+			} catch (error: unknown) { return { kind: "degraded", journal: journalInput, note: `Silent replacement reservation failed; no pane or prompt effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}`, diagnostic: "Replacement reservation failed." }; }
+			if (!reserved) return { kind: "degraded", journal: journalInput, note: "Silent replacement reservation lost a Journal race; no pane or prompt effect was attempted.", diagnostic: "Replacement reservation CAS failed." };
+			return { kind: "effect", journal: reserved, note: `Reserved linked silent replacement Attempt ${nextAttemptId} at retry ordinal ${ordinal}; no pane was created in this pass.`, action: "reserve-silent-replacement" };
+		}
+		return { kind: "none", journal: journalInput, note: "Silence recovery has no due effect." };
+	}
+
+	function monitorResult(action: MonitorWorkflowAction, journal: RunJournal | undefined, note: string, diagnostic?: string, completed = false, changedSources?: readonly string[], notification?: boolean): MonitorPassResult {
 		let condition: MonitorCondition;
 		if (completed || journal?.run.status === "completed" || journal?.run.completion?.phase === "archived") condition = "completed";
 		else if (journal?.run.tasks.some((task) => task.attention === "needs-user" && task.attentionReason === "review-approval-required") || action === "approval-required") condition = "approval-required";
 		else if (journal?.run.tasks.some((task) => task.attention !== "none") || action === "blocked") condition = "blocked";
 		else if (diagnostic || action === "degraded") condition = "degraded";
 		else condition = "ordinary";
-		return { action, ...(journal ? { journal } : {}), note, condition, ...(diagnostic ? { diagnostic } : {}), ...(completed ? { completed: true } : {}), ...(changedSources ? { changedSources: [...changedSources] } : {}) };
+		return { action, ...(journal ? { journal } : {}), note, condition, ...(diagnostic ? { diagnostic } : {}), ...(completed ? { completed: true } : {}), ...(changedSources ? { changedSources: [...changedSources] } : {}), ...(notification !== undefined ? { notification } : {}) };
 	}
 
 	function observationIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
@@ -2974,31 +3429,35 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return monitorResult(degraded ? "degraded" : "record-observation", replaced.journal, `Observed Attempt ${selected.attempt.id}: ${changedSources.join(", ")}.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
 	}
 
-	async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
+		async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind !== "loaded" || loaded.journal.run.controllerSessionId !== controllerSessionId || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active Controller-owned Run is available for a lifecycle wait." };
 		const selected = currentMonitorAttempt(loaded.journal);
 		const identity = selected ? observationIdentity(selected.attempt) : undefined;
 		if (!identity || !herdr.inspectManagedAgent || !herdr.waitForManagedAgent) return { kind: "unavailable", diagnostic: "The current prompted Attempt or Herdr lifecycle wait is unavailable." };
-		const interval = Math.max(1, loaded.journal.run.effectiveSettings.passiveInspectionIntervalSeconds) * 1_000;
+		const waitForDeadline = async (): Promise<"timeout" | "cancelled"> => {
+			const remaining = nextSilenceDeadline(loaded.journal, selected!.attempt, clock.now().getTime()) - clock.now().getTime();
+			if (remaining <= 0) return "timeout";
+			try { if (clock.wait) await clock.wait(remaining, signal); } catch { return "cancelled"; }
+			return "timeout";
+		};
 		let inspected: ManagedAgentInspection;
 		try { inspected = await herdr.inspectManagedAgent(identity); } catch {
-			try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
-			return { kind: "timeout" };
+			return { kind: await waitForDeadline() };
 		}
 		if (inspected.kind !== "observed") {
-			try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
-			return { kind: "timeout" };
+			return { kind: await waitForDeadline() };
 		}
 		if (inspected.lifecycle !== "working") {
-			try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
-			return { kind: "timeout" };
+			return { kind: await waitForDeadline() };
 		}
 		if (signal.aborted) return { kind: "cancelled" };
+		const waitMs = nextSilenceDeadline(loaded.journal, selected!.attempt, clock.now().getTime()) - clock.now().getTime();
+		if (waitMs <= 0) return { kind: "timeout" };
 		try {
-			const waited = await herdr.waitForManagedAgent(identity, Math.min(interval, 30_000), signal);
+			const waited = await herdr.waitForManagedAgent(identity, Math.min(waitMs, 30_000), signal);
 			if (waited.kind === "timeout" || waited.kind === "unavailable") {
-				try { if (clock.wait) await clock.wait(interval, signal); } catch { return { kind: "cancelled" }; }
+				try { if (clock.wait) await clock.wait(waitMs, signal); } catch { return { kind: "cancelled" }; }
 			}
 			return waited.kind === "unavailable" ? { kind: "timeout" } : waited;
 		} catch (error: unknown) { return signal.aborted || (error instanceof Error && error.name === "AbortError") ? { kind: "cancelled" } : { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr lifecycle wait failed." }; }
@@ -3056,6 +3515,22 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			const degraded = activityDegraded(journal, decision.note || "Builder evidence decision completed.");
 			if (degraded) return degraded;
 			if (journal.journalRevision !== beforeRevision) return monitorResult("finalize-builder-evidence", journal, decision.note || "Builder evidence was durably finalized.");
+		}
+		const silenceCandidate = reconciliationCandidate(journal);
+		if (silenceCandidate && !("ambiguous" in silenceCandidate)) {
+			const silence = await advanceSilenceRecovery(repositoryRoot, journal, silenceCandidate.index, silenceCandidate.task, silenceCandidate.attempt);
+			if (silence.kind !== "none") {
+				let diagnostic = silence.diagnostic;
+				if (silence.journal.journalRevision !== journal.journalRevision) {
+					try {
+						const activityResult = await runJournal.appendActivity(repositoryRoot, { timestamp: silence.journal.run.updatedAt, runId: silence.journal.run.id, event: "silence-recovery-observed", message: silence.note });
+						if (activityResult.kind !== "appended") diagnostic = diagnostic ?? "Activity append failed after authoritative silence recovery persistence.";
+					} catch (error: unknown) {
+						diagnostic = diagnostic ?? (error instanceof Error ? error.message.slice(0, 2_000) : "Activity append failed after authoritative silence recovery persistence.");
+					}
+				}
+				return monitorResult(silence.action ?? (silence.kind === "degraded" ? "degraded" : "record-observation"), silence.journal, silence.note, diagnostic, false, undefined, silence.notification);
+			}
 		}
 		const beforeApprovalRevision = journal.journalRevision;
 		const approval = await validateApprovedTasks(repositoryRoot, journal, deps);

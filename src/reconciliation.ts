@@ -55,6 +55,70 @@ export function decideReconciliation(facts: ReconciliationFacts): Reconciliation
 	return { kind: "none" };
 }
 
+export type SilenceRecoveryDecision =
+	| { kind: "wait"; deadline: number }
+	| { kind: "suspect" }
+	| { kind: "warn-external" }
+	| { kind: "external-grace" }
+	| { kind: "nudge" }
+	| { kind: "interrupt" }
+	| { kind: "resume" }
+	| { kind: "replace"; retryOrdinal: number }
+	| { kind: "exhausted" }
+	| { kind: "inspection-incomplete" };
+
+export interface SilenceRecoveryTiming {
+	now: number;
+	passiveInspectionMs: number;
+	secondInspectionMs: number;
+	nudgeGraceMs: number;
+	externalWarningMs: number;
+	lastProgressAt: number;
+	phaseAt: number;
+	phase: "none" | "suspected" | "nudged" | "interrupted" | "resumed" | "waiting-external" | "external-grace" | "incomplete";
+	externalFirstObservedAt?: number;
+	externalExitedAt?: number;
+	warnedExternal?: boolean;
+	retryOrdinal?: number;
+	retryLimit: number;
+	process: "none" | "live" | "unavailable";
+	unchanged: boolean;
+}
+
+/** Pure deadline/rung selection for ticket-11. No adapter or mutation authority. */
+export function decideSilenceRecovery(input: SilenceRecoveryTiming): SilenceRecoveryDecision {
+	if (input.process === "live") {
+		if (input.externalFirstObservedAt !== undefined && !input.warnedExternal && input.now >= input.externalFirstObservedAt + input.externalWarningMs) return { kind: "warn-external" };
+		return { kind: "wait", deadline: (input.externalFirstObservedAt ?? input.now) + input.externalWarningMs };
+	}
+	if (input.process === "unavailable") return { kind: "inspection-incomplete" };
+	if (!input.unchanged) return { kind: "wait", deadline: input.now + input.passiveInspectionMs };
+	if (input.phase === "external-grace") {
+		const deadline = (input.externalExitedAt ?? input.now) + input.nudgeGraceMs;
+		return input.now < deadline ? { kind: "wait", deadline } : { kind: "suspect" };
+	}
+	if (input.phase === "none") {
+		const deadline = input.lastProgressAt + input.passiveInspectionMs;
+		return input.now < deadline ? { kind: "wait", deadline } : { kind: "suspect" };
+	}
+	if (input.phase === "suspected" || input.phase === "incomplete") {
+		const deadline = input.phaseAt + input.secondInspectionMs;
+		return input.now < deadline ? { kind: "wait", deadline } : { kind: "nudge" };
+	}
+	if (input.phase === "nudged") {
+		const deadline = input.phaseAt + input.nudgeGraceMs;
+		return input.now < deadline ? { kind: "wait", deadline } : { kind: "interrupt" };
+	}
+	if (input.phase === "interrupted") return { kind: "resume" };
+	if (input.phase === "resumed") {
+		const deadline = input.phaseAt + input.nudgeGraceMs;
+		if (input.now < deadline) return { kind: "wait", deadline };
+		const ordinal = (input.retryOrdinal ?? 0) + 1;
+		return ordinal > input.retryLimit ? { kind: "exhausted" } : { kind: "replace", retryOrdinal: ordinal };
+	}
+	return { kind: "wait", deadline: input.now + input.passiveInspectionMs };
+}
+
 export interface TaskFactRequest {
 	schemaVersion: 1;
 	field: TaskFactKey;

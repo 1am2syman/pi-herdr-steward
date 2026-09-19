@@ -44,6 +44,9 @@ import type {
 	MonitorWaitResult,
 	ManagedWorktreeProgress,
 	HerdrTaskFactAnswerResult,
+	HerdrInputResult,
+	HerdrPromptResult,
+	SilenceProcessObservation,
 } from "./steward.ts";
 import type { ReviewerChoiceInspection } from "./review.ts";
 import { parseTaskFactRequest, type TaskFactRequestResult } from "./reconciliation.ts";
@@ -435,6 +438,26 @@ function exactPiArgv(value: unknown, model: ModelChoice): boolean {
 	return JSON.stringify(value) === JSON.stringify(expected) || JSON.stringify(value) === JSON.stringify(["pi", ...expected]);
 }
 
+function exactPromptAcknowledgement(result: ExecResult, identity: ManagedAgentIdentity): HerdrPromptResult | undefined {
+	const envelope = safeEnvelope(result);
+	const value = resultObject(envelope);
+	const actual = identityFields(objectValue(value?.agent));
+	if (envelope?.id === "cli:agent:prompt" && value?.type === "agent_prompted" && actual && actual.name === identity.name && actual.workspaceId === identity.workspaceId && actual.paneId === identity.paneId && actual.terminalId === identity.terminalId) return { kind: "prompted", name: actual.name, workspaceId: actual.workspaceId, tabId: actual.tabId, paneId: actual.paneId, terminalId: actual.terminalId };
+	return undefined;
+}
+
+function exactKeysAcknowledgement(result: ExecResult, identity: ManagedAgentIdentity): HerdrInputResult | undefined {
+	const envelope = safeEnvelope(result);
+	const value = resultObject(envelope);
+	const actual = identityFields(objectValue(value?.agent));
+	if (envelope?.id === "cli:agent:send-keys" && value?.type === "agent_keys_sent" && actual && actual.name === identity.name && actual.workspaceId === identity.workspaceId && actual.paneId === identity.paneId && actual.terminalId === identity.terminalId) return { kind: "acknowledged", identity: { ...identity } };
+	return undefined;
+}
+
+function exactIdentityForAdapter(left: ManagedAgentIdentity, right: ManagedAgentIdentity): boolean {
+	return left.name === right.name && left.workspaceId === right.workspaceId && left.paneId === right.paneId && left.terminalId === right.terminalId;
+}
+
 export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerdrAdapter {
 	return {
 		async checkAvailability(repositoryRoot) {
@@ -648,6 +671,68 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 				return { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr terminal read failed." };
 			}
 		},
+		async nudgeAgent(input) {
+			if (!exec || input.prompt.length === 0 || input.prompt.length > 16 * 1024 || input.prompt !== input.prompt.trim()) return { kind: "failed", stage: "agent-prompt", code: "invalid-input", message: "Status nudge prompt is not bounded and canonical." };
+			try {
+				const inspected = await this.inspectManagedAgent!(input.identity);
+				if (inspected.kind !== "observed" || !exactIdentityForAdapter(inspected.identity, input.identity)) return { kind: "failed", stage: "agent-prompt", code: "identity-mismatch", message: "The exact recorded agent was not preflighted before status nudge." };
+				const result = await exec("herdr", ["agent", "prompt", input.identity.name, input.prompt], { cwd: input.repositoryRoot, timeout: 30_000 });
+				return exactPromptAcknowledgement(result, input.identity) ?? { kind: "failed", stage: "agent-prompt", code: result.killed ? "killed" : "ambiguous-response", message: "Herdr returned no exact same-identity status-nudge acknowledgement." };
+			} catch (error: unknown) { return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Status nudge failed." }; }
+		},
+		async interruptAgent(input) {
+			if (!exec) return { kind: "failed", message: "The Pi command runner is unavailable." };
+			try {
+				const inspected = await this.inspectManagedAgent!(input.identity);
+				if (inspected.kind !== "observed" || !exactIdentityForAdapter(inspected.identity, input.identity)) return { kind: "failed", message: "The exact recorded agent was not preflighted before logical Escape." };
+				const result = await exec("herdr", ["agent", "send-keys", input.identity.name, "esc"], { cwd: input.repositoryRoot, timeout: 5_000 });
+				return exactKeysAcknowledgement(result, input.identity) ?? { kind: result.killed ? "ambiguous" : "failed", message: "Herdr returned no exact same-identity Escape acknowledgement." };
+			} catch (error: unknown) { return { kind: "ambiguous", message: error instanceof Error ? error.message : "Logical Escape failed." }; }
+		},
+		async resumeAgent(input) {
+			if (!exec || input.prompt.length === 0 || input.prompt.length > 16 * 1024 || input.prompt !== input.prompt.trim()) return { kind: "failed", stage: "agent-prompt", code: "invalid-input", message: "Resume prompt is not bounded and canonical." };
+			try {
+				const inspected = await this.inspectManagedAgent!(input.identity);
+				if (inspected.kind !== "observed" || !exactIdentityForAdapter(inspected.identity, input.identity)) return { kind: "failed", stage: "agent-prompt", code: "identity-mismatch", message: "The exact recorded agent was not preflighted before resume." };
+				const result = await exec("herdr", ["agent", "prompt", input.identity.name, input.prompt], { cwd: input.repositoryRoot, timeout: 30_000 });
+				return exactPromptAcknowledgement(result, input.identity) ?? { kind: "failed", stage: "agent-prompt", code: result.killed ? "killed" : "ambiguous-response", message: "Herdr returned no exact same-identity resume acknowledgement." };
+			} catch (error: unknown) { return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Same-agent resume failed." }; }
+		},
+		async createRecoveryPane(input) {
+			if (!exec) return { kind: "failed", stage: "pane-split", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			try {
+				const result = await exec("herdr", ["pane", "split", "--pane", input.sourcePaneId, "--direction", "right", "--cwd", input.worktreePath, "--no-focus"], { cwd: input.repositoryRoot, timeout: 30_000 });
+				const envelope = safeEnvelope(result);
+				const value = resultObject(envelope);
+				const pane = objectValue(value?.pane);
+				if (envelope?.id === "cli:pane:split" && value?.type === "pane_split" && pane && safeIdentity(pane.workspace_id) && safeIdentity(pane.tab_id) && safeIdentity(pane.pane_id) && safeIdentity(pane.terminal_id) && pane.workspace_id === input.workspaceId && pane.source_pane_id === input.sourcePaneId && pane.cwd === input.worktreePath) return { kind: "created", workspaceId: pane.workspace_id, tabId: pane.tab_id, paneId: pane.pane_id, terminalId: pane.terminal_id, sourcePaneId: input.sourcePaneId, worktreePath: input.worktreePath };
+				const error = safeErrorEnvelope(result);
+				return { kind: "failed", stage: "pane-split", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid no-focus recovery pane envelope." };
+			} catch (error: unknown) { return { kind: "failed", stage: "pane-split", code: "runner-error", message: error instanceof Error ? error.message : "Recovery pane split failed." }; }
+		},
+		async startReplacementAgent(input) {
+			if (!exec) return { kind: "failed", stage: "agent-start", code: "runner-unavailable", message: "The Pi command runner is unavailable." };
+			try {
+				const result = await exec("herdr", ["agent", "start", input.name, "--kind", "pi", "--pane", input.paneId, "--timeout", "30000", "--", "--model", input.model.model, "--thinking", input.model.thinkingLevel], { cwd: input.repositoryRoot, timeout: 30_000 });
+				const collision = safeErrorEnvelope(result);
+				if (collision?.id === "cli:agent:start" && collision.code === "agent_name_taken") return { kind: "name-collision", code: "agent_name_taken", message: collision.message };
+				const envelope = safeEnvelope(result);
+				const value = resultObject(envelope);
+				const agent = objectValue(value?.agent);
+				const identity = identityFields(agent);
+				if (envelope?.id === "cli:agent:start" && value?.type === "agent_started" && identity && identity.name === input.name && identity.paneId === input.paneId && agent?.agent === "pi" && agent.agent_status === "idle" && agent.interactive_ready === true && exactPiArgv(agent.argv, input.model)) return { kind: "started", agentKind: "pi", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+				return { kind: "failed", stage: "agent-start", code: collision?.code ?? (result.killed ? "killed" : "malformed-response"), message: collision?.message ?? "Herdr returned no valid replacement agent envelope." };
+			} catch (error: unknown) { return { kind: "failed", stage: "agent-start", code: "runner-error", message: error instanceof Error ? error.message : "Replacement agent start failed." }; }
+		},
+		async promptReplacementAgent(input) {
+			if (!exec || input.assignmentPrompt.length === 0 || input.assignmentPrompt.length > 64 * 1024 || input.assignmentPrompt !== input.assignmentPrompt.trim()) return { kind: "failed", stage: "agent-prompt", code: "invalid-input", message: "Replacement Assignment prompt is not bounded and canonical." };
+			try {
+				const inspected = await this.inspectManagedAgent!(input.identity);
+				if (inspected.kind !== "observed" || !exactIdentityForAdapter(inspected.identity, input.identity)) return { kind: "failed", stage: "agent-prompt", code: "identity-mismatch", message: "Replacement identity was not preflighted." };
+				const result = await exec("herdr", ["agent", "prompt", input.identity.name, input.assignmentPrompt], { cwd: input.repositoryRoot, timeout: 30_000 });
+				return exactPromptAcknowledgement(result, input.identity) ?? { kind: "failed", stage: "agent-prompt", code: result.killed ? "killed" : "ambiguous-response", message: "Herdr returned no exact replacement prompt acknowledgement." };
+			} catch (error: unknown) { return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Replacement prompt failed." }; }
+		},
 	};
 }
 
@@ -664,7 +749,68 @@ export function createProcessAdapter(exec: CommandRunner | undefined): StewardPr
 				return { kind: "thrown", message: error instanceof Error ? error.message : "Verification process failed before a result was returned." };
 			}
 		},
+		async inspectAttemptProcesses(input) {
+			if (!exec) return { kind: "unavailable", diagnostic: "The Pi command runner is unavailable." };
+			if (!isAbsolute(input.repositoryRoot) || input.repositoryRoot !== resolve(input.repositoryRoot) || !safeIdentity(input.identity.paneId)) return { kind: "unavailable", diagnostic: "Process observer requires an exact repository and pane identity." };
+			try {
+				const result = await exec("herdr", ["pane", "process-info", "--pane", input.identity.paneId], { cwd: input.repositoryRoot, timeout: 5_000 });
+				if (result.code !== 0 || result.killed || result.stderr.length !== 0) return { kind: "unavailable", diagnostic: result.stderr.trim() || "Process-info command did not return an exact successful empty-stderr result." };
+				const envelope = safeEnvelope(result);
+				const value = resultObject(envelope);
+				if (envelope?.id !== "cli:pane:process_info" || value?.type !== "pane_process_info") return { kind: "unavailable", diagnostic: result.killed ? "Process-info command was killed." : "Herdr returned no exact pane_process_info envelope." };
+				const paneId = typeof value.pane_id === "string" ? value.pane_id : objectValue(value.pane)?.pane_id;
+				const shellPid = value.shell_pid;
+				const foregroundProcessGroupId = value.foreground_process_group_id;
+				const processes = value.processes;
+				if (paneId !== input.identity.paneId || typeof shellPid !== "number" || !Number.isSafeInteger(shellPid) || shellPid <= 0 || typeof foregroundProcessGroupId !== "number" || !Number.isSafeInteger(foregroundProcessGroupId) || foregroundProcessGroupId <= 0 || !Array.isArray(processes) || processes.length === 0 || processes.length > 512) return { kind: "unavailable", diagnostic: "Process-info envelope has mismatched identity or bounded process facts." };
+				type ProcessFact = { pid: number; ppid: number; processGroupId: number; cwd: string; argv: string[]; cmdline: string; executableName: string };
+				const normalized: ProcessFact[] = [];
+				for (const item of processes) {
+					const process = objectValue(item);
+					if (!process || !exactProcessKeys(process)) return { kind: "unavailable", diagnostic: "Process-info list contains malformed or unknown process facts." };
+					if (Object.prototype.hasOwnProperty.call(process, "process_group_id") && Object.prototype.hasOwnProperty.call(process, "pgid") && process.process_group_id !== process.pgid) return { kind: "unavailable", diagnostic: "Process-info facts contain contradictory process-group identities." };
+					if (Object.prototype.hasOwnProperty.call(process, "executable_name") && Object.prototype.hasOwnProperty.call(process, "name") && process.executable_name !== process.name) return { kind: "unavailable", diagnostic: "Process-info facts contain contradictory executable identities." };
+					const pid = process.pid;
+					const ppid = process.ppid;
+					const processGroupId = process.process_group_id ?? process.pgid;
+					const cwd = process.cwd;
+					const argv = process.argv;
+					const cmdline = process.cmdline;
+					const executableName = process.executable_name ?? process.name;
+					if (![pid, ppid, processGroupId].every((candidate) => typeof candidate === "number" && Number.isSafeInteger(candidate) && candidate > 0) || typeof cwd !== "string" || !isAbsolute(cwd) || cwd !== resolve(cwd) || cwd.length > 4_096 || !Array.isArray(argv) || argv.length === 0 || argv.length > 128 || argv.some((arg) => typeof arg !== "string" || arg.length === 0 || arg.length > 4_096 || arg.includes("\u0000")) || typeof cmdline !== "string" || cmdline.length === 0 || cmdline.length > 32 * 1024 || typeof executableName !== "string" || executableName.length === 0 || executableName.length > 256 || executableName.includes("\u0000")) return { kind: "unavailable", diagnostic: "Process-info facts exceeded the exact bounds." };
+					normalized.push({ pid: pid as number, ppid: ppid as number, processGroupId: processGroupId as number, cwd, argv: [...argv] as string[], cmdline, executableName });
+				}
+				if (new Set(normalized.map((item) => item.pid)).size !== normalized.length) return { kind: "unavailable", diagnostic: "Process-info list contains duplicate PIDs." };
+				normalized.sort((left, right) => left.pid - right.pid);
+				const digest = `sha256:${createHash("sha256").update(JSON.stringify(normalized), "utf8").digest("hex")}`;
+				const foreground = normalized.filter((item) => item.processGroupId === foregroundProcessGroupId);
+				if (foreground.length === 0) return { kind: "unavailable", diagnostic: "Process-info list did not prove the foreground process group." };
+				const managedOnly = foreground.every((item) => isManagedProcessName(item.executableName, item.argv, item.cmdline, input.identity));
+				if (managedOnly) return { kind: "none", paneId: input.identity.paneId, shellPid: shellPid as number, foregroundProcessGroupId: foregroundProcessGroupId as number, processCount: normalized.length, digest };
+				const external = foreground.find((item) => !isManagedProcessName(item.executableName, item.argv, item.cmdline, input.identity))!;
+				return { kind: "live-external", paneId: input.identity.paneId, shellPid: shellPid as number, foregroundProcessGroupId: foregroundProcessGroupId as number, processCount: normalized.length, digest, classification: classifyExternalProcess(external.executableName, external.argv, external.cmdline), executableName: external.executableName.slice(0, 256) };
+			} catch (error: unknown) { return { kind: "unavailable", diagnostic: (error instanceof Error ? error.message : "Process-info inspection failed.").slice(0, 2_000) }; }
+		},
 	};
+}
+
+function exactProcessKeys(value: Record<string, unknown>): boolean {
+	return Object.keys(value).every((key) => ["pid", "ppid", "process_group_id", "pgid", "cwd", "argv", "cmdline", "executable_name", "name"].includes(key)) && Object.prototype.hasOwnProperty.call(value, "pid") && Object.prototype.hasOwnProperty.call(value, "ppid") && (Object.prototype.hasOwnProperty.call(value, "process_group_id") || Object.prototype.hasOwnProperty.call(value, "pgid")) && Object.prototype.hasOwnProperty.call(value, "cwd") && Object.prototype.hasOwnProperty.call(value, "argv") && Object.prototype.hasOwnProperty.call(value, "cmdline") && (Object.prototype.hasOwnProperty.call(value, "executable_name") || Object.prototype.hasOwnProperty.call(value, "name"));
+}
+
+function isManagedProcessName(name: string, argv: readonly string[], cmdline: string, identity: ManagedAgentIdentity): boolean {
+	const normalizedName = name.toLowerCase();
+	const candidates = [name, ...argv, ...cmdline.split(/\s+/)].map((value) => value.toLowerCase().replace(/["']/g, ""));
+	const exactPi = candidates.some((value) => value === "pi" || value.endsWith("/pi") || value === "pi-coding-agent" || value.endsWith("/pi-coding-agent"));
+	const exactIdentity = candidates.some((value) => value === identity.name.toLowerCase());
+	return exactPi || exactIdentity || /(?:^|\/)(?:bash|sh|zsh|fish|dash)$/.test(normalizedName);
+}
+
+function classifyExternalProcess(name: string, argv: readonly string[], cmdline: string): "test" | "build" | "child" {
+	const value = `${name} ${argv.join(" ")} ${cmdline}`.toLowerCase();
+	if (/(?:vitest|jest|pytest|mocha|ava|npm(?:\.cmd)?\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+test|cargo\s+test|go\s+test|\.\/gradlew\s+test)/.test(value)) return "test";
+	if (/(?:tsc|typescript|vite|webpack|rollup|esbuild|swc|babel|make|cmake|cargo\s+build|go\s+build|npm(?:\.cmd)?\s+(?:run\s+)?build|pnpm\s+(?:run\s+)?build|yarn\s+build)/.test(value)) return "build";
+	return "child";
 }
 
 export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAdapter {
