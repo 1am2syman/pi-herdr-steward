@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { parseCanonicalModelReference, type ModelChoice, type ModelPlan } from "./config.ts";
 
 export const TASK_FACT_REQUEST_PREFIX = "STEWARD_TASK_FACT_REQUEST" as const;
 export const TASK_FACT_ANSWER_PREFIX = "STEWARD_TASK_FACT_ANSWER" as const;
@@ -53,6 +54,126 @@ export function decideReconciliation(facts: ReconciliationFacts): Reconciliation
 	if (facts.live?.kind === "unclear") return { kind: "unclear" };
 	if (facts.live?.kind === "missing") return { kind: "missing" };
 	return { kind: "none" };
+}
+
+export const TRANSIENT_INFRASTRUCTURE_KINDS = [
+	"provider-network-interruption",
+	"agent-startup-failure",
+	"herdr-command-failure",
+	"unexpected-process-exit",
+] as const;
+
+export type TransientInfrastructureKind = (typeof TRANSIENT_INFRASTRUCTURE_KINDS)[number];
+export type TransientInfrastructureStage = "worktree-create" | "pane-split" | "agent-start" | "agent-prompt" | "agent-runtime";
+
+export interface TypedInfrastructureFact {
+	stage: TransientInfrastructureStage;
+	code: string;
+	diagnostic: string;
+	source?: "typed-herdr-result" | "exact-agent-missing";
+}
+
+export interface ClassifiedInfrastructureFact extends TypedInfrastructureFact {
+	kind: TransientInfrastructureKind;
+}
+
+const providerNetworkCodes = new Set([
+	"provider-network-interruption",
+	"provider_network_interruption",
+	"provider-network",
+	"provider_network",
+	"provider-network-error",
+	"provider_network_error",
+	"network-interruption",
+	"network_interruption",
+	"network-error",
+	"network_error",
+	"network-timeout",
+	"network_timeout",
+	"econnreset",
+	"econnrefused",
+	"etimedout",
+]);
+const startupCodes = new Set(["agent-startup-failure", "agent_startup_failure", "agent-start-failed", "agent_start_failed", "agent-startup-error", "agent_startup_error", "startup-failure", "startup_failure", "startup-failed", "startup_failed"]);
+const herdrCommandCodes = new Set(["herdr-command-failure", "herdr_command_failure", "herdr-command-failed", "herdr_command_failed", "command-failure", "command_failure", "command-failed", "command_failed", "dispatch-failure", "dispatch_failure"]);
+
+/**
+ * Normalize only structured adapter facts. Terminal prose and generic
+ * malformed/killed results intentionally do not enter this classifier.
+ */
+export function classifyInfrastructureFact(fact: TypedInfrastructureFact): ClassifiedInfrastructureFact | undefined {
+	if (typeof fact.code !== "string" || fact.code.length === 0 || typeof fact.diagnostic !== "string") return undefined;
+	if (fact.source === "exact-agent-missing" && fact.code === "agent_not_found") return { ...fact, kind: "unexpected-process-exit" };
+	if ((fact.stage === "agent-start" || fact.stage === "agent-prompt") && providerNetworkCodes.has(fact.code)) return { ...fact, kind: "provider-network-interruption" };
+	if (fact.stage === "agent-start" && startupCodes.has(fact.code)) return { ...fact, kind: "agent-startup-failure" };
+	if (herdrCommandCodes.has(fact.code)) return { ...fact, kind: "herdr-command-failure" };
+	return undefined;
+}
+
+export type RetryLinkFact = {
+	kind: "silent-agent-recovery" | "transient-recovery";
+	retryOrdinal: 1 | 2;
+	replacesAttemptId: string;
+	actualModel?: ModelChoice;
+};
+
+export function replacementRetryOrdinal(links: readonly RetryLinkFact[], retryLimit: number): 1 | 2 | undefined {
+	const used = links.length;
+	if (!Number.isSafeInteger(retryLimit) || retryLimit <= used || used >= 2) return undefined;
+	return (used + 1) as 1 | 2;
+}
+
+export function replacementRetryCount(links: readonly RetryLinkFact[]): 0 | 1 | 2 {
+	return Math.min(2, links.length) as 0 | 1 | 2;
+}
+
+export interface RetryModelInspection {
+	choice: ModelChoice;
+	available: boolean;
+	diagnostics: readonly { code: string }[];
+}
+
+export type TransientModelSelection =
+	| { kind: "same-model-first"; planIndex: number; choice: ModelChoice }
+	| { kind: "approved-fallback"; planIndex: number; choice: ModelChoice; reason: "same-model-unavailable" | "same-model-retry-failed"; skipped: Array<{ planIndex: number; model: string; codes: string[] }> }
+	| { kind: "unavailable"; skipped: Array<{ planIndex: number; model: string; codes: string[] }> };
+
+function inspectionCodes(inspection: RetryModelInspection): string[] {
+	return inspection.diagnostics.map((item) => item.code).filter((code) => typeof code === "string" && code.length > 0).slice(0, 8);
+}
+
+/** Selects a lineage-aware same-model-first, strictly-forward fallback. */
+export function selectTransientModel(input: {
+	actualModel: ModelChoice;
+	plan: ModelPlan;
+	inspections: readonly RetryModelInspection[];
+	reason: "same-model-unavailable" | "same-model-retry-failed";
+	requireProviderDifferentFrom?: string;
+	allowSameProvider?: boolean;
+}): TransientModelSelection {
+	const choices = [input.plan.primary, ...input.plan.fallbacks];
+	const inspected = choices.map((choice, planIndex) => {
+		const direct = input.inspections[planIndex];
+		if (direct?.choice.model === choice.model && direct.choice.thinkingLevel === choice.thinkingLevel) return direct;
+		return input.inspections.find((item) => item.choice.model === choice.model && item.choice.thinkingLevel === choice.thinkingLevel) ?? { choice, available: false, diagnostics: [{ code: "uninspected" }] };
+	});
+	const currentIndex = choices.findIndex((choice) => choice.model === input.actualModel.model && choice.thinkingLevel === input.actualModel.thinkingLevel);
+	if (currentIndex < 0) return { kind: "unavailable", skipped: [] };
+	const current = inspected[currentIndex]!;
+	const acceptable = (inspection: RetryModelInspection): boolean => {
+		if (!inspection.available) return false;
+		if (input.requireProviderDifferentFrom && !input.allowSameProvider && parseCanonicalModelReference(inspection.choice.model)?.provider === input.requireProviderDifferentFrom) return false;
+		return true;
+	};
+	if (acceptable(current) && input.reason === "same-model-unavailable") return { kind: "same-model-first", planIndex: currentIndex, choice: { ...current.choice } };
+	const skipped: Array<{ planIndex: number; model: string; codes: string[] }> = [];
+	if (input.reason === "same-model-retry-failed" || !current.available || !acceptable(current)) skipped.push({ planIndex: currentIndex, model: current.choice.model, codes: inspectionCodes(current).concat(input.reason === "same-model-retry-failed" ? ["same-model-retry-failed"] : []).slice(0, 8) });
+	for (let index = currentIndex + 1; index < choices.length; index += 1) {
+		const candidate = inspected[index]!;
+		if (acceptable(candidate)) return { kind: "approved-fallback", planIndex: index, choice: { ...candidate.choice }, reason: input.reason, skipped };
+		skipped.push({ planIndex: index, model: candidate.choice.model, codes: inspectionCodes(candidate) });
+	}
+	return { kind: "unavailable", skipped };
 }
 
 export type SilenceRecoveryDecision =

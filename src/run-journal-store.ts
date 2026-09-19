@@ -61,7 +61,7 @@ export type AttemptReportInspection =
 	| { kind: "unavailable"; diagnostic: string };
 
 export type AttemptPreservationInspection =
-	| { kind: "inspected"; assignment: { path: string; size: number; sha256: string }; report: MonitorReportObservation; evidence: { directory: string; count: number; byteCount: number; sha256: string; entries: Array<{ path: string; size: number; sha256: string }> } }
+	| { kind: "inspected"; assignment: { path: string; size: number; sha256: string } | { kind: "missing" | "unavailable"; path: string; diagnostic?: string }; report: MonitorReportObservation; evidence: { directory: string; count: number; byteCount: number; sha256: string; entries: Array<{ path: string; size: number; sha256: string }> } }
 	| { kind: "unavailable"; diagnostic: string };
 
 export type AttemptAssignmentInspection =
@@ -281,14 +281,25 @@ async function inspectAttemptPreservation(input: { repositoryRoot: string; attem
 	const expectedRoot = resolve(input.attempt.assignmentPath, "..");
 	if (!isAbsolute(input.attempt.assignmentPath) || !isAbsolute(input.attempt.reportPath) || !isAbsolute(input.attempt.evidenceDirectory) || input.attempt.assignmentPath !== join(expectedRoot, "assignment.json") || input.attempt.reportPath !== join(expectedRoot, "report.md") || input.attempt.evidenceDirectory !== join(expectedRoot, "evidence") || !expectedRoot.startsWith(`${root}/`)) return { kind: "unavailable", diagnostic: "Attempt preservation paths are not deterministic Steward-owned paths." };
 	const assignment = await inspectPreservationFile(input.attempt.assignmentPath, 64 * 1024);
-	if (!assignment) return { kind: "unavailable", diagnostic: "Assignment is missing, unstable, or not a regular non-symlink file." };
+	let assignmentObservation: { path: string; size: number; sha256: string } | { kind: "missing" | "unavailable"; path: string; diagnostic?: string };
+	if (assignment) assignmentObservation = { path: input.attempt.assignmentPath, size: assignment.size, sha256: assignment.sha256 };
+	else {
+		try {
+			await lstat(input.attempt.assignmentPath);
+			assignmentObservation = { kind: "unavailable", path: input.attempt.assignmentPath, diagnostic: "Assignment is missing, unstable, or not a regular non-symlink file." };
+		} catch (error: unknown) {
+			assignmentObservation = missing(error) ? { kind: "missing", path: input.attempt.assignmentPath } : { kind: "unavailable", path: input.attempt.assignmentPath, diagnostic: filesystemErrorText(error).slice(0, 2_000) };
+		}
+	}
 	const report = await inspectStableAttemptReport(input.repositoryRoot, input.attempt.reportPath, configDirName);
-	let evidenceInfo: Awaited<ReturnType<typeof lstat>>;
+	let evidenceInfo: Awaited<ReturnType<typeof lstat>> | undefined;
+	let evidenceMissing = false;
 	try {
 		evidenceInfo = await lstat(input.attempt.evidenceDirectory);
 		if (!evidenceInfo.isDirectory() || evidenceInfo.isSymbolicLink() || (await realpath(input.attempt.evidenceDirectory)) !== input.attempt.evidenceDirectory) return { kind: "unavailable", diagnostic: "Evidence directory is not a stable non-symlink directory." };
-	} catch {
-		return { kind: "unavailable", diagnostic: "Evidence directory could not be inspected." };
+	} catch (error: unknown) {
+		if (missing(error)) evidenceMissing = true;
+		else return { kind: "unavailable", diagnostic: "Evidence directory could not be inspected." };
 	}
 	const entries: Array<{ path: string; size: number; sha256: string }> = [];
 	let byteCount = 0;
@@ -314,9 +325,9 @@ async function inspectAttemptPreservation(input: { repositoryRoot: string; attem
 		}
 		return true;
 	}
-	if (!(await walk(input.attempt.evidenceDirectory, ""))) return { kind: "unavailable", diagnostic: "Evidence inventory was unstable, symlinked, or exceeded bounded preservation limits." };
+	if (!evidenceMissing && !(await walk(input.attempt.evidenceDirectory, ""))) return { kind: "unavailable", diagnostic: "Evidence inventory was unstable, symlinked, or exceeded bounded preservation limits." };
 	const inventory = JSON.stringify(entries);
-	return { kind: "inspected", assignment: { path: input.attempt.assignmentPath, size: assignment.size, sha256: assignment.sha256 }, report: report.kind === "present" ? { kind: "present", size: report.size, sha256: report.sha256 } : report.kind === "missing" ? { kind: "missing" } : { kind: "unavailable", diagnostic: report.diagnostic }, evidence: { directory: input.attempt.evidenceDirectory, count: entries.length, byteCount, sha256: `sha256:${createHash("sha256").update(inventory, "utf8").digest("hex")}`, entries } };
+	return { kind: "inspected", assignment: assignmentObservation, report: report.kind === "present" ? { kind: "present", size: report.size, sha256: report.sha256 } : report.kind === "missing" ? { kind: "missing" } : { kind: "unavailable", diagnostic: report.diagnostic }, evidence: { directory: input.attempt.evidenceDirectory, count: entries.length, byteCount, sha256: `sha256:${createHash("sha256").update(inventory, "utf8").digest("hex")}`, entries } };
 }
 
 export function resolveRunJournalPaths(repositoryRoot: string, configDirName = CONFIG_DIR_NAME): RunJournalPaths {

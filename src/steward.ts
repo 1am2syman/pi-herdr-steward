@@ -3,6 +3,7 @@ import type { ConfigLoadResult, ConfigSaveResult } from "./config-store.ts";
 import {
 	formatModelPlans,
 	formatRecoveryDefaults,
+	parseCanonicalModelReference,
 	cloneRecoveryDefaults,
 	cloneModelPlans,
 	validateProjectModelPlans,
@@ -69,6 +70,8 @@ import {
 	type SilencePhase,
 	type AttemptReplacement,
 	type AttemptContinuation,
+	type InfrastructureOutcome,
+	type RecoveryPreservation,
 } from "./run.ts";
 import {
 	buildReviewerAssignment,
@@ -114,7 +117,7 @@ import type {
 	VerificationEvidenceInput,
 	VerificationFinalizeResult,
 } from "./completion-store.ts";
-import { decideReconciliation, decideSilenceRecovery, parseTaskFactRequest, resolveTaskFactAnswer, taskFactValue, type ReconciliationDecision, type TaskFactKey, type SilenceRecoveryDecision } from "./reconciliation.ts";
+import { classifyInfrastructureFact, decideReconciliation, decideSilenceRecovery, parseTaskFactRequest, replacementRetryOrdinal, resolveTaskFactAnswer, selectTransientModel, taskFactValue, type ClassifiedInfrastructureFact, type ReconciliationDecision, type TaskFactKey, type SilenceRecoveryDecision } from "./reconciliation.ts";
 
 export type { MonitorDigest, MonitorLifecycle, SilenceProcessObservation } from "./run.ts";
 
@@ -348,8 +351,9 @@ export interface ManagedAgentIdentity {
 
 export type ManagedAgentInspection =
 	| { kind: "observed"; identity: ManagedAgentIdentity; lifecycle: MonitorLifecycle; stateChangeSequence: number | null }
-	| { kind: "missing"; diagnostic: string }
-	| { kind: "unclear"; diagnostic: string };
+	| { kind: "missing"; diagnostic: string; code?: "agent_not_found" }
+	| { kind: "unclear"; diagnostic: string; availability?: "unavailable" };
+
 
 export type MonitorWaitResult =
 	| { kind: "settled"; lifecycle: Extract<MonitorLifecycle, "idle" | "done" | "blocked" | "unknown">; identity: ManagedAgentIdentity; stateChangeSequence: number | null }
@@ -363,7 +367,7 @@ export type ManagedWorktreeProgress =
 
 export type MonitorTrigger = "start" | "lifecycle" | "fallback" | "settled" | "turn" | "compaction" | "prompt" | "manual";
 
-export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "silence-nudge" | "silence-interrupt" | "silence-resume" | "reserve-silent-replacement" | "none" | "approval-required" | "blocked" | "degraded";
+export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "silence-nudge" | "silence-interrupt" | "silence-resume" | "reserve-silent-replacement" | "reserve-transient-replacement" | "none" | "approval-required" | "blocked" | "degraded";
 
 export type MonitorCondition = "completed" | "approval-required" | "blocked" | "degraded" | "ordinary";
 
@@ -434,7 +438,7 @@ export interface ActiveAttemptStatusView {
 	taskPhase: "building" | "reworking" | "reviewing" | "approved";
 	attemptId: string;
 	role: "builder";
-	attemptState: "prepared" | "active" | "awaiting-report" | "reported" | "superseded";
+	attemptState: "prepared" | "active" | "awaiting-report" | "reported" | "ended-error" | "superseded";
 	assignmentPath?: string;
 	assignmentHash?: string;
 	actualModel?: import("./config.ts").ModelChoice;
@@ -510,6 +514,7 @@ function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusVi
 	const reviewer = latestReviewerAttempt(task);
 	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: reviewing`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, `Attention: ${task.attention}`];
 	if (reviewer) lines.push(...silenceStatusLines(journal, task, reviewer));
+	if (reviewer) lines.push(...transientStatusLines(journal, task, reviewer));
 	if (task.attentionReason) lines.push(`Attention reason: ${task.attentionReason}`);
 	if (task.attentionDiagnostic) lines.push(`Attention diagnostic: ${task.attentionDiagnostic}`);
 	if (task.approval?.phase === "invalidated") lines.push(`Approval: invalidated (${task.approval.reason}); preserved exact facts require user attention.`);
@@ -594,6 +599,7 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 	};
 	const evidence = attempt.evidence;
 	const silenceLines = silenceStatusLines(journal, task, attempt);
+	const transientLines = transientStatusLines(journal, task, attempt);
 	const evidenceLines = evidence?.phase === "rejected"
 		? [`Evidence: rejected (${evidence.codes.join(", ")})`, `Evidence detail: ${evidence.summary}`, "Review: blocked; evidence is not valid."]
 		: evidence?.phase === "finalization-intended"
@@ -611,8 +617,9 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 		`Model: ${attempt.actualModel.model} [thinking=${attempt.actualModel.thinkingLevel}]`,
 		...(activeAttempt.worktreeBranch ? [`Worktree: ${activeAttempt.worktreeBranch} @ ${activeAttempt.worktreePath}`] : []),
 		...(activeAttempt.agentName ? [`Herdr Builder: ${activeAttempt.agentName} (pane=${activeAttempt.paneId}, workspace=${activeAttempt.workspaceId})`] : []),
-		`Attention: ${task.attention}`,
-		...silenceLines,
+			`Attention: ${task.attention}`,
+			...silenceLines,
+			...transientLines,
 		...(evidenceLines.length > 0 ? evidenceLines : [task.phase === "reworking" ? "Rework: awaiting the same Builder's validated Attempt Report." : "Completion: not inferred from Herdr activity; awaiting a validated Attempt Report."]),
 		...(note ? [note] : []),
 	];
@@ -630,6 +637,22 @@ function silenceStatusLines(journal: RunJournal, task: TaskRecord, attempt: Atte
 	const used = task.attempts.filter((candidate) => candidate.replacement !== undefined).length;
 	const deadline = new Date(nextSilenceDeadline(journal, attempt, new Date(journal.run.updatedAt).getTime())).toISOString();
 	return [`Silence recovery: ${silence.phase}`, `Silent replacements: ${used}/${journal.run.effectiveSettings.transientRetryLimit}`, `Next silence deadline: ${deadline}`];
+}
+
+function transientStatusLines(journal: RunJournal, task: TaskRecord, attempt: AttemptRecord): string[] {
+	const outcomeAttempt = task.attempts.slice().reverse().find((candidate) => candidate.recovery?.infrastructure);
+	const outcome = outcomeAttempt?.recovery?.infrastructure;
+	const preservation = outcomeAttempt?.recovery?.preservation;
+	const replacement = attempt.replacement?.kind === "transient-recovery" ? attempt.replacement : undefined;
+	if (!outcome && !replacement) return [];
+	const used = task.attempts.filter((candidate) => candidate.replacement !== undefined).length;
+	const lines = [`Transient replacements: ${used}/${journal.run.effectiveSettings.transientRetryLimit}`];
+	if (outcome) lines.push(`Transient infrastructure: ${outcome.kind}`, `Transient stop: ${outcome.stop.phase}`);
+	if (replacement) {
+		lines.push(`Transient model: ${replacement.modelSelection.kind === "same-model-first" ? `same model (plan ${replacement.modelSelection.planIndex})` : `approved fallback (plan ${replacement.modelSelection.planIndex}, ${replacement.modelSelection.reason})`}`);
+	}
+	if (preservation) lines.push("Transient evidence: retained before stop/replacement decision.");
+	return lines;
 }
 
 function resultForSaveFailure(scope: ConfigurationScope, save: ConfigSaveResult): ConfigureResult {
@@ -1244,9 +1267,17 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	if (!persistedPrepared) return { journal, note: "Reviewer pane intent could not be persisted; no pane was created." };
 	journal = persistedPrepared;
 	let pane: import("./steward.ts").HerdrReviewerPaneResult;
-	try { pane = await dependencies.herdr.createReviewerPane({ repositoryRoot, sourcePaneId: builderDispatch.paneId, worktreePath: builderDispatch.worktreePath, branch: builderDispatch.branch, agentName, workspaceId: builderDispatch.workspaceId }); }
-	catch (error: unknown) { return { journal, note: `Reviewer pane creation failed; dispatch remains at pane-intended and no verdict exists. ${error instanceof Error ? error.message : "Herdr pane split failed."}` }; }
-	if (pane.kind !== "created" || pane.workspaceId !== builderDispatch.workspaceId || pane.sourcePaneId !== builderDispatch.paneId || pane.worktreePath !== builderDispatch.worktreePath || pane.paneId === builderDispatch.paneId || pane.terminalId === builderDispatch.terminalId || !validIdentity(pane.tabId)) return { journal, note: "Reviewer pane envelope was malformed or contradictory; dispatch remains at pane-intended and no verdict exists." };
+		try { pane = await dependencies.herdr.createReviewerPane({ repositoryRoot, sourcePaneId: builderDispatch.paneId, worktreePath: builderDispatch.worktreePath, branch: builderDispatch.branch, agentName, workspaceId: builderDispatch.workspaceId }); }
+		catch (error: unknown) { return { journal, note: `Reviewer pane creation failed; dispatch remains at pane-intended and no verdict exists. ${error instanceof Error ? error.message : "Herdr pane split failed."}` }; }
+		if (pane.kind === "failed") {
+			const currentTask = journal.run.tasks[candidate.index];
+			const currentAttempt = currentTask ? latestReviewerAttempt(currentTask) : undefined;
+			if (currentTask && currentAttempt) {
+				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId, journal, taskIndex: candidate.index, task: currentTask, attempt: currentAttempt, dependencies, stage: pane.stage, code: pane.code, diagnostic: pane.message });
+				if (transition) return reviewDecisionFromTransient(transition);
+			}
+		}
+		if (pane.kind !== "created" || pane.workspaceId !== builderDispatch.workspaceId || pane.sourcePaneId !== builderDispatch.paneId || pane.worktreePath !== builderDispatch.worktreePath || pane.paneId === builderDispatch.paneId || pane.terminalId === builderDispatch.terminalId || !validIdentity(pane.tabId)) return { journal, note: "Reviewer pane envelope was malformed or contradictory; dispatch remains at pane-intended and no verdict exists." };
 	let agentIntent: RunJournal;
 	try {
 		agentIntent = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
@@ -1264,7 +1295,7 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 		let result: import("./steward.ts").HerdrAgentStartResult;
 		try { result = await dependencies.herdr.startReviewer({ repositoryRoot, name: agentName, paneId: pane.paneId, model: reviewerModel }); }
 		catch (error: unknown) { return { journal, note: `Reviewer start failed; dispatch remains at agent-intended and no verdict exists. ${error instanceof Error ? error.message : "Herdr agent start failed."}` }; }
-		if (result.kind !== "name-collision") { started = result; break; }
+			if (result.kind !== "name-collision") { started = result; break; }
 		if (collision === 7) return { journal, note: "Eight Steward-owned Reviewer names collided; dispatch remains pending and no verdict exists." };
 			agentName = `steward-r-${compactUuid(dependencies.clock)}-${candidate.task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-${attemptId.slice(-2)}`;
 		try {
@@ -1278,8 +1309,16 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 			if (!persistedRename) return { journal, note: "Reviewer name collision could not be durably reconciled; no existing agent was adopted." };
 			journal = persistedRename;
 		} catch (error: unknown) { return { journal, note: `Reviewer name collision could not be reconciled; no existing agent was adopted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
-	}
-	if (!started || started.kind !== "started" || started.name !== agentName || started.agentKind !== "pi" || started.workspaceId !== pane.workspaceId || started.paneId !== pane.paneId || started.terminalId !== pane.terminalId || !validIdentity(started.tabId)) return { journal, note: "Reviewer start envelope was malformed or contradictory; dispatch remains at agent-intended and no verdict exists." };
+		}
+		if (started?.kind === "failed") {
+			const currentTask = journal.run.tasks[candidate.index];
+			const currentAttempt = currentTask ? latestReviewerAttempt(currentTask) : undefined;
+			if (currentTask && currentAttempt) {
+				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId, journal, taskIndex: candidate.index, task: currentTask, attempt: currentAttempt, dependencies, stage: started.stage, code: started.code, diagnostic: started.message, identity: { name: agentName, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId }, requireExactMissing: true });
+				if (transition) return reviewDecisionFromTransient(transition);
+			}
+		}
+		if (!started || started.kind !== "started" || started.name !== agentName || started.agentKind !== "pi" || started.workspaceId !== pane.workspaceId || started.paneId !== pane.paneId || started.terminalId !== pane.terminalId || !validIdentity(started.tabId)) return { journal, note: "Reviewer start envelope was malformed or contradictory; dispatch remains at agent-intended and no verdict exists." };
 	let assignment: ReviewerAssignmentDocument;
 	const activeTask = journal.run.tasks[candidate.index];
 	const activeReviewer = activeTask ? latestReviewerAttempt(activeTask) : undefined;
@@ -1304,9 +1343,17 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 	if (!persistedPromptIntent) return { journal, note: "Reviewer prompt intent could not be persisted; no prompt was sent." };
 	journal = persistedPromptIntent;
 	let prompted: import("./steward.ts").HerdrPromptResult;
-	try { prompted = await dependencies.herdr.promptReviewer({ repositoryRoot, name: agentName, assignmentPrompt: formatReviewerPrompt(assignment) }); }
-	catch (error: unknown) { return { journal, note: `Reviewer prompt failed; dispatch remains at prompt-intended without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
-	if (prompted.kind !== "prompted" || prompted.name !== agentName || prompted.workspaceId !== pane.workspaceId || prompted.paneId !== pane.paneId || prompted.terminalId !== pane.terminalId || !validIdentity(prompted.tabId)) return { journal, note: "Reviewer prompt envelope was malformed or contradictory; dispatch remains at prompt-intended without a resend." };
+		try { prompted = await dependencies.herdr.promptReviewer({ repositoryRoot, name: agentName, assignmentPrompt: formatReviewerPrompt(assignment) }); }
+		catch (error: unknown) { return { journal, note: `Reviewer prompt failed; dispatch remains at prompt-intended without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
+		if (prompted.kind === "failed") {
+			const currentTask = journal.run.tasks[candidate.index];
+			const currentAttempt = currentTask ? latestReviewerAttempt(currentTask) : undefined;
+			if (currentTask && currentAttempt) {
+				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId, journal, taskIndex: candidate.index, task: currentTask, attempt: currentAttempt, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity: { name: agentName, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId }, requireExactMissing: true });
+				if (transition) return reviewDecisionFromTransient(transition);
+			}
+		}
+		if (prompted.kind !== "prompted" || prompted.name !== agentName || prompted.workspaceId !== pane.workspaceId || prompted.paneId !== pane.paneId || prompted.terminalId !== pane.terminalId || !validIdentity(prompted.tabId)) return { journal, note: "Reviewer prompt envelope was malformed or contradictory; dispatch remains at prompt-intended without a resend." };
 	const promptedAt = transitionTimestamp(journal, dependencies.clock.now());
 	let active: RunJournal;
 	try {
@@ -1457,7 +1504,9 @@ function monitorFooter(journal: RunJournal, condition: MonitorCondition, diagnos
 	const attempt = task?.attempts.at(-1);
 	const silence = task && attempt?.recovery?.silence;
 	const silenceSuffix = silence ? ` · silence ${silence.phase} · ${task.attempts.filter((candidate) => candidate.replacement !== undefined).length}/${journal.run.effectiveSettings.transientRetryLimit} · next ${new Date(nextSilenceDeadline(journal, attempt, Date.parse(journal.run.updatedAt))).toISOString()}` : "";
-	return `steward: ${journal.run.id} · ${phase} · ${attention} attention${silenceSuffix}${suffix}`;
+	const transientCount = task?.attempts.filter((candidate) => candidate.replacement !== undefined).length ?? 0;
+	const transientSuffix = task?.attempts.some((candidate) => candidate.recovery?.infrastructure) ? ` · transient ${transientCount}/${journal.run.effectiveSettings.transientRetryLimit}` : "";
+	return `steward: ${journal.run.id} · ${phase} · ${attention} attention${silenceSuffix}${transientSuffix}${suffix}`;
 }
 
 async function validateApprovedTasks(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<ReviewDecision> {
@@ -1956,6 +2005,14 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 	journal = persistedIntent;
 	let prompted: HerdrPromptResult;
 	try { prompted = await dependencies.herdr.promptBuilder({ repositoryRoot, name: previousDispatch.agentName, assignmentPrompt: formatBuilderPrompt(assignment) }); } catch (error: unknown) { return { journal, note: `Same Builder rework prompt failed; prompt-intended state is retained without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
+	if (prompted.kind === "failed") {
+		const currentTask = journal.run.tasks[candidate.index];
+		const currentAttempt = currentTask?.attempts.at(-1);
+		if (currentTask && currentAttempt) {
+			const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: journal.run.controllerSessionId, journal, taskIndex: candidate.index, task: currentTask, attempt: currentAttempt, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity: { name: previousDispatch.agentName, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId }, requireExactMissing: true });
+			if (transition) return reviewDecisionFromTransient(transition);
+		}
+	}
 	if (prompted.kind !== "prompted" || prompted.name !== previousDispatch.agentName || prompted.workspaceId !== previousDispatch.workspaceId || prompted.paneId !== previousDispatch.paneId || prompted.terminalId !== previousDispatch.terminalId || !validIdentity(prompted.tabId)) return { journal, note: "Same Builder rework prompt envelope was malformed; prompt-intended state is retained without a resend." };
 	let active: RunJournal;
 	try {
@@ -2073,6 +2130,14 @@ async function dispatchInitialBuilder(input: {
 	let worktree: Extract<HerdrWorktreeCreateResult, { kind: "created" }>;
 	try {
 		const result = await dependencies.herdr.createBuilderWorktree({ repositoryRoot, branch, baseRevision: journal.run.integrationBase.revision, label: agentName });
+		if (result.kind === "failed") {
+			const currentTask = journal.run.tasks[selected.index];
+			const currentAttempt = currentTask?.attempts[0];
+			if (currentTask && currentAttempt) {
+				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: currentTask, attempt: currentAttempt, dependencies, stage: result.stage, code: result.code, diagnostic: result.message });
+				if (transition) { journal = transition.journal; return pending(transition.note); }
+			}
+		}
 		if (result.kind !== "created" || result.branch !== branch || !isAbsolutePath(result.path) || !validIdentity(result.workspaceId) || !validIdentity(result.paneId) || !validIdentity(result.terminalId) || !validIdentity(result.tabId)) return pending("Herdr returned a malformed or contradictory worktree envelope; dispatch is pending.");
 		worktree = result;
 	} catch (error: unknown) {
@@ -2106,6 +2171,10 @@ async function dispatchInitialBuilder(input: {
 			started = await dependencies.herdr.startBuilder({ repositoryRoot, name: agentName, paneId: worktree.paneId, model });
 		} catch (error: unknown) {
 			return pending(`Builder agent start failed; dispatch is pending. ${error instanceof Error ? error.message : "Herdr agent start failed."}`);
+		}
+		if (started.kind === "failed") {
+			const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: journal.run.tasks[selected.index] ?? task, attempt: journal.run.tasks[selected.index]?.attempts[0] ?? initialAttempt, dependencies, stage: started.stage, code: started.code, diagnostic: started.message, identity: { name: agentName, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId }, requireExactMissing: true });
+			if (transition) { journal = transition.journal; return pending(transition.note); }
 		}
 		if (started.kind === "name-collision") {
 			if (collision === 7) return pending("Eight Steward-owned Builder names collided; the prepared Attempt is pending reconciliation.");
@@ -2155,6 +2224,10 @@ async function dispatchInitialBuilder(input: {
 	} catch (error: unknown) {
 		return pending(`Builder prompt failed; dispatch is pending without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}`);
 	}
+	if (prompted.kind === "failed") {
+		const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: journal.run.tasks[selected.index] ?? task, attempt: journal.run.tasks[selected.index]?.attempts[0] ?? agentIntent, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity: { name: agentName, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId }, requireExactMissing: true });
+		if (transition) { journal = transition.journal; return pending(transition.note); }
+	}
 	if (prompted.kind !== "prompted" || prompted.name !== agentName || prompted.workspaceId !== worktree.workspaceId || prompted.paneId !== worktree.paneId || prompted.terminalId !== worktree.terminalId || !validIdentity(prompted.tabId)) return pending("Herdr returned a malformed or contradictory Builder prompt envelope; dispatch is pending without a resend.");
 	const promptedAt = transitionTimestamp(journal, dependencies.clock.now());
 	let active: RunJournal;
@@ -2184,6 +2257,7 @@ type ReconciliationWorkflowResult = {
 	journal: RunJournal;
 	note: string;
 	action?: MonitorWorkflowAction;
+	diagnostic?: string;
 };
 
 function reconciliationCandidate(journal: RunJournal): { index: number; task: TaskRecord; attempt: AttemptRecord } | { ambiguous: true } | undefined {
@@ -2191,7 +2265,8 @@ function reconciliationCandidate(journal: RunJournal): { index: number; task: Ta
 	for (let index = 0; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index]!;
 		const attempt = task.attempts.at(-1);
-		if (!attempt || !["building", "reworking", "reviewing"].includes(task.phase) || !["prepared", "active", "awaiting-report"].includes(attempt.state)) continue;
+		const transientContinuation = attempt?.state === "ended-error" && task.attention === "recovering" && attempt.recovery?.infrastructure !== undefined;
+		if (!attempt || !["building", "reworking", "reviewing"].includes(task.phase) || (!["prepared", "active", "awaiting-report"].includes(attempt.state) && !transientContinuation)) continue;
 		if (attempt.role === "builder" && task.phase !== "building" && task.phase !== "reworking") continue;
 		if (attempt.role === "reviewer" && task.phase !== "reviewing") continue;
 		candidates.push({ index, task, attempt });
@@ -2202,7 +2277,7 @@ function reconciliationCandidate(journal: RunJournal): { index: number; task: Ta
 
 function recoveryIdentityFor(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
 	const dispatch = attempt.dispatch;
-	if (dispatch.phase !== "prompt-intended" && dispatch.phase !== "prompted" && dispatch.phase !== "reconciled-active") return undefined;
+	if (dispatch.phase !== "agent-intended" && dispatch.phase !== "assignment-intended" && dispatch.phase !== "prompt-intended" && dispatch.phase !== "prompted" && dispatch.phase !== "reconciled-active") return undefined;
 	return { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
 }
 
@@ -2280,6 +2355,235 @@ function preservationForSilenceSnapshot(task: TaskRecord, attempt: AttemptRecord
 	return { observedAt, worktreePath, branch, head: snapshot.git.head, worktree: snapshot.worktree, git: snapshot.git, assignment: snapshot.assignment, report: snapshot.report, evidence: snapshot.evidence };
 }
 
+type TransientTransition = { kind: "changed" | "degraded"; journal: RunJournal; note: string; action?: MonitorWorkflowAction; diagnostic?: string };
+
+function reviewDecisionFromTransient(transition: TransientTransition): ReviewDecision {
+	return { journal: transition.journal, note: transition.note, action: transition.action ?? (transition.kind === "degraded" ? "degraded" : "record-observation"), ...(transition.diagnostic ? { diagnostic: transition.diagnostic } : {}) };
+}
+
+function transientModelReason(attempt: AttemptRecord): "same-model-unavailable" | "same-model-retry-failed" {
+	return attempt.replacement ? "same-model-retry-failed" : "same-model-unavailable";
+}
+
+async function inspectTransientPreservation(repositoryRoot: string, task: TaskRecord, attempt: AttemptRecord, dependencies: StewardDependencies, observedAt: string): Promise<RecoveryPreservation | undefined> {
+	const branch = branchForAttempt(task, attempt);
+	const worktreePath = "worktreePath" in attempt.dispatch ? attempt.dispatch.worktreePath : attempt.role === "reviewer" ? attempt.worktree.path : undefined;
+	if (!branch || !worktreePath || !dependencies.runJournal.inspectAttemptPreservation || !dependencies.git.inspectManagedWorktreeProgress) return undefined;
+	const [preserved, progress] = await Promise.all([
+		dependencies.runJournal.inspectAttemptPreservation({ repositoryRoot, attempt }).catch(() => undefined),
+		dependencies.git.inspectManagedWorktreeProgress(worktreePath).catch(() => undefined),
+	]);
+	if (!preserved || preserved.kind !== "inspected" || !progress || progress.kind !== "observed" || progress.git.digest.kind !== "observed") return undefined;
+	return {
+		observedAt,
+		worktreePath,
+		branch,
+		head: progress.head,
+		worktree: progress.worktree,
+		git: { head: progress.git.head, digest: progress.git.digest.sha256 },
+		assignment: preserved.assignment,
+		report: preserved.report,
+		evidence: preserved.evidence,
+	};
+}
+
+function infrastructureOutcome(input: ClassifiedInfrastructureFact, observedAt: string, stop: InfrastructureOutcome["stop"]): InfrastructureOutcome {
+	return { kind: input.kind, stage: input.stage, observedAt, code: input.code.slice(0, 256), diagnostic: input.diagnostic.slice(0, 2_000), source: input.source ?? "typed-herdr-result", stop };
+}
+
+async function applyTransientInfrastructureRecovery(input: {
+	repositoryRoot: string;
+	controllerSessionId: string;
+	journal: RunJournal;
+	taskIndex: number;
+	task: TaskRecord;
+	attempt: AttemptRecord;
+	fact: ClassifiedInfrastructureFact;
+	dependencies: StewardDependencies;
+	alreadyMissing?: boolean;
+}): Promise<TransientTransition> {
+	let journal = input.journal;
+	const { dependencies, repositoryRoot, taskIndex, fact } = input;
+	void input.controllerSessionId;
+	let task = input.task;
+	let attempt = input.attempt;
+	const persist = async (update: (nextTask: TaskRecord, nextAttempt: AttemptRecord) => void): Promise<boolean> => {
+		let candidate: RunJournal;
+		try {
+			candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const nextTask = next.run.tasks[taskIndex];
+				const nextAttempt = nextTask?.attempts.find((item) => item.id === attempt.id);
+				if (!nextTask || !nextAttempt) throw new Error("Transient recovery Attempt disappeared before persistence.");
+				update(nextTask, nextAttempt);
+			});
+		} catch { return false; }
+		const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate).catch(() => undefined);
+		if (!replaced || replaced.kind !== "replaced") return false;
+		journal = replaced.journal;
+		task = journal.run.tasks[taskIndex] ?? task;
+		attempt = task.attempts.find((item) => item.id === attempt.id) ?? attempt;
+		return true;
+	};
+
+	const observedAt = transitionTimestamp(journal, dependencies.clock.now());
+	const preserved = await inspectTransientPreservation(repositoryRoot, task, attempt, dependencies, observedAt);
+	const failureLive = recoveryLiveRecord({ observedAt, kind: input.alreadyMissing || fact.kind === "unexpected-process-exit" ? "missing" : "unclear", diagnostic: fact.diagnostic });
+	const identity = recoveryIdentityFor(attempt);
+	const existingOutcome = attempt.recovery?.infrastructure;
+	if (existingOutcome?.stop.phase === "ambiguous") return { kind: "degraded", journal, note: existingOutcome.stop.diagnostic, diagnostic: "Transient stop ambiguity is durable; no effect will be repeated." };
+	if (existingOutcome?.stop.phase === "intended") {
+		const intendedStop = existingOutcome.stop;
+		const diagnostic = "A graceful stop was intended but its acknowledgement was not retained; the exact stop effect is ambiguous and no replacement effect will be attempted.";
+		const changed = await persist((nextTask, nextAttempt) => {
+			nextAttempt.state = "ended-error";
+			nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, ...(preserved ? { preservation: preserved } : {}), infrastructure: infrastructureOutcome(fact, existingOutcome.observedAt, { phase: "ambiguous", intendedAt: intendedStop.intendedAt, observedAt, agent: intendedStop.agent, diagnostic }) };
+			nextTask.attention = "needs-user";
+			nextTask.attentionReason = "transient-stop-ambiguous";
+			nextTask.attentionDiagnostic = diagnostic;
+		});
+		return changed ? { kind: "changed", journal, note: diagnostic } : { kind: "degraded", journal, note: diagnostic, diagnostic: "Transient stop ambiguity CAS failed." };
+	}
+	const stopRequired = identity !== undefined && !input.alreadyMissing && !(fact.kind === "agent-startup-failure" && attempt.state === "prepared") && fact.kind !== "unexpected-process-exit";
+	if (!preserved) {
+		const stop: InfrastructureOutcome["stop"] = identity ? { phase: "ambiguous", intendedAt: observedAt, observedAt, agent: identity, diagnostic: "Typed transient infrastructure failure was observed, but exact worktree, report, Assignment, or evidence preservation was unavailable; no stop or replacement effect was attempted." } : { phase: "not-required", reason: "never-started" };
+		const outcome = infrastructureOutcome(fact, observedAt, stop);
+		const changed = await persist((nextTask, nextAttempt) => {
+			nextAttempt.state = "ended-error";
+			nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, infrastructure: outcome };
+			nextTask.attention = "needs-user";
+			nextTask.attentionReason = "transient-stop-ambiguous";
+			nextTask.attentionDiagnostic = outcome.diagnostic;
+		});
+		return changed ? { kind: "changed", journal, note: "Typed transient failure was durably retained, but exact preservation was unavailable; no stop or replacement effect was attempted." } : { kind: "degraded", journal, note: "Typed transient failure was observed, but its preservation and no-effect needs-user state could not be persisted.", diagnostic: "Transient recovery CAS failed." };
+	}
+
+	let stop: InfrastructureOutcome["stop"] = existingOutcome?.stop ?? (fact.kind === "unexpected-process-exit" || input.alreadyMissing ? { phase: "not-required", reason: "already-missing" } : !stopRequired ? { phase: "not-required", reason: "never-started" } : { phase: "intended", intendedAt: observedAt, agent: identity! });
+	let outcome = infrastructureOutcome(fact, observedAt, stop);
+	if (!(await persist((nextTask, nextAttempt) => {
+		nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, preservation: preserved, infrastructure: outcome };
+		nextAttempt.state = "ended-error";
+		nextTask.attention = "recovering";
+		nextTask.attentionReason = "transient-infrastructure-recovery";
+		nextTask.attentionDiagnostic = stop.phase === "intended" ? "Typed transient infrastructure recovery is preserving exact evidence before one graceful stop." : "Typed transient infrastructure recovery retained the exact missing resource and is deriving one linked successor.";
+	}))) return { kind: "degraded", journal, note: "Typed transient failure was observed, but its preservation and stop intent could not be persisted; no stop or replacement effect was attempted.", diagnostic: "Transient stop intent CAS failed." };
+
+	if (stop.phase === "intended") {
+		let stopped: HerdrStopResult;
+		try { stopped = dependencies.herdr.stopAgentGracefully ? await dependencies.herdr.stopAgentGracefully({ repositoryRoot, name: identity!.name, workspaceId: identity!.workspaceId, paneId: identity!.paneId, terminalId: identity!.terminalId }) : { kind: "ambiguous", message: "Graceful stop adapter is unavailable." }; }
+		catch (error: unknown) { stopped = { kind: "ambiguous", message: error instanceof Error ? error.message : "Graceful stop failed." }; }
+		const exact = stopped.kind === "acknowledged" && stopped.name === identity!.name && stopped.workspaceId === identity!.workspaceId && stopped.paneId === identity!.paneId && stopped.terminalId === identity!.terminalId;
+		const acknowledgedAt = transitionTimestamp(journal, dependencies.clock.now());
+		stop = exact ? { phase: "acknowledged", intendedAt: observedAt, acknowledgedAt, agent: identity! } : { phase: "ambiguous", intendedAt: observedAt, observedAt: acknowledgedAt, agent: identity!, diagnostic: stopped.kind === "failed" || stopped.kind === "ambiguous" ? stopped.message : "Wrong-identity or malformed graceful stop acknowledgement." };
+		outcome = infrastructureOutcome(fact, observedAt, stop);
+		const recorded = await persist((nextTask, nextAttempt) => {
+			nextAttempt.state = "ended-error";
+			nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, preservation: preserved, infrastructure: outcome };
+			if (!exact) { nextTask.attention = "needs-user"; nextTask.attentionReason = "transient-stop-ambiguous"; nextTask.attentionDiagnostic = outcome.diagnostic; }
+		});
+		if (!recorded) return { kind: "degraded", journal, note: "Graceful stop was attempted, but its exact acknowledgement state could not be persisted; no replacement effect was attempted.", diagnostic: "Transient stop acknowledgement CAS failed." };
+		if (!exact) return { kind: "changed", journal, note: "Graceful stop acknowledgement was not proven for the exact recorded identity; the durable ambiguity state forbids a replacement effect." };
+	}
+
+	const links = task.attempts.flatMap((candidate) => candidate.replacement ? [{ kind: candidate.replacement.kind, retryOrdinal: candidate.replacement.retryOrdinal, replacesAttemptId: candidate.replacement.replacesAttemptId, actualModel: candidate.actualModel }] : []);
+	const ordinal = replacementRetryOrdinal(links, journal.run.effectiveSettings.transientRetryLimit);
+	const finishNeedsUser = async (reason: "transient-fallback-unavailable" | "transient-retries-exhausted" | "transient-stop-ambiguous", diagnostic: string): Promise<TransientTransition> => {
+		const changed = await persist((nextTask, nextAttempt) => {
+			nextAttempt.state = "ended-error";
+			nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, preservation: preserved, infrastructure: outcome };
+			nextTask.attention = "needs-user";
+			nextTask.attentionReason = reason;
+			nextTask.attentionDiagnostic = diagnostic.slice(0, 2_000);
+		});
+		return changed ? { kind: "changed", journal, note: diagnostic } : { kind: "degraded", journal, note: `${diagnostic} Durable needs-user state could not be persisted.`, diagnostic: "Transient terminal state CAS failed." };
+	};
+	if (!ordinal) return finishNeedsUser("transient-retries-exhausted", "The frozen transient replacement budget is exhausted; the latest Attempt ended with a typed infrastructure failure and no third successor was reserved.");
+
+	const plan = journal.run.modelPlan[attempt.role];
+	const choices = [plan.primary, ...plan.fallbacks];
+	const inspections = await Promise.all(choices.map(async (choice, planIndex) => {
+		if (!dependencies.model.inspectModelChoice) return { choice: { ...choice }, available: false, diagnostics: [{ code: "inspection-unavailable" }] };
+		try { const inspected = await dependencies.model.inspectModelChoice(choice, attempt.role, planIndex); return { choice: { ...inspected.choice }, available: inspected.available, diagnostics: inspected.diagnostics.map((item) => ({ code: item.code })) }; }
+		catch { return { choice: { ...choice }, available: false, diagnostics: [{ code: "inspection-failed" }] }; }
+	}));
+	const builderProvider = task.attempts.slice().reverse().find((candidate) => candidate.role === "builder" && candidate.id !== attempt.id)?.actualModel.model;
+	const selection = selectTransientModel({ actualModel: attempt.actualModel, plan, inspections, reason: transientModelReason(attempt), ...(attempt.role === "reviewer" && builderProvider ? { requireProviderDifferentFrom: parseCanonicalModelReference(builderProvider)?.provider, allowSameProvider: attempt.independence.kind === "same-provider-family-approved" } : {}) });
+	if (selection.kind === "unavailable") return finishNeedsUser("transient-fallback-unavailable", "No strictly-forward approved model remained for the typed transient recovery; no successor was reserved.");
+
+	const dispatch = attempt.dispatch;
+	const worktreePath = preserved.worktreePath;
+	const branch = preserved.branch;
+	const predecessor = task.attempts.slice(0, task.attempts.findIndex((candidate) => candidate.id === attempt.id)).reverse().find((candidate) => candidate.role === attempt.role || (attempt.role === "reviewer" && candidate.role === "builder"));
+	const sourcePaneId = "paneId" in dispatch ? dispatch.paneId : "sourcePaneId" in dispatch ? dispatch.sourcePaneId : predecessor && "paneId" in predecessor.dispatch ? predecessor.dispatch.paneId : undefined;
+	const workspaceId = "workspaceId" in dispatch ? dispatch.workspaceId : predecessor && "workspaceId" in predecessor.dispatch ? predecessor.dispatch.workspaceId : undefined;
+	if (!sourcePaneId || !workspaceId) return finishNeedsUser("transient-stop-ambiguous", "The typed transient recovery has no exact source pane/workspace identity for a no-focus successor; no successor was reserved.");
+	const nextAttemptId = `attempt-${String(task.attempts.length + 1).padStart(2, "0")}`;
+	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, task.contract.id, nextAttemptId);
+	const replacementName = `${attempt.role === "builder" ? "steward-b" : "steward-r"}-${compactUuid(dependencies.clock)}-${nextAttemptId.replace(/[^0-9]/g, "")}`;
+	if (!safeHerdrName(replacementName)) return finishNeedsUser("transient-fallback-unavailable", "A safe Steward-owned successor name could not be derived; no successor was reserved.");
+	const modelSelection = selection.kind === "same-model-first" ? { kind: "same-model-first" as const, planIndex: selection.planIndex } : { kind: "approved-fallback" as const, planIndex: selection.planIndex, reason: selection.reason, skipped: selection.skipped };
+	const replacement: AttemptReplacement = { kind: "transient-recovery", trigger: fact.kind, replacesAttemptId: attempt.id, retryOrdinal: ordinal, preservedAt: transitionTimestamp(journal, dependencies.clock.now()), modelSelection };
+	const successorIndependence = attempt.role === "reviewer"
+		? (() => {
+			const builder = task.attempts.slice().reverse().find((candidate) => candidate.role === "builder");
+			const builderProvider = builder ? parseCanonicalModelReference(builder.actualModel.model)?.provider : undefined;
+			const reviewerProvider = parseCanonicalModelReference(selection.choice.model)?.provider;
+			return builderProvider && reviewerProvider && builderProvider !== reviewerProvider
+				? { kind: "different-provider-family" as const, builderProvider, reviewerProvider }
+				: { ...attempt.independence };
+		})()
+		: undefined;
+	const replacementDispatch = attempt.role === "builder"
+		? { phase: "replacement-pane-intended" as const, branch, worktreePath, agentName: replacementName, sourcePaneId, workspaceId }
+		: { phase: "replacement-pane-intended" as const, sourcePaneId, worktreePath, agentName: replacementName, branch, workspaceId };
+	const reservedAt = replacement.preservedAt;
+	const reserved = await persist((nextTask, nextAttempt) => {
+		if (nextAttempt.state !== attempt.state || nextAttempt.id !== attempt.id) throw new Error("Transient predecessor changed before successor reservation.");
+		nextAttempt.state = "superseded";
+		nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, preservation: preserved, infrastructure: outcome };
+		const successor: AttemptRecord = attempt.role === "builder"
+			? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, specificationHash: attempt.specificationHash, baseRevision: attempt.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
+			: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, specificationHash: attempt.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: attempt.subject, independence: successorIndependence!, worktree: { path: attempt.worktree.path, baseline: { ...attempt.worktree.baseline, dirtyPaths: [...attempt.worktree.baseline.dirtyPaths], operationMarkers: [...attempt.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
+		nextTask.attempts.push(successor);
+		nextTask.attention = "none";
+		delete nextTask.attentionReason;
+		delete nextTask.attentionDiagnostic;
+	});
+	return reserved ? { kind: "changed", journal, note: `Reserved transient replacement Attempt ${nextAttemptId} at retry ordinal ${ordinal}; no successor effect was attempted in this pass.`, action: "reserve-transient-replacement" } : { kind: "degraded", journal, note: "Typed transient recovery lost its successor reservation Journal race; no pane, start, or prompt effect was attempted.", diagnostic: "Transient successor reservation CAS failed." };
+}
+
+async function recoverTypedHerdrFailure(input: {
+	repositoryRoot: string;
+	controllerSessionId: string;
+	journal: RunJournal;
+	taskIndex: number;
+	task: TaskRecord;
+	attempt: AttemptRecord;
+	dependencies: StewardDependencies;
+	stage: import("./reconciliation.ts").TransientInfrastructureStage;
+	code: string;
+	diagnostic: string;
+	identity?: ManagedAgentIdentity;
+	requireExactMissing?: boolean;
+}): Promise<TransientTransition | undefined> {
+	const fact = classifyInfrastructureFact({ stage: input.stage, code: input.code, diagnostic: input.diagnostic, source: "typed-herdr-result" });
+	if (!fact) return undefined;
+	let alreadyMissing = false;
+	if (input.requireExactMissing && (fact.kind === "agent-startup-failure" || fact.kind === "unexpected-process-exit")) {
+		if (!input.identity || !input.dependencies.herdr.inspectManagedAgent) return undefined;
+		let observed: ManagedAgentInspection;
+		try { observed = await input.dependencies.herdr.inspectManagedAgent(input.identity); }
+		catch { return undefined; }
+		if (observed.kind !== "missing") return undefined;
+		alreadyMissing = true;
+	} else if (input.requireExactMissing && input.identity && input.dependencies.herdr.inspectManagedAgent) {
+		try {
+			const observed = await input.dependencies.herdr.inspectManagedAgent(input.identity);
+			if (observed.kind === "missing") alreadyMissing = true;
+		} catch { /* Typed provider/command facts remain authoritative; stop is still gated below. */ }
+	}
+	return applyTransientInfrastructureRecovery({ ...input, fact, alreadyMissing });
+}
+
 function sameFact(left: unknown, right: unknown): boolean {
 	const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonical(item)])) : value;
 	return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
@@ -2345,6 +2649,14 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 		journal = replaced.journal;
 		return true;
 	};
+
+	if (attempt.state === "ended-error" && task.attention === "recovering" && attempt.recovery?.infrastructure) {
+		const recorded = attempt.recovery.infrastructure;
+		const fact = classifyInfrastructureFact({ stage: recorded.stage, code: recorded.code, diagnostic: recorded.diagnostic, source: recorded.source });
+		if (!fact) return { kind: "degraded", journal, note: "The durable transient infrastructure fact is not an allowlisted typed fact; no recovery effect was attempted.", diagnostic: "Transient recovery fact could not be reclassified." };
+		const transition = await applyTransientInfrastructureRecovery({ repositoryRoot, controllerSessionId, journal, taskIndex: index, task, attempt, fact, dependencies });
+		return { kind: transition.kind, journal: transition.journal, note: transition.note, ...(transition.action ? { action: transition.action } : {}), ...(transition.diagnostic ? { diagnostic: transition.diagnostic } : {}) };
+	}
 
 		const continuePreparedDispatch = async (): Promise<ReconciliationWorkflowResult | undefined> => {
 			if (attempt.state !== "prepared") return undefined;
@@ -2479,6 +2791,10 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 				let prompted: HerdrPromptResult;
 			try { prompted = dependencies.herdr.promptReplacementAgent ? await dependencies.herdr.promptReplacementAgent({ repositoryRoot, identity, assignmentPrompt: prompt }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Replacement prompt adapter is unavailable." }; }
 			catch (error: unknown) { prompted = { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Replacement prompt failed." }; }
+			if (prompted.kind === "failed") {
+				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId, journal, taskIndex: index, task, attempt, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity, requireExactMissing: true });
+				if (transition) return { kind: transition.kind, journal: transition.journal, note: transition.note, ...(transition.action ? { action: transition.action } : {}) };
+			}
 			const exact = prompted.kind === "prompted" && prompted.name === identity.name && prompted.workspaceId === identity.workspaceId && prompted.paneId === identity.paneId && prompted.terminalId === identity.terminalId;
 			if (!exact) {
 				const ambiguous = await markReplacementAmbiguous(prompted.kind === "failed" ? prompted.message : "Wrong-identity or malformed replacement prompt acknowledgement.");
@@ -2509,6 +2825,10 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 				const ambiguous = await markReplacementAmbiguous(error instanceof Error ? error.message : "Recovery pane split failed.");
 				return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The reserved replacement pane effect is ambiguous; its durable tombstone forbids a second pane split." : "The reserved silent replacement pane could not be created; the same prepared Attempt remains pending." };
 			}
+			if (pane.kind === "failed") {
+				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId, journal, taskIndex: index, task, attempt, dependencies, stage: pane.stage, code: pane.code, diagnostic: pane.message });
+				if (transition) return { kind: transition.kind, journal: transition.journal, note: transition.note, ...(transition.action ? { action: transition.action } : {}) };
+			}
 			if (pane.kind !== "created" || pane.sourcePaneId !== dispatch.sourcePaneId || pane.worktreePath !== dispatch.worktreePath || pane.workspaceId !== dispatch.workspaceId || !validIdentity(pane.paneId) || !validIdentity(pane.terminalId) || !validIdentity(pane.tabId)) {
 				const ambiguous = await markReplacementAmbiguous("Herdr returned a malformed or contradictory recovery-pane identity.");
 				return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The reserved replacement pane acknowledgement is ambiguous; its durable tombstone forbids a second pane split." : "The reserved silent replacement returned a malformed or contradictory pane identity; no resource was adopted." };
@@ -2532,6 +2852,10 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 				created = await dependencies.herdr.createBuilderWorktree({ repositoryRoot, branch: dispatch.branch, baseRevision: attempt.baseRevision, label: dispatch.agentName });
 			} catch (error: unknown) {
 				return { kind: "degraded", journal, note: `Prepared Builder worktree creation failed; the same Attempt remains pending. ${error instanceof Error ? error.message : "Worktree creation failed."}` };
+			}
+			if (created.kind === "failed") {
+				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId, journal, taskIndex: index, task, attempt, dependencies, stage: created.stage, code: created.code, diagnostic: created.message });
+				if (transition) return { kind: transition.kind, journal: transition.journal, note: transition.note, ...(transition.action ? { action: transition.action } : {}) };
 			}
 			if (created.kind !== "created" || created.branch !== dispatch.branch || !isAbsolutePath(created.path) || !validIdentity(created.workspaceId) || !validIdentity(created.paneId) || !validIdentity(created.terminalId) || !validIdentity(created.tabId)) return { kind: "degraded", journal, note: "Prepared Builder worktree creation returned a malformed or contradictory envelope; no resource was adopted." };
 			let inspected: BuilderWorktreeInspection;
@@ -2583,6 +2907,10 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 						nextAttempt.dispatch = { ...nextAttempt.dispatch, agentName: replacement } as AttemptRecord["dispatch"];
 					});
 					return changed ? { kind: "changed", journal, note: `The prepared ${attempt.role} name collided; a new Steward-owned name was retained inside Attempt ${attempt.id} and no other Attempt was created.`, action: "record-observation" } : { kind: "degraded", journal, note: "The prepared Attempt name collision could not be durably reconciled; no second Attempt was created." };
+				}
+				if (started.kind === "failed") {
+					const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId, journal, taskIndex: index, task, attempt, dependencies, stage: started.stage, code: started.code, diagnostic: started.message, identity, requireExactMissing: true });
+					if (transition) return { kind: transition.kind, journal: transition.journal, note: transition.note, ...(transition.action ? { action: transition.action } : {}) };
 				}
 				if (started.kind !== "started" || started.name !== identity.name || started.agentKind !== "pi" || started.workspaceId !== identity.workspaceId || started.paneId !== identity.paneId || started.terminalId !== identity.terminalId || !validIdentity(started.tabId)) {
 					const ambiguous = await markReplacementAmbiguous(started.kind === "failed" ? started.message : "The replacement agent start acknowledgement was malformed or contradictory.");
@@ -2684,7 +3012,12 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 	let inspected: ManagedAgentInspection;
 	try { inspected = await inspectManagedAgent(liveIdentity); } catch (error: unknown) { inspected = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr inspection failed." }; }
 	if (inspected.kind === "observed" && !exactIdentity(inspected.identity, liveIdentity)) inspected = { kind: "unclear", diagnostic: "Herdr returned a different name, workspace, pane, or terminal identity." };
+	if (inspected.kind === "unclear" && inspected.availability === "unavailable") return { kind: "degraded", journal, note: "Herdr observation is temporarily unavailable; the exact Attempt and attention state remain unchanged.", diagnostic: inspected.diagnostic.slice(0, 2_000) };
 	const observedAt = transitionTimestamp(journal, dependencies.clock.now());
+	if (inspected.kind === "missing" && inspected.code === "agent_not_found" && reportState === "missing") {
+		const fact = classifyInfrastructureFact({ stage: "agent-runtime", code: "agent_not_found", diagnostic: inspected.diagnostic, source: "exact-agent-missing" });
+		if (fact) return applyTransientInfrastructureRecovery({ repositoryRoot, controllerSessionId, journal, taskIndex: index, task, attempt, fact, dependencies, alreadyMissing: true });
+	}
 	const liveKind = inspected.kind === "observed"
 		? inspected.lifecycle === "working" || inspected.lifecycle === "blocked" ? inspected.lifecycle : inspected.lifecycle === "idle" || inspected.lifecycle === "done" ? "settled" : "unclear"
 		: inspected.kind === "missing" ? "missing" : "unclear";
@@ -2890,7 +3223,7 @@ async function inspectSilenceAttempt(repositoryRoot: string, task: TaskRecord, a
 	if (preserved.kind !== "inspected") diagnostics.push(preserved.diagnostic);
 	const process = dependencies.process.inspectAttemptProcesses ? await dependencies.process.inspectAttemptProcesses({ repositoryRoot, identity }).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Process inspection failed." } as SilenceProcessObservation)) : { kind: "unavailable", diagnostic: "Process inspection adapter is unavailable." } as SilenceProcessObservation;
 	if (process.kind === "unavailable") diagnostics.push(process.diagnostic);
-	if (preserved.kind !== "inspected") return { kind: "incomplete", diagnostic: diagnostics.join(" ").slice(0, 2_000) };
+	if (preserved.kind !== "inspected" || "kind" in preserved.assignment) return { kind: "incomplete", diagnostic: diagnostics.join(" ").slice(0, 2_000) || "Assignment preservation is not yet complete." };
 	const snapshot: SilenceInspectionSnapshot = { attemptId: attempt.id, role: attempt.role, agent: { ...identity }, lifecycle, stateChangeSequence, terminal, worktree, git, assignment: preserved.assignment, report: preserved.report, evidence: preserved.evidence, process };
 	if (diagnostics.length > 0 || terminal.kind === "unavailable" || worktree.kind === "unavailable" || git.diagnostic) return { kind: "incomplete", snapshot, diagnostic: diagnostics.join(" ").slice(0, 2_000) || "One or more passive inspection sources were unavailable." };
 	return { kind: "complete", snapshot };

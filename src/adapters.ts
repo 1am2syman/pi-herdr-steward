@@ -458,6 +458,12 @@ function exactIdentityForAdapter(left: ManagedAgentIdentity, right: ManagedAgent
 	return left.name === right.name && left.workspaceId === right.workspaceId && left.paneId === right.paneId && left.terminalId === right.terminalId;
 }
 
+function unavailableManagedAgent(diagnostic: string): ManagedAgentInspection {
+	const value = { kind: "unclear" as const, diagnostic } as ManagedAgentInspection & { availability: "unavailable" };
+	Object.defineProperty(value, "availability", { value: "unavailable", enumerable: false });
+	return value;
+}
+
 export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerdrAdapter {
 	return {
 		async checkAvailability(repositoryRoot) {
@@ -535,7 +541,7 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			const resultValue = resultObject(envelope);
 			const agent = objectValue(resultValue?.agent);
 			const identity = identityFields(agent);
-			if (resultValue?.type === "agent_prompted" && identity && identity.name === input.name) return { kind: "prompted", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+			if (resultValue?.type === "agent_prompted" && identity && identity.name === input.name && safeIdentity(identity.workspaceId) && safeIdentity(identity.paneId) && safeIdentity(identity.terminalId)) return { kind: "prompted", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
 			const error = safeErrorEnvelope(result);
 			return { kind: "failed", stage: "agent-prompt", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid agent_prompted envelope." };
 		},
@@ -574,7 +580,7 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			catch (error: unknown) { return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Herdr Reviewer prompt failed." }; }
 			const value = resultObject(safeEnvelope(result));
 			const identity = identityFields(objectValue(value?.agent));
-			if (value?.type === "agent_prompted" && identity && identity.name === input.name) return { kind: "prompted", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
+			if (value?.type === "agent_prompted" && identity && identity.name === input.name && safeIdentity(identity.workspaceId) && safeIdentity(identity.paneId) && safeIdentity(identity.terminalId)) return { kind: "prompted", name: identity.name, workspaceId: identity.workspaceId, tabId: identity.tabId, paneId: identity.paneId, terminalId: identity.terminalId };
 			const error = safeErrorEnvelope(result);
 			return { kind: "failed", stage: "agent-prompt", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid Reviewer agent_prompted envelope." };
 		},
@@ -630,16 +636,22 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			return { kind: result.killed ? "ambiguous" : "failed", message: error?.message ?? "Herdr returned no valid same-identity /quit acknowledgement." };
 		},
 		async inspectManagedAgent(identity) {
-			if (!exec) return { kind: "unclear", diagnostic: "The Pi command runner is unavailable." };
+			if (!exec) return unavailableManagedAgent("The Pi command runner is unavailable.");
 			try {
 				const result = await exec("herdr", ["agent", "get", identity.name], { timeout: 5000 });
 				const observed = exactManagedAgent(identity, result, "cli:agent:get");
 				if (observed) return observed;
 				const error = safeErrorEnvelope(result);
-				if (error?.id === "cli:agent:get" && error.code === "agent_not_found" && result.stdout.trim() === "") return { kind: "missing", diagnostic: error.message };
-				return { kind: "unclear", diagnostic: result.killed ? "Herdr agent get was killed." : error?.message ?? "Herdr returned no valid same-identity agent_info envelope." };
+					if (error?.id === "cli:agent:get" && error.code === "agent_not_found" && result.stdout.trim() === "") {
+						const missing = { kind: "missing" as const, diagnostic: error.message } as ManagedAgentInspection & { code: "agent_not_found" };
+						Object.defineProperty(missing, "code", { value: "agent_not_found", enumerable: false });
+						return missing;
+					}
+				return error?.code === "server_unavailable" || error?.code === "runner_unavailable"
+					? unavailableManagedAgent(error.message)
+					: { kind: "unclear", diagnostic: result.killed ? "Herdr agent get was killed." : error?.message ?? "Herdr returned no valid same-identity agent_info envelope." };
 			} catch (error: unknown) {
-				return { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr agent get failed." };
+				return unavailableManagedAgent(error instanceof Error ? error.message : "Herdr agent get failed.");
 			}
 		},
 		async waitForManagedAgent(identity, timeoutMs, signal): Promise<MonitorWaitResult> {
