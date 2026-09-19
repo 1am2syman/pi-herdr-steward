@@ -8,7 +8,7 @@ import { afterEach, it, vi } from "vitest";
 import { createRunJournalStore } from "../src/run-journal-store.ts";
 import { createAttemptEvidenceStore, sha256Bytes } from "../src/attempt-evidence-store.ts";
 import { resolveAssignmentPaths } from "../src/assignment-store.ts";
-import { buildInitialRunJournal, cloneRunJournal, COMPLETION_GATE_PREDICATES, deserializeRunJournal, serializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type BuilderAttemptRecord, type MonitorCheckpoint, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
+import { buildInitialRunJournal, cloneRunJournal, COMPLETION_GATE_PREDICATES, deserializeRunJournal, serializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type AttemptRecovery, type BuilderAttemptRecord, type MonitorCheckpoint, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
 import type { ReviewSubject } from "../src/review.ts";
 import { type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
 import type { BuilderAssignmentDocument } from "../src/run.ts";
@@ -49,6 +49,59 @@ function journal(runId: string, revision = 1, updatedAt = "2026-09-17T18:00:00.0
 		integrationBase: { kind: "none" },
 	});
 	return { ...created, journalRevision: revision, run: { ...created.run, updatedAt } };
+}
+
+function recoveryJournal(variant: "working" | "reconciled" | "awaiting" | "missing"): RunJournal {
+	const base = buildInitialRunJournal({
+		identity: { runId: "run-20260918T000000000Z-recovery", createdAt: "2026-09-18T00:00:00.000Z" },
+		controllerSessionId: "storage-session",
+		draft: {
+			declaredOutcome: "Persist recovery facts",
+			tasks: [{ requiredOutcome: "Keep the exact Attempt", allowedScope: ["src"], expectedArtifacts: [{ kind: "git-commit" }], verification: { kind: "command", command: "npm test" }, reviewRequired: false }],
+			modelPlan: plans,
+			effectiveSettings: settings,
+			finalVerification: { kind: "command", command: "npm test" },
+		},
+		modelPlan: plans,
+		effectiveSettings: settings,
+		integrationBase: { kind: "git", branch: "main", revision: "0".repeat(40) },
+	});
+	const task = base.run.tasks[0]!;
+	const assignmentPath = "/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-01/assignment.json";
+	const attemptBase: BuilderAttemptRecord = {
+		id: "attempt-01",
+		role: "builder",
+		state: variant === "awaiting" ? "awaiting-report" : "active",
+		preparedAt: "2026-09-18T00:00:01.000Z",
+		activatedAt: "2026-09-18T00:00:02.000Z",
+		actualModel: { ...plans.builder.primary },
+		specificationHash: task.specificationHash,
+		baseRevision: "0".repeat(40),
+		assignmentPath,
+		reportPath: assignmentPath.replace("assignment.json", "report.md"),
+		evidenceDirectory: assignmentPath.replace("assignment.json", "evidence"),
+		dispatch: ({
+			phase: variant === "reconciled" ? "reconciled-active" : "prompted",
+			branch: "steward/run/task/attempt-01",
+			agentName: "steward-b-abcdef12-01-01",
+			worktreePath: "/tmp/recovery-run/worktree",
+			workspaceId: "workspace-1",
+			paneId: "pane-1",
+			terminalId: "terminal-1",
+			assignmentSha256: `sha256:${"a".repeat(64)}`,
+			...(variant === "reconciled" ? { reconciledAt: "2026-09-18T00:00:02.000Z", basis: "matching-live-agent" as const } : { promptedAt: "2026-09-18T00:00:02.000Z" }),
+		} as BuilderAttemptRecord["dispatch"]),
+	};
+	const liveKind: AttemptRecovery["live"]["kind"] = variant === "missing" ? "missing" : variant === "awaiting" ? "settled" : variant === "reconciled" ? "unclear" : "working";
+	const recovery: AttemptRecovery = {
+		live: { observedAt: "2026-09-18T00:00:03.000Z", kind: liveKind, ...(liveKind === "working" ? { lifecycle: "working" as const } : liveKind === "settled" ? { lifecycle: "idle" as const } : liveKind === "unclear" ? { lifecycle: "unknown" as const, diagnostic: "bounded unclear observation" } : {}) },
+		...(variant === "awaiting" ? { reportRequest: { phase: "requested" as const, intendedAt: "2026-09-18T00:00:03.000Z", requestedAt: "2026-09-18T00:00:04.000Z", agent: { name: "steward-b-abcdef12-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, reportPath: assignmentPath.replace("assignment.json", "report.md") } } : {}),
+		...(variant === "missing" ? { preservation: { observedAt: "2026-09-18T00:00:04.000Z", worktreePath: "/tmp/recovery-run/worktree", branch: "steward/run/task/attempt-01", head: "1".repeat(40), worktree: { kind: "observed" as const, byteCount: 0, sha256: `sha256:${"b".repeat(64)}` }, git: { head: "1".repeat(40), digest: `sha256:${"c".repeat(64)}` }, assignment: { path: assignmentPath, sha256: `sha256:${"d".repeat(64)}`, size: 10 }, report: { kind: "missing" as const }, evidence: { directory: assignmentPath.replace("assignment.json", "evidence"), count: 0, byteCount: 0, sha256: `sha256:${"e".repeat(64)}`, entries: [] } } } : {}),
+	};
+	const value: RunJournal = { ...base, journalRevision: 2, run: { ...base.run, updatedAt: "2026-09-18T00:00:05.000Z", tasks: [{ ...task, phase: "building", attention: variant === "missing" || variant === "reconciled" ? "recovering" : "none", ...(variant === "missing" ? { attentionReason: "reconciliation-agent-missing" as const } : variant === "reconciled" ? { attentionReason: "reconciliation-live-unclear" as const } : {}), attempts: [{ ...attemptBase, recovery }] }] } };
+	const validated = validateRunJournal(value);
+	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
+	return validated.value;
 }
 
 function maxHistoryJournal(): RunJournal {
@@ -272,6 +325,32 @@ it.sequential("creates an exact protected journal and reloads it", async () => {
 	deepStrictEqual((await store.loadActive(root)).kind, "loaded");
 	ok(!Object.prototype.hasOwnProperty.call(input.run, "monitor"));
 	deepStrictEqual(await listTemporaryFiles(result.paths.stewardDirectory), []);
+});
+
+it.sequential("round-trips ticket-10 recovery branches and rejects impossible recovery combinations", async () => {
+	for (const variant of ["working", "reconciled", "awaiting", "missing"] as const) {
+		const value = recoveryJournal(variant);
+		const bytes = serializeRunJournal(value);
+		const decoded = deserializeRunJournal(bytes, "active-run.json");
+		ok(decoded.value, `${variant} recovery did not decode`);
+		if (!decoded.value) continue;
+		deepStrictEqual(decoded.value, value);
+		deepStrictEqual(cloneRunJournal(value), value);
+	}
+	const missing = JSON.parse(serializeRunJournal(recoveryJournal("missing"))) as Record<string, unknown>;
+	const missingTask = (missing.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>;
+	const missingAttempt = missingTask[0]!.attempts as Array<Record<string, unknown>>;
+	const missingRecovery = missingAttempt[0]!.recovery as Record<string, unknown>;
+	delete missingRecovery.preservation;
+	ok(!deserializeRunJournal(JSON.stringify(missing), "active-run.json").value, "missing recovery without preservation was accepted");
+	const awaiting = JSON.parse(serializeRunJournal(recoveryJournal("awaiting"))) as Record<string, unknown>;
+	const awaitingAttempt = ((awaiting.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>;
+	delete (awaitingAttempt[0]!.recovery as Record<string, unknown>).reportRequest;
+	ok(!deserializeRunJournal(JSON.stringify(awaiting), "active-run.json").value, "awaiting-report without request was accepted");
+	const unknown = JSON.parse(serializeRunJournal(recoveryJournal("working"))) as Record<string, unknown>;
+	const unknownAttempt = ((unknown.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>;
+	((unknownAttempt[0]!.recovery as Record<string, unknown>).live as Record<string, unknown>).unexpected = true;
+	ok(!deserializeRunJournal(JSON.stringify(unknown), "active-run.json").value, "unknown recovery keys were accepted");
 });
 
 it.sequential("accepts an optional strict monitor checkpoint, clones it, and rejects unknown monitor keys", async () => {

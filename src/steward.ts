@@ -14,6 +14,7 @@ import {
 	type ThinkingLevel,
 } from "./config.ts";
 import type { ActiveRunLoadResult, ActivityAppendResult, AttemptReportInspection, CreateActiveResult } from "./run-journal-store.ts";
+import type { TaskFactRequestResult } from "./reconciliation.ts";
 import type { AssignmentCreateResult, AssignmentPaths } from "./assignment-store.ts";
 import {
 	buildInitialRunJournal,
@@ -107,8 +108,28 @@ import type {
 	VerificationEvidenceInput,
 	VerificationFinalizeResult,
 } from "./completion-store.ts";
+import { decideReconciliation, parseTaskFactRequest, resolveTaskFactAnswer, taskFactValue, type ReconciliationDecision, type TaskFactKey } from "./reconciliation.ts";
 
 export type { MonitorDigest, MonitorLifecycle } from "./run.ts";
+
+type ProvenDispatch = Extract<AttemptRecord["dispatch"], { phase: "prompted" | "reconciled-active" }>;
+type ProvenAttempt = AttemptRecord & { dispatch: ProvenDispatch };
+type AssignmentDispatch = Extract<AttemptRecord["dispatch"], { phase: "prompt-intended" | "prompted" | "reconciled-active" }>;
+type AssignmentAttempt = AttemptRecord & { dispatch: AssignmentDispatch };
+
+function hasProvenAgentIdentity(attempt: AttemptRecord): attempt is ProvenAttempt {
+	return attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active";
+}
+
+function hasAssignmentIdentity(attempt: AttemptRecord): attempt is AssignmentAttempt {
+	return attempt.dispatch.phase === "prompt-intended" || hasProvenAgentIdentity(attempt);
+}
+
+function attemptIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
+	if (!hasProvenAgentIdentity(attempt)) return undefined;
+	const dispatch = attempt.dispatch;
+	return { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
+}
 
 /** The two presentation contexts supported by this slice. */
 export type StatusTarget = "command" | "footer";
@@ -124,6 +145,8 @@ export interface RunJournalAdapter {
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<import("./run-journal-store.ts").ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: import("./run.ts").ActivityEntry): Promise<ActivityAppendResult>;
 	inspectAttemptReport?(repositoryRoot: string, reportPath: string): Promise<AttemptReportInspection>;
+	inspectAttemptAssignment?(input: { repositoryRoot: string; attempt: AttemptRecord }): Promise<import("./run-journal-store.ts").AttemptAssignmentInspection>;
+	inspectAttemptPreservation?(input: { repositoryRoot: string; attempt: AttemptRecord }): Promise<import("./run-journal-store.ts").AttemptPreservationInspection>;
 	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
 	createAssignment(repositoryRoot: string, document: BuilderAssignmentDocument | ReviewerAssignmentDocument): Promise<AssignmentCreateResult>;
 	loadBuilderEvidenceInputs?(input: import("./attempt-evidence-store.ts").BuilderEvidenceInputRequest): Promise<import("./attempt-evidence-store.ts").BuilderEvidenceInputs>;
@@ -182,6 +205,7 @@ export interface StewardUiAdapter {
 	confirmRun(summary: RunConfirmationSummary): Promise<boolean>;
 	confirmSameFamilyReview?(input: { builderModel: import("./config.ts").ModelChoice; reviewerModel: import("./config.ts").ModelChoice; subject: ReviewSubject; provider: string }): Promise<boolean>;
 	presentStartResult(result: StartResult): void;
+	presentResumeResult?(result: ResumeResult): void;
 	notifyCompletion?(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void;
 	presentMonitorCondition?(input: MonitorConditionInput): void;
 }
@@ -201,6 +225,9 @@ export interface StewardHerdrAdapter {
 	createReviewerPane?(input: { repositoryRoot: string; sourcePaneId: string; worktreePath: string; branch: string; agentName: string; workspaceId: string }): Promise<HerdrReviewerPaneResult>;
 	startReviewer?(input: { repositoryRoot: string; name: string; paneId: string; model: import("./config.ts").ModelChoice }): Promise<HerdrAgentStartResult>;
 	promptReviewer?(input: { repositoryRoot: string; name: string; assignmentPrompt: string }): Promise<HerdrPromptResult>;
+	readBlockedTaskFactRequest?(identity: ManagedAgentIdentity, role: "builder" | "reviewer"): Promise<TaskFactRequestResult>;
+	answerBlockedTaskFact?(input: { repositoryRoot: string; identity: ManagedAgentIdentity; answer: string }): Promise<HerdrTaskFactAnswerResult>;
+	requestAttemptReport?(input: { repositoryRoot: string; identity: ManagedAgentIdentity; role: "builder" | "reviewer"; reportPath: string; assignmentPath: string; evidenceDirectory: string }): Promise<HerdrPromptResult>;
 	stopAgentGracefully?(input: { repositoryRoot: string; name: string; workspaceId: string; paneId: string; terminalId: string }): Promise<HerdrStopResult>;
 	inspectManagedAgent?(identity: ManagedAgentIdentity): Promise<ManagedAgentInspection>;
 	waitForManagedAgent?(identity: ManagedAgentIdentity, timeoutMs: number, signal: AbortSignal): Promise<MonitorWaitResult>;
@@ -219,6 +246,11 @@ export type HerdrAgentStartResult =
 export type HerdrPromptResult =
 	| { kind: "prompted"; name: string; workspaceId: string; tabId: string; paneId: string; terminalId: string }
 	| { kind: "failed"; stage: "agent-prompt"; code: string; message: string };
+
+export type HerdrTaskFactAnswerResult =
+	| { kind: "acknowledged"; identity: ManagedAgentIdentity }
+	| { kind: "failed"; message: string }
+	| { kind: "ambiguous"; message: string };
 
 export type HerdrReviewerPaneResult =
 	| { kind: "created"; workspaceId: string; tabId: string; paneId: string; terminalId: string; sourcePaneId: string; worktreePath: string }
@@ -299,7 +331,8 @@ export interface ManagedAgentIdentity {
 
 export type ManagedAgentInspection =
 	| { kind: "observed"; identity: ManagedAgentIdentity; lifecycle: MonitorLifecycle; stateChangeSequence: number | null }
-	| { kind: "unavailable"; diagnostic: string };
+	| { kind: "missing"; diagnostic: string }
+	| { kind: "unclear"; diagnostic: string };
 
 export type MonitorWaitResult =
 	| { kind: "settled"; lifecycle: Extract<MonitorLifecycle, "idle" | "done" | "blocked" | "unknown">; identity: ManagedAgentIdentity; stateChangeSequence: number | null }
@@ -336,9 +369,18 @@ export interface MonitorPassResult {
 	notification?: boolean;
 }
 
+export type ResumeResult =
+	| { kind: "missing"; message: string }
+	| { kind: "invalid"; message: string }
+	| { kind: "foreign-session"; recordedSessionId: string; currentSessionId: string; message: string }
+	| { kind: "usage"; message: string }
+	| { kind: "reconciled"; result: MonitorPassResult }
+	| { kind: "degraded"; message: string; result?: MonitorPassResult };
+
 export interface MonitorAdvanceOptions {
 	interactive: boolean;
 	maximumActions: 1;
+	source?: "monitor" | "status" | "resume";
 }
 
 export interface StewardDependencies {
@@ -375,7 +417,7 @@ export interface ActiveAttemptStatusView {
 	taskPhase: "building" | "reworking" | "reviewing" | "approved";
 	attemptId: string;
 	role: "builder";
-	attemptState: "prepared" | "active" | "reported";
+	attemptState: "prepared" | "active" | "awaiting-report" | "reported";
 	assignmentPath?: string;
 	assignmentHash?: string;
 	actualModel?: import("./config.ts").ModelChoice;
@@ -385,7 +427,7 @@ export interface ActiveAttemptStatusView {
 	paneId?: string;
 	workspaceId?: string;
 	reportPath: string;
-	attention: "none" | "blocked" | "needs-user";
+	attention: "none" | "blocked" | "recovering" | "needs-user";
 	dispatchPhase: DispatchRecord["phase"] | "assignment-intended";
 	evidence?: BuilderEvidenceRecord;
 }
@@ -426,6 +468,7 @@ export type StartResult =
 /** The ticket-01 and ticket-02 orchestration operations. */
 export interface Steward {
 	status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView>;
+	resume(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult>;
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
 	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
 	waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult>;
@@ -456,7 +499,7 @@ function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusVi
 		lines.push("Review dispatch pending; no Reviewer Attempt has been launched.");
 	} else {
 		lines.push(`Reviewer Attempt ${reviewer.id}: ${reviewer.state}`, `Reviewer dispatch phase: ${reviewer.dispatch.phase}`, `Reviewer Assignment: ${reviewer.assignmentPath}${reviewer.dispatch.phase === "prompt-intended" || reviewer.dispatch.phase === "prompted" ? ` (${reviewer.dispatch.assignmentSha256})` : ""}`, `Reviewer Report: ${reviewer.reportPath}`, `Reviewer Model: ${reviewer.actualModel.model} [thinking=${reviewer.actualModel.thinkingLevel}]`);
-		if (reviewer.integrity?.kind === "violated") lines.push(`Review integrity: violated (${reviewer.integrity.after.head}, ${reviewer.integrity.after.dirtyStateFingerprint}); verdict retained but needs-user.`);
+		if (reviewer.integrity?.kind === "violated") lines.push(`Review integrity: violated (${reviewer.integrity.after.head}, ${reviewer.integrity.after.dirtyStateFingerprint}); read-only violation retained and needs-user.`);
 		else if (reviewer.integrity?.kind === "preserved") lines.push("Review integrity: preserved; worktree remained read-only.");
 		if (reviewer.reportRepair?.phase === "request-intended") lines.push(`Reviewer report repair: request-intended (${reviewer.reportRepair.failure}); no duplicate prompt will be sent.`);
 		else if (reviewer.reportRepair?.phase === "requested") lines.push(`Reviewer report repair: requested (${reviewer.reportRepair.failure}); awaiting the same Reviewer.`);
@@ -514,7 +557,7 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 		agentName: dispatch.agentName,
 		paneId: dispatch.paneId,
 		workspaceId: dispatch.workspaceId,
-		...(dispatch.phase === "prompt-intended" || dispatch.phase === "prompted" ? { assignmentHash: dispatch.assignmentSha256 } : {}),
+		...(dispatch.phase === "prompt-intended" || dispatch.phase === "prompted" || dispatch.phase === "reconciled-active" ? { assignmentHash: dispatch.assignmentSha256 } : {}),
 	};
 	const activeAttempt: ActiveAttemptStatusView = {
 		runId: journal.run.id,
@@ -649,7 +692,8 @@ function buildEvidenceManifest(input: {
 function activeBuilder(journal: RunJournal): { task: TaskRecord; attempt: BuilderAttemptRecord } | undefined {
 	const candidates = journal.run.tasks.flatMap((task) => {
 		const attempt = task.attempts[task.attempts.length - 1];
-		return (task.phase === "building" || task.phase === "reworking") && attempt?.role === "builder" && attempt.state === "active" && attempt.dispatch.phase === "prompted" ? [{ task, attempt }] : [];
+		const reportEligible = attempt?.state === "active" || attempt?.state === "awaiting-report" || (attempt?.state === "prepared" && attempt.dispatch.phase === "prompt-intended");
+		return (task.phase === "building" || task.phase === "reworking") && attempt?.role === "builder" && reportEligible && ["prompt-intended", "prompted", "reconciled-active"].includes(attempt.dispatch.phase) ? [{ task, attempt }] : [];
 	});
 	return candidates.length === 1 ? candidates[0] : undefined;
 }
@@ -682,7 +726,7 @@ async function validateActiveBuilderEvidence(repositoryRoot: string, controllerS
 	if (!dependencies.runJournal.loadBuilderEvidenceInputs || !dependencies.runJournal.inspectReferencedEvidence || !dependencies.runJournal.finalizeBuilderEvidence) return { kind: "waiting", journal: loadedJournal, note: "Builder evidence adapters are unavailable; evidence remains unaccepted." };
 	let inputs: import("./attempt-evidence-store.ts").BuilderEvidenceInputs;
 	try {
-		inputs = await dependencies.runJournal.loadBuilderEvidenceInputs({ repositoryRoot, paths, assignmentSha256: attempt.dispatch.phase === "prompted" ? attempt.dispatch.assignmentSha256 : "" });
+		inputs = await dependencies.runJournal.loadBuilderEvidenceInputs({ repositoryRoot, paths, assignmentSha256: hasAssignmentIdentity(attempt) ? attempt.dispatch.assignmentSha256 : "" });
 	} catch (error: unknown) {
 		return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["report-or-evidence-invalid"], [error instanceof Error ? error.message : "Evidence input loading failed."]);
 	}
@@ -756,7 +800,14 @@ async function validateActiveBuilderEvidence(repositoryRoot: string, controllerS
 	const reportedJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 		const nextAttempt = [...(next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts ?? [])].reverse().find((candidate): candidate is BuilderAttemptRecord => candidate.role === "builder");
 		if (!nextAttempt) throw new Error("Builder Attempt disappeared before finalization.");
+		const reconciledAt = nextAttempt.dispatch.phase === "prompt-intended" ? transitionTimestamp(journal, dependencies.clock.now()) : undefined;
+		if (reconciledAt && nextAttempt.dispatch.phase === "prompt-intended") {
+			const dispatch = nextAttempt.dispatch;
+			nextAttempt.dispatch = { ...dispatch, phase: "reconciled-active", reconciledAt, basis: "valid-report" };
+			nextAttempt.activatedAt = reconciledAt;
+		}
 		nextAttempt.state = "reported";
+		delete nextAttempt.recovery;
 		nextAttempt.evidence = finalized;
 	});
 	const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, reportedJournal);
@@ -920,7 +971,7 @@ async function retainReviewerRepairFailure(repositoryRoot: string, journal: RunJ
 		return persisted ? { journal: persisted, note: "Reviewer report repair failed a second time; Task is blocked and no further prompt will be sent." } : { journal, note: "Reviewer report repair failed a second time; durable block write failed and no further prompt was sent." };
 	}
 	if (reviewer.reportRepair?.phase === "request-intended") return { journal, note: "Reviewer report repair was already intended; no duplicate repair prompt was sent." };
-	if (!reviewer.dispatch || reviewer.dispatch.phase !== "prompted" || !dependencies.herdr.promptReviewer) return { journal, note: "Reviewer report is repairable, but the same Reviewer prompt adapter is unavailable; no repair was attempted." };
+	if (!hasProvenAgentIdentity(reviewer) || !dependencies.herdr.promptReviewer) return { journal, note: "Reviewer report is repairable, but the same Reviewer prompt adapter is unavailable; no repair was attempted." };
 	let intended: RunJournal;
 	try {
 		intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
@@ -969,7 +1020,7 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	if (reviewer.integrity?.kind === "violated") return { journal, note: "Reviewer read-only violation is retained; finalized evidence bytes are preserved and no verdict is eligible." };
 	if (reviewer.state === "reported" && reviewer.evidence?.phase === "finalized") return interpretReviewerVerdict(repositoryRoot, journal, candidate, reviewer, dependencies);
 	const paths = evidencePathsFor(reviewer);
-	const assignmentSha256 = reviewer.dispatch.phase === "prompt-intended" || reviewer.dispatch.phase === "prompted" ? reviewer.dispatch.assignmentSha256 : "";
+	const assignmentSha256 = hasAssignmentIdentity(reviewer) ? reviewer.dispatch.assignmentSha256 : "";
 	let inputs: import("./attempt-evidence-store.ts").ReviewerEvidenceInputs;
 	try { inputs = await dependencies.runJournal.loadReviewerEvidenceInputs({ repositoryRoot, paths, assignmentSha256 }); } catch (error: unknown) { return { journal, note: `Reviewer evidence loading failed; no verdict was inferred. ${error instanceof Error ? error.message : "Evidence loading failed."}` }; }
 	if (inputs.kind === "report-missing") return retainReviewerRepairFailure(repositoryRoot, journal, candidate, reviewer, "missing-report", [`Reviewer Attempt Report is missing at ${reviewer.reportPath}.`], null, dependencies);
@@ -1024,7 +1075,16 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 			const task = next.run.tasks[candidate.index];
 			const attempt = task ? latestReviewerAttempt(task) : undefined;
 			if (!task || !attempt) throw new Error("Reviewer Attempt disappeared after evidence finalization.");
+				const reconciledAt = attempt.dispatch.phase === "prompt-intended" ? transitionTimestamp(persistedIntent, dependencies.clock.now()) : undefined;
+				if (reconciledAt && attempt.dispatch.phase === "prompt-intended") {
+					const dispatch = attempt.dispatch;
+					const builder = candidate.builder;
+					if (!hasProvenAgentIdentity(builder)) throw new Error("Reviewer report cannot establish the Builder branch identity.");
+					attempt.dispatch = { ...dispatch, phase: "reconciled-active", branch: builder.dispatch.branch, reconciledAt, basis: "valid-report" };
+				attempt.activatedAt = reconciledAt;
+			}
 			attempt.state = "reported";
+			delete attempt.recovery;
 			attempt.integrity = { kind: "preserved", after: reviewSnapshotFor(after as import("./run.ts").ReviewWorktreeSnapshot) };
 			attempt.evidence = { phase: "finalized", finalizedAt: transitionTimestamp(persistedIntent, dependencies.clock.now()), verdict: parsed.value!.verdict, reportSha256: inputs.reportSha256, manifestPath: finalizedManifestPath, manifestSha256: finalizedManifestSha256, subject: { ...reviewer.subject, ...(reviewer.subject.kind === "git" ? { commits: [...reviewer.subject.commits] } : { artifacts: reviewer.subject.artifacts.map((artifact) => ({ ...artifact })) }) } };
 		});
@@ -1085,8 +1145,8 @@ function reviewSnapshotsExact(left: import("./run.ts").ReviewWorktreeSnapshot, r
 
 async function dispatchReviewer(repositoryRoot: string, controllerSessionId: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, subject: ReviewSubject, manifestPath: string, manifestSha256: string, baseline: import("./run.ts").ReviewWorktreeSnapshot, reviewerModel: import("./config.ts").ModelChoice, independence: ReviewerIndependence, dependencies: StewardDependencies): Promise<ReviewDecision> {
 	let journal = journalInput;
+	if (!hasProvenAgentIdentity(candidate.builder)) return { journal, note: "Reviewer dispatch is waiting for a fully proven Builder identity; no Reviewer effect was attempted." };
 	const builderDispatch = candidate.builder.dispatch;
-	if (builderDispatch.phase !== "prompted") return { journal, note: "Reviewer dispatch is waiting for a fully prompted Builder identity; no Reviewer effect was attempted." };
 	if (!dependencies.herdr.createReviewerPane || !dependencies.herdr.startReviewer || !dependencies.herdr.promptReviewer) return { journal, note: "Review dispatch pending; Reviewer Herdr adapters are unavailable." };
 	const attemptId = `attempt-${String(candidate.task.attempts.length + 1).padStart(2, "0")}`;
 	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, candidate.task.contract.id, attemptId);
@@ -1266,8 +1326,8 @@ async function advanceEligibleReview(repositoryRoot: string, controllerSessionId
 	} else independence = { kind: "different-provider-family", builderProvider: selection.builderProvider, reviewerProvider: selection.reviewerProvider };
 	if (!dependencies.git.inspectReviewWorktree) return { journal, note: "Review dispatch pending; read-only Git snapshot inspection is unavailable." };
 	let snapshot: import("./run.ts").ReviewWorktreeSnapshot | { kind: "unavailable"; message: string };
+	if (!hasProvenAgentIdentity(selected.builder)) return { journal, note: "Review dispatch is waiting for the proven Builder identity; no Reviewer effect was attempted." };
 	const builderDispatch = selected.builder.dispatch;
-	if (builderDispatch.phase !== "prompted") return { journal, note: "Review dispatch is waiting for the prompted Builder identity; no Reviewer effect was attempted." };
 	try { snapshot = await dependencies.git.inspectReviewWorktree(builderDispatch.worktreePath); } catch (error: unknown) { return pauseReview(repositoryRoot, selected, journal, dependencies, `Pre-Review worktree inspection failed; no Reviewer was launched. ${error instanceof Error ? error.message : "Inspection failed."}`); }
 	if ("kind" in snapshot) return pauseReview(repositoryRoot, selected, journal, dependencies, `Pre-Review worktree inspection is unavailable; no Reviewer was launched. ${snapshot.message}`);
 	if (snapshot.head !== (selected.builder.evidence?.phase === "finalized" ? selected.builder.evidence.producedRevision : "") || snapshot.dirtyPaths.length > 0 || snapshot.operationMarkers.length > 0) return pauseReview(repositoryRoot, selected, journal, dependencies, "Pre-Review worktree differs from the finalized Builder subject; preserved worktree state requires user attention.");
@@ -1293,7 +1353,7 @@ function currentMonitorAttempt(journal: RunJournal): { task: TaskRecord; index: 
 	for (let index = 0; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
 		const attempt = task?.attempts.at(-1);
-		if (!task || !attempt || (task.phase !== "building" && task.phase !== "reworking" && task.phase !== "reviewing" && task.phase !== "approved" && task.phase !== "integrating" && task.phase !== "completed") || attempt.dispatch.phase !== "prompted") continue;
+			if (!task || !attempt || (task.phase !== "building" && task.phase !== "reworking" && task.phase !== "reviewing" && task.phase !== "approved" && task.phase !== "integrating" && task.phase !== "completed") || (attempt.dispatch.phase !== "prompted" && attempt.dispatch.phase !== "reconciled-active")) continue;
 		candidates.push({ task, index, attempt });
 	}
 	return candidates.length === 1 ? candidates[0] : undefined;
@@ -1301,7 +1361,7 @@ function currentMonitorAttempt(journal: RunJournal): { task: TaskRecord; index: 
 
 function monitorIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
 	const dispatch = attempt.dispatch;
-	return dispatch.phase === "prompted" ? { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId } : undefined;
+	return dispatch.phase === "prompted" || dispatch.phase === "reconciled-active" ? { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId } : undefined;
 }
 
 function monitorChangedSources(previous: MonitorCheckpoint | undefined, next: MonitorCheckpoint): string[] {
@@ -2043,6 +2103,418 @@ function isAbsolutePath(value: string): boolean {
 	return value.startsWith("/") && value.trim() === value && !value.includes("\u0000");
 }
 
+type ReconciliationWorkflowResult = {
+	kind: "none" | "changed" | "blocked" | "degraded";
+	journal: RunJournal;
+	note: string;
+	action?: MonitorWorkflowAction;
+};
+
+function reconciliationCandidate(journal: RunJournal): { index: number; task: TaskRecord; attempt: AttemptRecord } | { ambiguous: true } | undefined {
+	const candidates: Array<{ index: number; task: TaskRecord; attempt: AttemptRecord }> = [];
+	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+		const task = journal.run.tasks[index]!;
+		const attempt = task.attempts.at(-1);
+		if (!attempt || !["building", "reworking", "reviewing"].includes(task.phase) || !["prepared", "active", "awaiting-report"].includes(attempt.state)) continue;
+		if (attempt.role === "builder" && task.phase !== "building" && task.phase !== "reworking") continue;
+		if (attempt.role === "reviewer" && task.phase !== "reviewing") continue;
+		candidates.push({ index, task, attempt });
+	}
+	if (candidates.length > 1) return { ambiguous: true };
+	return candidates[0];
+}
+
+function recoveryIdentityFor(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
+	const dispatch = attempt.dispatch;
+	if (dispatch.phase !== "prompt-intended" && dispatch.phase !== "prompted" && dispatch.phase !== "reconciled-active") return undefined;
+	return { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
+}
+
+function exactIdentity(left: ManagedAgentIdentity, right: ManagedAgentIdentity): boolean {
+	return left.name === right.name && left.workspaceId === right.workspaceId && left.paneId === right.paneId && left.terminalId === right.terminalId;
+}
+
+function optionalManagedAgentInspector(herdr: StewardHerdrAdapter): StewardHerdrAdapter["inspectManagedAgent"] {
+	try {
+		if (!Object.prototype.hasOwnProperty.call(herdr, "inspectManagedAgent")) return undefined;
+		return herdr.inspectManagedAgent;
+	} catch { return undefined; }
+}
+
+function recoveryLiveRecord(input: { observedAt: string; kind: "working" | "blocked" | "settled" | "unclear" | "missing"; lifecycle?: MonitorLifecycle; stateChangeSequence?: number | null; diagnostic?: string }): import("./run.ts").AttemptRecovery["live"] {
+	const lifecycle = input.lifecycle === "unavailable" ? undefined : input.lifecycle;
+	return { observedAt: input.observedAt, kind: input.kind, ...(lifecycle ? { lifecycle } : {}), ...(input.stateChangeSequence !== undefined ? { stateChangeSequence: input.stateChangeSequence } : {}), ...(input.diagnostic ? { diagnostic: input.diagnostic.slice(0, 2_000) } : {}) };
+}
+
+function sameRecoveryLive(left: import("./run.ts").AttemptRecovery["live"] | undefined, right: import("./run.ts").AttemptRecovery["live"]): boolean {
+	return Boolean(left && left.kind === right.kind && left.lifecycle === right.lifecycle && left.stateChangeSequence === right.stateChangeSequence && left.diagnostic === right.diagnostic);
+}
+
+function promoteMatchingDispatch(task: TaskRecord, attempt: AttemptRecord, reconciledAt: string, basis: "matching-live-agent" | "valid-report"): void {
+	if (attempt.dispatch.phase !== "prompt-intended") return;
+	if (attempt.role === "builder") {
+		const dispatch = attempt.dispatch;
+		attempt.dispatch = { ...dispatch, phase: "reconciled-active", reconciledAt, basis };
+	} else {
+		const attemptIndex = task.attempts.findIndex((candidate) => candidate.id === attempt.id);
+		const prior = attemptIndex > 0 ? task.attempts[attemptIndex - 1] : undefined;
+		if (!prior || prior.role !== "builder" || !hasProvenAgentIdentity(prior)) throw new Error("Reviewer reconciliation cannot establish the preceding Builder branch identity.");
+		const dispatch = attempt.dispatch;
+		attempt.dispatch = { ...dispatch, phase: "reconciled-active", branch: prior.dispatch.branch, reconciledAt, basis };
+	}
+	if (attempt.state === "prepared") {
+		attempt.state = "active";
+		attempt.activatedAt = reconciledAt;
+	}
+}
+
+function currentReconciliationAttempt(journal: RunJournal, index: number, attemptId: string): AttemptRecord | undefined {
+	return journal.run.tasks[index]?.attempts.find((candidate) => candidate.id === attemptId);
+}
+
+function branchForAttempt(task: TaskRecord, attempt: AttemptRecord): string | undefined {
+	if ("branch" in attempt.dispatch && typeof attempt.dispatch.branch === "string") return attempt.dispatch.branch;
+	const attemptIndex = task.attempts.findIndex((candidate) => candidate.id === attempt.id);
+	const preceding = attemptIndex > 0 ? task.attempts[attemptIndex - 1] : undefined;
+	return preceding && preceding.role === "builder" && "branch" in preceding.dispatch ? preceding.dispatch.branch : undefined;
+}
+
+function sameFact(left: unknown, right: unknown): boolean {
+	return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function factValueFromAssignment(field: TaskFactKey, task: TaskRecord, attempt: AttemptRecord, assignment: import("./run.ts").AssignmentDocument): unknown {
+	const facts = assignment.assignment;
+	switch (field) {
+		case "requiredOutcome": return facts.requiredOutcome;
+		case "allowedScope": return task.contract.allowedScope;
+		case "expectedArtifacts": return task.contract.expectedArtifacts;
+		case "verification": return task.contract.verification;
+		case "reportPath": return facts.reportPath;
+		case "evidenceDirectory": return facts.evidenceDirectory;
+		case "reviewSubject": return attempt.role === "reviewer" && "subject" in facts ? facts.subject : undefined;
+	}
+}
+
+async function verifiedTaskFactValue(repositoryRoot: string, runId: string, task: TaskRecord, attempt: AttemptRecord, dependencies: StewardDependencies, field: TaskFactKey): Promise<{ kind: "verified"; value: unknown } | { kind: "blocked"; diagnostic: string }> {
+		if (!dependencies.runJournal.inspectAttemptAssignment) return { kind: "blocked", diagnostic: "The protected Assignment inspection adapter is unavailable." };
+		const observed = await dependencies.runJournal.inspectAttemptAssignment({ repositoryRoot, attempt });
+		if (observed.kind !== "loaded") return { kind: "blocked", diagnostic: observed.diagnostic };
+		if (!hasAssignmentIdentity(attempt) || observed.sha256 !== attempt.dispatch.assignmentSha256 || observed.path !== attempt.assignmentPath) return { kind: "blocked", diagnostic: "The protected Assignment bytes do not match the exact recorded Attempt identity." };
+		let decoded: import("./run.ts").AssignmentDocument | undefined;
+		if (attempt.role === "builder") {
+			const value = deserializeBuilderAssignment(observed.bytes.toString("utf8"), attempt.assignmentPath);
+			decoded = value.value;
+		} else {
+			const value = deserializeReviewerAssignment(observed.bytes.toString("utf8"), attempt.assignmentPath);
+			decoded = value.value;
+		}
+		if (!decoded || decoded.assignment.runId !== runId || decoded.assignment.taskId !== task.contract.id || decoded.assignment.attemptId !== attempt.id || decoded.assignment.specificationHash !== task.specificationHash || decoded.assignment.reportPath !== attempt.reportPath || decoded.assignment.evidenceDirectory !== attempt.evidenceDirectory) return { kind: "blocked", diagnostic: "The protected Assignment is malformed or no longer matches the frozen Task and Attempt." };
+		const recordedIdentity = recoveryIdentityFor(attempt);
+		if (!recordedIdentity || decoded.assignment.herdr.agentName !== recordedIdentity.name || decoded.assignment.herdr.workspaceId !== recordedIdentity.workspaceId || decoded.assignment.herdr.paneId !== recordedIdentity.paneId || decoded.assignment.herdr.terminalId !== recordedIdentity.terminalId) return { kind: "blocked", diagnostic: "The protected Assignment resource identity does not match the exact recorded agent." };
+		if (attempt.role === "builder" && (!decoded.assignment.worktree || !('branch' in decoded.assignment.worktree) || decoded.assignment.worktree.path !== attempt.dispatch.worktreePath || decoded.assignment.worktree.branch !== attempt.dispatch.branch)) return { kind: "blocked", diagnostic: "The protected Builder Assignment worktree identity changed." };
+		if (attempt.role === "reviewer" && decoded.assignment.worktree.path !== attempt.worktree.path) return { kind: "blocked", diagnostic: "The protected Reviewer Assignment worktree identity changed." };
+		const assignedValue = factValueFromAssignment(field, task, attempt, decoded);
+		const expectedValue = taskFactValue({ field, task: task.contract, attempt: { reportPath: attempt.reportPath, evidenceDirectory: attempt.evidenceDirectory, ...(attempt.role === "reviewer" ? { subject: attempt.subject } : {}) } });
+		if (assignedValue === undefined || !sameFact(assignedValue, expectedValue)) return { kind: "blocked", diagnostic: "The requested Task fact does not equal the frozen Assignment and Journal facts." };
+		return { kind: "verified", value: assignedValue };
+}
+
+async function reconcileCurrentAttempt(repositoryRoot: string, controllerSessionId: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<ReconciliationWorkflowResult> {
+	let journal = journalInput;
+	const selected = reconciliationCandidate(journal);
+	if (!selected) return { kind: "none", journal, note: "No current non-finalized Attempt requires reconciliation." };
+	if ("ambiguous" in selected) return { kind: "degraded", journal, note: "Multiple non-finalized Attempts are eligible for reconciliation; no Attempt was selected." };
+	const { index } = selected;
+	let task = selected.task;
+	let attempt = selected.attempt;
+	const persist = async (update: (nextTask: TaskRecord, nextAttempt: AttemptRecord) => void): Promise<boolean> => {
+		let candidate: RunJournal;
+		try {
+			candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const nextTask = next.run.tasks[index];
+				const nextAttempt = nextTask?.attempts.find((item) => item.id === attempt.id);
+				if (!nextTask || !nextAttempt) throw new Error("Reconciliation Attempt disappeared before the durable transition.");
+				update(nextTask, nextAttempt);
+			});
+		} catch { return false; }
+		const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate);
+		if (replaced.kind !== "replaced") return false;
+		journal = replaced.journal;
+		return true;
+	};
+
+	const continuePreparedDispatch = async (): Promise<ReconciliationWorkflowResult | undefined> => {
+		if (attempt.state !== "prepared" || attempt.dispatch.phase === "prompt-intended") return undefined;
+		const dispatch = attempt.dispatch;
+		if (dispatch.phase === "pane-intended") return { kind: "degraded", journal, note: "Reviewer pane creation was interrupted before an exact returned pane identity; the same prepared Attempt is preserved and no second pane was split." };
+
+		if (attempt.role === "builder" && dispatch.phase === "worktree-intended") {
+			if (!dependencies.herdr.createBuilderWorktree || !dependencies.git.inspectBuilderWorktree) return { kind: "degraded", journal, note: "The prepared Builder worktree phase cannot continue because its exact no-clobber adapters are unavailable." };
+			let created: HerdrWorktreeCreateResult;
+			try {
+				created = await dependencies.herdr.createBuilderWorktree({ repositoryRoot, branch: dispatch.branch, baseRevision: attempt.baseRevision, label: dispatch.agentName });
+			} catch (error: unknown) {
+				return { kind: "degraded", journal, note: `Prepared Builder worktree creation failed; the same Attempt remains pending. ${error instanceof Error ? error.message : "Worktree creation failed."}` };
+			}
+			if (created.kind !== "created" || created.branch !== dispatch.branch || !isAbsolutePath(created.path) || !validIdentity(created.workspaceId) || !validIdentity(created.paneId) || !validIdentity(created.terminalId) || !validIdentity(created.tabId)) return { kind: "degraded", journal, note: "Prepared Builder worktree creation returned a malformed or contradictory envelope; no resource was adopted." };
+			let inspected: BuilderWorktreeInspection;
+			try { inspected = await dependencies.git.inspectBuilderWorktree(created.path, attempt.baseRevision); }
+			catch (error: unknown) { return { kind: "degraded", journal, note: `Prepared Builder worktree verification failed; no later effect was attempted. ${error instanceof Error ? error.message : "Git inspection failed."}` }; }
+			if (inspected.kind !== "ready" || inspected.head !== attempt.baseRevision || !inspected.clean) return { kind: "degraded", journal, note: "Prepared Builder worktree base or clean-head verification failed; the same Attempt remains pending." };
+			const changed = await persist((_nextTask, nextAttempt) => {
+				if (nextAttempt.role !== "builder" || nextAttempt.dispatch.phase !== "worktree-intended") throw new Error("Prepared Builder Attempt changed before worktree continuation.");
+				nextAttempt.dispatch = { phase: "agent-intended", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: created.path, workspaceId: created.workspaceId, paneId: created.paneId, terminalId: created.terminalId };
+			});
+			return changed ? { kind: "changed", journal, note: `Prepared Builder Attempt ${attempt.id} now records the exact no-clobber worktree identity; no agent was started in this pass.`, action: "record-observation" } : { kind: "degraded", journal, note: "Prepared Builder worktree was verified, but its exact identity could not be persisted; no later effect was attempted." };
+		}
+
+		if ((attempt.role === "builder" && (dispatch.phase === "agent-intended" || dispatch.phase === "assignment-intended")) || (attempt.role === "reviewer" && dispatch.phase === "agent-intended")) {
+			if (dispatch.phase === "assignment-intended" && attempt.role !== "builder") return { kind: "degraded", journal, note: "Only a prepared rework Builder may continue an Assignment-intended phase; the prepared Attempt remains unchanged." };
+			const identity = "workspaceId" in dispatch && typeof dispatch.workspaceId === "string" && "paneId" in dispatch && typeof dispatch.paneId === "string" && "terminalId" in dispatch && typeof dispatch.terminalId === "string"
+				? { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId }
+				: undefined;
+			const inspectManagedAgent = optionalManagedAgentInspector(dependencies.herdr);
+			if (!identity || !inspectManagedAgent) return { kind: "degraded", journal, note: "Prepared Agent-intended Attempt lacks an exact inspectable resource identity; it remains pending without adoption." };
+			let inspected: ManagedAgentInspection;
+			try { inspected = await inspectManagedAgent(identity); }
+			catch (error: unknown) { return { kind: "degraded", journal, note: `Prepared Agent-intended identity inspection failed; no start or Assignment effect was attempted. ${error instanceof Error ? error.message : "Herdr inspection failed."}` }; }
+			if (inspected.kind === "unclear") return { kind: "degraded", journal, note: `Prepared Agent-intended identity is unclear; the same Attempt remains pending. ${inspected.diagnostic}` };
+			if (inspected.kind === "missing") {
+				const started = attempt.role === "builder"
+					? dependencies.herdr.startBuilder ? await dependencies.herdr.startBuilder({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel }) : { kind: "failed", stage: "agent-start", code: "adapter-unavailable", message: "Builder start adapter is unavailable." } as HerdrAgentStartResult
+					: dependencies.herdr.startReviewer ? await dependencies.herdr.startReviewer({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel }) : { kind: "failed", stage: "agent-start", code: "adapter-unavailable", message: "Reviewer start adapter is unavailable." } as HerdrAgentStartResult;
+				if (started.kind === "name-collision") {
+					const replacement = `${attempt.role === "builder" ? "steward-b" : "steward-r"}-${compactUuid(dependencies.clock)}-${attempt.id.replace(/[^0-9]/g, "") || "01"}`;
+					if (!safeHerdrName(replacement)) return { kind: "degraded", journal, note: "The prepared Attempt's exact name collided, but a safe same-Attempt name could not be derived." };
+					const changed = await persist((_nextTask, nextAttempt) => {
+						if (nextAttempt.role !== attempt.role || nextAttempt.dispatch.phase !== dispatch.phase) throw new Error("Prepared Attempt changed during same-Attempt name collision handling.");
+						nextAttempt.dispatch = { ...nextAttempt.dispatch, agentName: replacement } as AttemptRecord["dispatch"];
+					});
+					return changed ? { kind: "changed", journal, note: `The prepared ${attempt.role} name collided; a new Steward-owned name was retained inside Attempt ${attempt.id} and no other Attempt was created.`, action: "record-observation" } : { kind: "degraded", journal, note: "The prepared Attempt name collision could not be durably reconciled; no second Attempt was created." };
+				}
+				if (started.kind !== "started" || started.name !== identity.name || started.agentKind !== "pi" || started.workspaceId !== identity.workspaceId || started.paneId !== identity.paneId || started.terminalId !== identity.terminalId || !validIdentity(started.tabId)) return { kind: "degraded", journal, note: "The prepared Attempt start envelope was malformed or contradictory; no resource was adopted." };
+				return { kind: "changed", journal, note: `The exact recorded ${attempt.role} resource was missing during its prepared start phase; its same-Attempt start was attempted once and will be re-inspected before any later effect.`, action: "record-observation" };
+			}
+			if (inspected.kind !== "observed" || !exactIdentity(inspected.identity, identity)) return { kind: "degraded", journal, note: "The prepared Attempt resource did not match its exact recorded identity; no adoption or later effect was attempted." };
+
+			let assignment: BuilderAssignmentDocument | ReviewerAssignmentDocument;
+			try {
+				if (attempt.role === "builder") {
+					assignment = buildBuilderAssignment({ run: journal.run, task, attempt, worktreePath: dispatch.worktreePath, branch: dispatch.branch, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name });
+				} else {
+					const attemptIndex = task.attempts.findIndex((candidateAttempt) => candidateAttempt.id === attempt.id);
+					const builder = attemptIndex > 0 ? task.attempts[attemptIndex - 1] : undefined;
+					if (!builder || builder.role !== "builder" || builder.evidence?.phase !== "finalized") return { kind: "degraded", journal, note: "Prepared Reviewer Assignment cannot be rebuilt without the exact finalized Builder subject; no prompt was attempted." };
+					assignment = buildReviewerAssignment({ runId: journal.run.id, task: task.contract, attempt, manifestPath: builder.evidence.manifestPath, manifestSha256: builder.evidence.manifestSha256, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name });
+				}
+			} catch (error: unknown) { return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment could not be rebuilt; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment validation failed."}` }; }
+			let created: AssignmentCreateResult;
+			try { created = await dependencies.runJournal.createAssignment(repositoryRoot, assignment); }
+			catch (error: unknown) { return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment could not be persisted; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment storage failed."}` }; }
+			if (created.kind !== "created" && created.kind !== "existing-match") return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment conflicts with existing bytes; no prompt was attempted.` };
+			const assignmentHash = attempt.role === "builder" ? builderAssignmentSha256(created.bytes) : reviewerAssignmentSha256(created.bytes);
+			const changed = await persist((_nextTask, nextAttempt) => {
+				if (nextAttempt.role !== attempt.role || nextAttempt.dispatch.phase !== dispatch.phase) throw new Error("Prepared Attempt changed before prompt intent.");
+				nextAttempt.dispatch = { ...nextAttempt.dispatch, phase: "prompt-intended", assignmentSha256: assignmentHash } as AttemptRecord["dispatch"];
+			});
+			return changed ? { kind: "changed", journal, note: `The existing ${attempt.role} Assignment was reused for Attempt ${attempt.id}; prompt intent is durable and the original Assignment will not be resent.`, action: "record-observation" } : { kind: "degraded", journal, note: `The existing ${attempt.role} Assignment was verified, but prompt intent could not be persisted; no prompt was attempted.` };
+		}
+
+		return { kind: "degraded", journal, note: `Prepared Attempt ${attempt.id} is at ${dispatch.phase}; the phase is preserved and no duplicate effect was attempted.` };
+	};
+
+	const preparedContinuation = await continuePreparedDispatch();
+	if (preparedContinuation) return preparedContinuation;
+
+	const reportPath = attempt.reportPath;
+	let reportState: "valid" | "invalid" | "missing" | "unclear" = "missing";
+	if (attempt.role === "builder") {
+		const candidate = activeBuilder(journal);
+		if (candidate && candidate.task.contract.id === task.contract.id && candidate.attempt.id === attempt.id && journal.run.controllerSessionId === controllerSessionId) {
+			const evidence = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, journal, dependencies);
+			journal = evidence.journal;
+			if (evidence.kind === "finalized" || journal.run.tasks[index]?.attempts.find((item) => item.id === attempt.id)?.state === "reported") return { kind: "changed", journal, note: evidence.note || `Builder Attempt ${attempt.id} report was validated and finalized.`, action: "finalize-builder-evidence" };
+			const observed = dependencies.runJournal.inspectAttemptReport ? await dependencies.runJournal.inspectAttemptReport(repositoryRoot, reportPath).catch(() => ({ kind: "unavailable", diagnostic: "Attempt Report observation failed." } as AttemptReportInspection)) : { kind: "missing" as const };
+			reportState = observed.kind === "present" ? "invalid" : observed.kind === "unavailable" ? "unclear" : "missing";
+		}
+	} else {
+		const reviewerIndex = task.attempts.findIndex((candidate) => candidate.id === attempt.id);
+		const latestBuilder = reviewerIndex > 0 ? task.attempts[reviewerIndex - 1] : undefined;
+		const reviewer = attempt.role === "reviewer" ? attempt : undefined;
+		if (reviewer && latestBuilder?.role === "builder" && latestBuilder.state === "reported" && dependencies.runJournal.inspectAttemptReport) {
+			const observed = await dependencies.runJournal.inspectAttemptReport(repositoryRoot, reportPath).catch(() => ({ kind: "unavailable", diagnostic: "Reviewer Attempt Report observation failed." } as AttemptReportInspection));
+			reportState = observed.kind === "present" ? "invalid" : observed.kind === "unavailable" ? "unclear" : "missing";
+			if (observed.kind === "present") {
+				const review = await validateActiveReviewerReport(repositoryRoot, journal, { index, task, builder: latestBuilder }, reviewer, dependencies, false);
+				journal = review.journal;
+				if (journal.run.tasks[index]?.attempts.find((item) => item.id === attempt.id)?.state === "reported") return { kind: "changed", journal, note: review.note || `Reviewer Attempt ${attempt.id} report was validated and finalized.`, action: "finalize-reviewer-evidence" };
+			}
+		}
+	}
+	// Report rejection may have updated the bounded evidence fact; all later
+	// reconciliation reads must use the same Attempt from the replacement.
+		const refreshed = currentReconciliationAttempt(journal, index, attempt.id);
+		if (!refreshed) return { kind: "degraded", journal, note: "The current Attempt disappeared during report reconciliation; no later effect was attempted." };
+		attempt = refreshed;
+		task = journal.run.tasks[index] ?? task;
+
+	const dispatch = attempt.dispatch;
+	const liveIdentity = recoveryIdentityFor(attempt);
+	if (!liveIdentity) {
+		if (dispatch.phase === "pane-intended" || dispatch.phase === "worktree-intended" || dispatch.phase === "agent-intended" || dispatch.phase === "assignment-intended") return { kind: "degraded", journal, note: "The current Attempt is prepared before an exact live identity; its phase is preserved for explicit continuation." };
+		const persisted = await persist((nextTask, nextAttempt) => {
+			const existing = nextAttempt.recovery;
+			nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt: transitionTimestamp(journal, dependencies.clock.now()), kind: "unclear", diagnostic: "The exact recorded Herdr identity could not be inspected." }), ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}) };
+			nextTask.attention = "recovering";
+			nextTask.attentionReason = "reconciliation-live-unclear";
+			nextTask.attentionDiagnostic = "The exact recorded Herdr identity could not be inspected.";
+		});
+		return persisted ? { kind: "changed", journal, note: "Attempt live identity is unclear; state was preserved without an effect." } : { kind: "degraded", journal, note: "Attempt live identity is unclear, but the recovery observation could not be persisted." };
+	}
+	const inspectManagedAgent = optionalManagedAgentInspector(dependencies.herdr);
+	if (!inspectManagedAgent) return { kind: journal.journalRevision === journalInput.journalRevision ? "none" : "changed", journal, note: "Herdr identity inspection is unavailable; the existing Attempt evidence remains authoritative without a recovery mutation." };
+
+	let inspected: ManagedAgentInspection;
+	try { inspected = await inspectManagedAgent(liveIdentity); } catch (error: unknown) { inspected = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr inspection failed." }; }
+	if (inspected.kind === "observed" && !exactIdentity(inspected.identity, liveIdentity)) inspected = { kind: "unclear", diagnostic: "Herdr returned a different name, workspace, pane, or terminal identity." };
+	const observedAt = transitionTimestamp(journal, dependencies.clock.now());
+	const liveKind = inspected.kind === "observed"
+		? inspected.lifecycle === "working" || inspected.lifecycle === "blocked" ? inspected.lifecycle : inspected.lifecycle === "idle" || inspected.lifecycle === "done" ? "settled" : "unclear"
+		: inspected.kind === "missing" ? "missing" : "unclear";
+	const observedLifecycle = inspected.kind === "observed" && inspected.lifecycle !== "unavailable" ? inspected.lifecycle : undefined;
+	const decision = decideReconciliation({ report: reportState, live: { kind: liveKind, ...(observedLifecycle ? { lifecycle: observedLifecycle } : {}) } });
+
+	if (decision.kind === "working-or-blocked" && decision.lifecycle === "working") {
+		const live = recoveryLiveRecord({ observedAt, kind: "working", lifecycle: "working", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null });
+		const current = currentReconciliationAttempt(journal, index, attempt.id);
+		const needsPromotion = current?.dispatch.phase === "prompt-intended" || current?.state === "prepared";
+		const needsObservation = !sameRecoveryLive(current?.recovery?.live, live) || (task.attention === "recovering" && ["reconciliation-live-unclear", "reconciliation-agent-missing"].includes(task.attentionReason ?? ""));
+		if (!needsPromotion && !needsObservation) return { kind: "none", journal, note: "The exact recorded agent is working; no effect was attempted." };
+		const changed = await persist((nextTask, nextAttempt) => {
+			promoteMatchingDispatch(nextTask, nextAttempt, observedAt, "matching-live-agent");
+			const existing = nextAttempt.recovery;
+			nextAttempt.recovery = { live, ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}) };
+			if (nextTask.attention === "recovering" && ["reconciliation-live-unclear", "reconciliation-agent-missing"].includes(nextTask.attentionReason ?? "")) { nextTask.attention = "none"; delete nextTask.attentionReason; delete nextTask.attentionDiagnostic; }
+		});
+		return changed ? { kind: "changed", journal, note: "The exact recorded agent is working; reconciliation is waiting with no prompt or replacement effect." } : { kind: "none", journal, note: "The exact recorded agent is working; no effect was attempted." };
+	}
+
+	if (decision.kind === "working-or-blocked" && decision.lifecycle === "blocked") {
+		const existingAnswer = attempt.recovery?.blockedAnswer;
+		if (existingAnswer) {
+			const live = recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null });
+			const needsPromotion = attempt.dispatch.phase === "prompt-intended" || attempt.state === "prepared";
+			const needsBlock = existingAnswer.phase !== "acknowledged" && (task.attention !== "blocked" || task.attentionReason !== "reconciliation-blocked-question");
+			if (!needsPromotion && !needsBlock && sameRecoveryLive(attempt.recovery?.live, live)) return { kind: "none", journal, note: "The exact agent is blocked; its existing Task-fact answer intent prevents a duplicate input." };
+			const changed = await persist((nextTask, nextAttempt) => {
+				promoteMatchingDispatch(nextTask, nextAttempt, observedAt, "matching-live-agent");
+				if (existingAnswer.phase !== "acknowledged") {
+					nextTask.attention = "blocked";
+					nextTask.attentionReason = "reconciliation-blocked-question";
+					nextTask.attentionDiagnostic = existingAnswer.phase === "ambiguous" ? existingAnswer.diagnostic : "A Task-fact answer already exists for this Attempt; no second answer will be sent.";
+				}
+				const blockedAnswer = existingAnswer.phase === "intended" ? { ...existingAnswer, phase: "ambiguous" as const, observedAt, diagnostic: "The prior Task-fact answer intent was interrupted; no second answer will be sent." } : existingAnswer;
+				nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live }), live, blockedAnswer };
+			});
+			return changed ? { kind: "blocked", journal, note: "The blocked Task-fact answer intent remains durable; no second answer was sent." } : { kind: "degraded", journal, note: "The blocked Task-fact answer state could not be persisted; no second answer was sent." };
+		}
+		const request = dependencies.herdr.readBlockedTaskFactRequest ? await dependencies.herdr.readBlockedTaskFactRequest(liveIdentity, attempt.role) : { kind: "unstructured", diagnostic: "No canonical Task-fact request adapter is available." } as const;
+		if (request.kind !== "fact-request") {
+			const changed = await persist((nextTask, nextAttempt) => { nextTask.attention = "blocked"; nextTask.attentionReason = "reconciliation-blocked-question"; nextTask.attentionDiagnostic = request.diagnostic.slice(0, 2_000); const existing = nextAttempt.recovery; nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}) }; });
+			return changed ? { kind: "blocked", journal, note: "The blocked agent did not present one canonical approved Task-fact request; user attention is required." } : { kind: "degraded", journal, note: "The blocked-agent question could not be persisted." };
+		}
+		if (request.request.field === "reviewSubject" && attempt.role !== "reviewer") return { kind: "blocked", journal, note: "The blocked agent requested a Reviewer-only fact; no input was sent." };
+		const verifiedFact = await verifiedTaskFactValue(repositoryRoot, journal.run.id, task, attempt, dependencies, request.request.field);
+		if (verifiedFact.kind !== "verified") {
+			const diagnostic = verifiedFact.diagnostic;
+			const changed = await persist((nextTask, nextAttempt) => { nextTask.attention = "blocked"; nextTask.attentionReason = "reconciliation-blocked-question"; nextTask.attentionDiagnostic = diagnostic.slice(0, 2_000); const existing = nextAttempt.recovery; nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}) }; });
+			return changed ? { kind: "blocked", journal, note: "The blocked Task-fact request was not answered because the protected Assignment was unavailable or changed." } : { kind: "degraded", journal, note: "The protected Assignment could not be verified before answering; no input was sent." };
+		}
+		const answer = resolveTaskFactAnswer(request.request.field, verifiedFact.value);
+		if (answer.kind !== "answer") return { kind: "blocked", journal, note: "The blocked Task-fact request is not derivable from the current frozen contract; no input was sent." };
+		const intended = await persist((nextTask, nextAttempt) => { promoteMatchingDispatch(nextTask, nextAttempt, observedAt, "matching-live-agent"); nextTask.attention = "none"; delete nextTask.attentionReason; delete nextTask.attentionDiagnostic; const existing = nextAttempt.recovery; nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), blockedAnswer: { phase: "intended", intendedAt: observedAt, agent: liveIdentity, questionSha256: request.request.questionSha256, fact: request.request.field, answerSha256: answer.answer.answerSha256 }, ...(existing?.preservation ? { preservation: existing.preservation } : {}) }; });
+		if (!intended) return { kind: "degraded", journal, note: "Task-fact answer intent could not be persisted; no input was sent." };
+		const delivered = dependencies.herdr.answerBlockedTaskFact ? await dependencies.herdr.answerBlockedTaskFact({ repositoryRoot, identity: liveIdentity, answer: answer.answer.answer }) : { kind: "failed", message: "Task-fact answer adapter is unavailable." };
+		const acknowledged = delivered.kind === "acknowledged" && "identity" in delivered ? exactIdentity(delivered.identity, liveIdentity) : false;
+		const recorded = await persist((nextTask, nextAttempt) => {
+			const current = nextAttempt.recovery?.blockedAnswer;
+			if (!current || current.phase !== "intended") throw new Error("Task-fact answer intent disappeared before acknowledgement.");
+			nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked" }) }), live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked" }), blockedAnswer: acknowledged ? { ...current, phase: "acknowledged", acknowledgedAt: transitionTimestamp(journal, dependencies.clock.now()) } : { ...current, phase: "ambiguous", observedAt: transitionTimestamp(journal, dependencies.clock.now()), diagnostic: delivered.kind === "failed" || delivered.kind === "ambiguous" ? delivered.message : "Wrong-identity Task-fact acknowledgement." } };
+			if (!acknowledged) { nextTask.attention = "blocked"; nextTask.attentionReason = "reconciliation-blocked-question"; nextTask.attentionDiagnostic = "Task-fact input delivery could not be proven for the exact recorded agent."; }
+		});
+		return recorded ? { kind: acknowledged ? "changed" : "blocked", journal, note: acknowledged ? "One canonical approved Task fact was delivered to the exact blocked agent." : "Task-fact delivery is ambiguous; the durable intent prevents a resend." } : { kind: "degraded", journal, note: "Task-fact delivery occurred or was attempted, but its acknowledgement state could not be persisted; no resend will be attempted." };
+	}
+
+	if (decision.kind === "settled") {
+		const existing = attempt.recovery?.reportRequest;
+		if (existing) {
+			if (existing.phase === "blocked" || existing.phase === "ambiguous" || existing.phase === "requested" || existing.phase === "intended") {
+				const live = recoveryLiveRecord({ observedAt, kind: "settled", lifecycle: decision.lifecycle, stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null });
+				const alreadyBlocked = existing.phase === "blocked" && task.attention === "blocked" && task.attentionReason === "reconciliation-report-missing" && sameRecoveryLive(attempt.recovery?.live, live);
+				if (alreadyBlocked) return { kind: "blocked", journal, note: "The exact settled agent has already received its one report request; no second request was sent." };
+				const changed = await persist((nextTask, nextAttempt) => {
+					promoteMatchingDispatch(nextTask, nextAttempt, observedAt, "matching-live-agent");
+					nextTask.attention = "blocked";
+					nextTask.attentionReason = "reconciliation-report-missing";
+					nextTask.attentionDiagnostic = "The one allowed Attempt Report request has not produced a valid report; no request will be repeated.";
+					nextAttempt.state = "awaiting-report";
+					const requestedAt = existing.phase === "requested" || existing.phase === "blocked" ? existing.requestedAt : undefined;
+					nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live }), live, reportRequest: existing.phase === "blocked" ? existing : { phase: "blocked", intendedAt: existing.intendedAt, ...(requestedAt ? { requestedAt } : {}), blockedAt: transitionTimestamp(journal, dependencies.clock.now()), agent: existing.agent, reportPath: existing.reportPath, diagnostic: "The one allowed Attempt Report request did not produce a valid report; no request will be repeated." } };
+				});
+				return changed ? { kind: "blocked", journal, note: "The exact settled agent already has one report request; no second request was sent." } : { kind: "degraded", journal, note: "The exact settled agent has one report request, but its blocked state could not be persisted; no second request was sent." };
+			}
+		}
+		const requestIntent = await persist((nextTask, nextAttempt) => { promoteMatchingDispatch(nextTask, nextAttempt, observedAt, "matching-live-agent"); nextTask.attention = "none"; delete nextTask.attentionReason; delete nextTask.attentionDiagnostic; nextAttempt.state = "awaiting-report"; const existing = nextAttempt.recovery; nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "settled", lifecycle: decision.lifecycle, stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}), reportRequest: { phase: "intended", intendedAt: observedAt, agent: liveIdentity, reportPath: attempt.reportPath } }; });
+		if (!requestIntent) return { kind: "degraded", journal, note: "Attempt report-request intent could not be persisted; no prompt was sent." };
+		const requested = dependencies.herdr.requestAttemptReport ? await dependencies.herdr.requestAttemptReport({ repositoryRoot, identity: liveIdentity, role: attempt.role, reportPath: attempt.reportPath, assignmentPath: attempt.assignmentPath, evidenceDirectory: attempt.evidenceDirectory }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Attempt report-request adapter is unavailable." } as HerdrPromptResult;
+		const exact = requested.kind === "prompted" && requested.name === liveIdentity.name && requested.workspaceId === liveIdentity.workspaceId && requested.paneId === liveIdentity.paneId && requested.terminalId === liveIdentity.terminalId;
+		const recorded = await persist((nextTask, nextAttempt) => {
+			const current = nextAttempt.recovery?.reportRequest;
+			if (!current || current.phase !== "intended") throw new Error("Attempt report-request intent disappeared before acknowledgement.");
+			nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "settled", lifecycle: decision.lifecycle }), ...(nextAttempt.recovery?.blockedAnswer ? { blockedAnswer: nextAttempt.recovery.blockedAnswer } : {}), ...(nextAttempt.recovery?.preservation ? { preservation: nextAttempt.recovery.preservation } : {}), reportRequest: exact ? { ...current, phase: "requested", requestedAt: transitionTimestamp(journal, dependencies.clock.now()) } : { ...current, phase: "ambiguous", observedAt: transitionTimestamp(journal, dependencies.clock.now()), diagnostic: requested.kind === "failed" ? requested.message : "Wrong-identity or malformed report-request acknowledgement." } };
+			if (!exact) { nextTask.attention = "blocked"; nextTask.attentionReason = "reconciliation-report-missing"; nextTask.attentionDiagnostic = "Attempt report-request delivery was not proven; no request will be repeated."; }
+		});
+		return recorded ? { kind: exact ? "changed" : "blocked", journal, note: exact ? "One same-identity Attempt Report request was delivered; awaiting the report." : "Attempt Report request delivery is ambiguous; no request will be repeated." } : { kind: "degraded", journal, note: "Attempt Report request was attempted, but acknowledgement state could not be persisted; no resend will be attempted." };
+	}
+
+	if (decision.kind === "unclear") {
+		const diagnostic = inspected.kind === "unclear" ? inspected.diagnostic : "Herdr live state was not safely classifiable.";
+		const live = recoveryLiveRecord({ observedAt, kind: "unclear", diagnostic });
+		if (task.attention === "recovering" && task.attentionReason === "reconciliation-live-unclear" && task.attentionDiagnostic === diagnostic.slice(0, 2_000) && sameRecoveryLive(attempt.recovery?.live, live)) return { kind: "none", journal, note: "Herdr live state remains unclear; the Attempt and worktree remain preserved without an effect." };
+		const changed = await persist((nextTask, nextAttempt) => { nextTask.attention = "recovering"; nextTask.attentionReason = "reconciliation-live-unclear"; nextTask.attentionDiagnostic = diagnostic.slice(0, 2_000); const existing = nextAttempt.recovery; nextAttempt.recovery = { live, ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}) }; });
+		return changed ? { kind: "changed", journal, note: "Herdr live state is unclear; the Attempt and worktree were preserved without an effect." } : { kind: "degraded", journal, note: "Herdr live state is unclear, but the bounded recovery observation could not be persisted." };
+	}
+
+	if (decision.kind === "missing") {
+		if (!dependencies.runJournal.inspectAttemptPreservation) return { kind: "degraded", journal, note: "The exact missing agent was observed, but preservation inspection is unavailable; no missing transition was recorded." };
+		const preservationBranch = branchForAttempt(task, attempt);
+		if (!hasAssignmentIdentity(attempt) || !preservationBranch) return { kind: "degraded", journal, note: "The exact missing agent was observed, but its deterministic worktree identity could not be established; no missing transition was recorded." };
+		const preserved = await dependencies.runJournal.inspectAttemptPreservation({ repositoryRoot, attempt });
+		if (preserved.kind !== "inspected") return { kind: "degraded", journal, note: `The exact missing agent was observed, but preservation failed: ${preserved.diagnostic}` };
+		const progress = dependencies.git.inspectManagedWorktreeProgress && hasAssignmentIdentity(attempt) ? await dependencies.git.inspectManagedWorktreeProgress(attempt.dispatch.worktreePath).catch(() => ({ kind: "unavailable", diagnostic: "Git preservation inspection failed." } as ManagedWorktreeProgress)) : { kind: "unavailable", diagnostic: "Git preservation inspection is unavailable." } as ManagedWorktreeProgress;
+		const preservation: import("./run.ts").RecoveryPreservation = {
+			observedAt,
+			worktreePath: attempt.dispatch.worktreePath,
+			branch: preservationBranch,
+			head: progress.kind === "observed" ? progress.head : null,
+			worktree: progress.kind === "observed" ? progress.worktree : { kind: "unavailable", diagnostic: progress.diagnostic },
+			git: progress.kind === "observed" ? { head: progress.git.head, digest: progress.git.digest.kind === "observed" ? progress.git.digest.sha256 : null, ...(progress.git.digest.kind === "unavailable" ? { diagnostic: progress.git.digest.diagnostic } : {}) } : { head: null, digest: null, diagnostic: progress.diagnostic },
+			assignment: preserved.assignment,
+			report: preserved.report,
+			evidence: preserved.evidence,
+		};
+		const missingLive = recoveryLiveRecord({ observedAt, kind: "missing", diagnostic: inspected.kind === "missing" ? inspected.diagnostic : undefined });
+		const priorPreservation = attempt.recovery?.preservation;
+		const samePreservation = priorPreservation && JSON.stringify({ ...priorPreservation, observedAt: "" }) === JSON.stringify({ ...preservation, observedAt: "" });
+		if (task.attention === "recovering" && task.attentionReason === "reconciliation-agent-missing" && samePreservation) return { kind: "none", journal, note: "The exact recorded agent remains missing; the preserved Attempt state remains authoritative and no effect was attempted." };
+		const changed = await persist((nextTask, nextAttempt) => { nextTask.attention = "recovering"; nextTask.attentionReason = "reconciliation-agent-missing"; nextTask.attentionDiagnostic = "The exact recorded agent is missing; worktree, Assignment, report, and evidence were preserved before any future replacement decision."; const existing = nextAttempt.recovery; nextAttempt.recovery = { live: missingLive, ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), preservation }; });
+		return changed ? { kind: "changed", journal, note: "The exact recorded agent is missing; worktree, Assignment, report, and evidence were preserved before the recovering stop." } : { kind: "degraded", journal, note: "The exact recorded agent is missing, but the preservation transition could not be persisted." };
+	}
+
+	return { kind: "none", journal, note: "No reconciliation effect was selected." };
+}
+
 /** Assemble the plain-function orchestration seam without adding lifecycle machinery. */
 export function createSteward({ runJournal, herdr, git, process, model, clock, ui }: StewardDependencies): Steward {
 	void process;
@@ -2060,6 +2532,19 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && loaded.journal.run.controllerSessionId === controllerSessionId) {
 			let currentJournal = loaded.journal;
 			let note = "";
+			const hasRecoverySignal = currentJournal.run.tasks.some((candidateTask) => {
+				const latest = candidateTask.attempts.at(-1);
+				return latest !== undefined && (latest.state === "prepared" || latest.state === "awaiting-report" || latest.dispatch.phase === "prompt-intended" || latest.dispatch.phase === "reconciled-active" || latest.recovery !== undefined);
+			});
+			const reconciliation = optionalManagedAgentInspector(herdr) || hasRecoverySignal
+				? await reconcileCurrentAttempt(repositoryRoot, controllerSessionId, currentJournal, { runJournal, herdr, git, process, model, clock, ui })
+				: { kind: "none" as const, journal: currentJournal, note: "" };
+			currentJournal = reconciliation.journal;
+			if (reconciliation.kind !== "none") {
+				statusView = currentJournal.run.status === "completed" ? presentCompletedStatus(currentJournal, reconciliation.note) : presentStatusForJournal(currentJournal, reconciliation.note);
+				ui.presentStatus(statusView, target);
+				return statusView;
+			}
 			const candidate = activeBuilder(currentJournal);
 			if (candidate) {
 				const decision = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
@@ -2078,12 +2563,29 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			const completion = await advanceApprovedCompletion(repositoryRoot, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
 			currentJournal = completion.journal;
 			if (completion.note) note = note ? `${note} ${completion.note}` : completion.note;
+			const latestTask = currentJournal.run.tasks.find((candidate) => candidate.phase === "building" && candidate.attempts.at(-1)?.role === "builder");
+			const latestAttempt = latestTask?.attempts.at(-1);
+			if (latestTask?.phase === "building" && latestAttempt?.role === "builder" && latestAttempt.state === "reported" && latestAttempt.evidence?.phase === "finalized" && note.startsWith("Review dispatch pending")) note = `Builder Attempt ${latestAttempt.id} report was validated and finalized.`;
 			statusView = completion.completed ? presentCompletedStatus(currentJournal, completion.note) : presentStatusForJournal(currentJournal, note);
 		} else if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && loaded.journal.run.controllerSessionId !== controllerSessionId) {
 			statusView = presentStatusForJournal(loaded.journal, "Controller Session does not match; evidence validation is read-only until the authorized Controller returns.");
 		}
 		ui.presentStatus(statusView, target);
 		return statusView;
+	}
+
+	async function resume(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult> {
+		const loaded = await runJournal.loadActive(repositoryRoot);
+		let result: ResumeResult;
+		if (loaded.kind === "missing") result = { kind: "missing", message: "No active Steward Run exists in this repository." };
+		else if (loaded.kind === "invalid") result = { kind: "invalid", message: `Active Steward Run state is invalid at ${loaded.paths.activePath}; resume is read-only. ${loaded.diagnostics.map((item) => item.message).join(" ")}` };
+		else if (loaded.journal.run.controllerSessionId !== controllerSessionId) result = { kind: "foreign-session", recordedSessionId: loaded.journal.run.controllerSessionId, currentSessionId: controllerSessionId, message: "The active Steward Run belongs to a different Controller Session; resume performed no mutation." };
+		else {
+			const pass = await advanceNext(repositoryRoot, controllerSessionId, { interactive: true, maximumActions: 1, source: "resume" });
+			result = pass.condition === "degraded" ? { kind: "degraded", message: pass.note, result: pass } : { kind: "reconciled", result: pass };
+		}
+		ui.presentResumeResult?.(result);
+		return result;
 	}
 
 	async function configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult> {
@@ -2382,14 +2884,14 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const selected = currentMonitorAttempt(journal);
 		if (!selected || !observationIdentity(selected.attempt)) return monitorResult("none", journal, "No current prompted Steward Attempt is available for monitoring.");
 		const identity = observationIdentity(selected.attempt)!;
-		let agent: ManagedAgentInspection = { kind: "unavailable", diagnostic: "Herdr monitoring inspection is unavailable." };
-		try { if (herdr.inspectManagedAgent) agent = await herdr.inspectManagedAgent(identity); } catch (error: unknown) { agent = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr monitoring inspection failed." }; }
+		let agent: ManagedAgentInspection = { kind: "unclear", diagnostic: "Herdr monitoring inspection is unavailable." };
+		try { if (herdr.inspectManagedAgent) agent = await herdr.inspectManagedAgent(identity); } catch (error: unknown) { agent = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr monitoring inspection failed." }; }
 		let terminal: MonitorDigest = { kind: "unavailable", diagnostic: "Herdr terminal observation is unavailable." };
 		try { if (herdr.readManagedTerminal) terminal = await herdr.readManagedTerminal(identity); } catch (error: unknown) { terminal = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr terminal observation failed." }; }
 		let worktree: MonitorDigest = { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." };
 		let gitProgress: { head: string | null; digest: string | null; diagnostic?: string } = { head: null, digest: null, diagnostic: "Managed Git observation is unavailable." };
 		try {
-			const progress = git.inspectManagedWorktreeProgress ? await git.inspectManagedWorktreeProgress(selected.attempt.dispatch.phase === "prompted" ? selected.attempt.dispatch.worktreePath : "") : { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." } as ManagedWorktreeProgress;
+			const progress = git.inspectManagedWorktreeProgress ? await git.inspectManagedWorktreeProgress(selected.attempt.dispatch.phase === "prompted" || selected.attempt.dispatch.phase === "reconciled-active" ? selected.attempt.dispatch.worktreePath : "") : { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." } as ManagedWorktreeProgress;
 			if (progress.kind === "observed") { worktree = progress.worktree; gitProgress = { head: progress.git.head, digest: progress.git.digest.kind === "observed" ? progress.git.digest.sha256 : null, ...(progress.git.digest.kind === "unavailable" ? { diagnostic: progress.git.digest.diagnostic } : {}) }; }
 			else { worktree = { kind: "unavailable", diagnostic: progress.diagnostic }; gitProgress = { head: null, digest: null, diagnostic: progress.diagnostic }; }
 		} catch (error: unknown) { const diagnostic = error instanceof Error ? error.message : "Managed worktree observation failed."; worktree = { kind: "unavailable", diagnostic }; gitProgress = { head: null, digest: null, diagnostic }; }
@@ -2405,7 +2907,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const observedAt = new Date(Math.max(clock.now().getTime(), new Date(journal.run.updatedAt).getTime() + 1)).toISOString();
 		const checkpoint: MonitorCheckpoint = { observedAt, taskId: selected.task.contract.id, attemptId: selected.attempt.id, role: selected.attempt.role, agent: { ...identity, lifecycle, stateChangeSequence }, terminal, worktree, git: gitProgress, report };
 		const changedSources = monitorChangedSources(journal.run.monitor, checkpoint);
-		const degraded = agent.kind === "unavailable" || terminal.kind === "unavailable" || worktree.kind === "unavailable" || Boolean(gitProgress.diagnostic) || report.kind === "unavailable";
+		const degraded = agent.kind === "unclear" || terminal.kind === "unavailable" || worktree.kind === "unavailable" || Boolean(gitProgress.diagnostic) || report.kind === "unavailable";
 		if (changedSources.length === 0) return monitorResult(degraded ? "degraded" : "none", journal, `${trigger} monitoring scan found no changed durable facts.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
 		let candidate: RunJournal;
 		try { candidate = advanceRunJournal(journal, clock.now(), (next) => { next.run.monitor = checkpoint; }); }
@@ -2459,6 +2961,21 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		let journal = loaded.journal;
 		if (journal.run.controllerSessionId !== controllerSessionId) return monitorResult("none", journal, "Controller Session does not match; advancement is read-only.");
 		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; advancement is dormant.", undefined, true);
+		const reconciliation = await reconcileCurrentAttempt(repositoryRoot, controllerSessionId, journal, monitorDependencies);
+		journal = reconciliation.journal;
+		if (reconciliation.kind !== "none") {
+			const action = reconciliation.action ?? (reconciliation.kind === "degraded" ? "degraded" : reconciliation.kind === "blocked" ? "blocked" : "record-observation");
+			let activityDiagnostic: string | undefined;
+			if (journal.journalRevision !== loaded.journal.journalRevision) {
+				try {
+					const activity = await runJournal.appendActivity(repositoryRoot, { timestamp: journal.run.updatedAt, runId: journal.run.id, event: "reconciliation-observed", message: reconciliation.note });
+					if (activity.kind !== "appended") activityDiagnostic = "Activity append failed after authoritative reconciliation persistence.";
+				} catch (error: unknown) {
+					activityDiagnostic = error instanceof Error ? error.message.slice(0, 2_000) : "Activity append failed after authoritative reconciliation persistence.";
+				}
+			}
+			return monitorResult(activityDiagnostic ? "degraded" : action, journal, reconciliation.note, activityDiagnostic);
+		}
 		const activity = { failed: false, diagnostic: "" };
 		const authoritativeActivity = monitorDependencies.runJournal.appendActivity.bind(monitorDependencies.runJournal);
 		const deps: StewardDependencies = {
@@ -2525,5 +3042,5 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (target === "command" && journal) ui.presentStatus(presentStatusForJournal(journal, result.note), "command");
 	}
 
-	return { status, configure, start, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
+	return { status, resume, configure, start, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
 }

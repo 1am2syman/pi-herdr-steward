@@ -413,7 +413,7 @@ it.sequential("uses the exact lifecycle wait first and the frozen passive interv
 	equal((await steward.waitForMonitorSignal(root, "monitor-controller", new AbortController().signal)).kind, "timeout");
 	equal(waitCalls, 2);
 	equal(fallbackWaits, 2);
-	dependencies.herdr.inspectManagedAgent = async (identity) => ({ kind: "unavailable", diagnostic: "agent disappeared" });
+	dependencies.herdr.inspectManagedAgent = async (identity) => ({ kind: "unclear", diagnostic: "agent disappeared" });
 	equal((await steward.waitForMonitorSignal(root, "monitor-controller", new AbortController().signal)).kind, "timeout");
 	equal(waitCalls, 2);
 	equal(fallbackWaits, 3);
@@ -454,7 +454,7 @@ it.sequential("keeps foreign, stale, and wrong-resource observations read-only",
 	equal(effects.reviewerPrompts, 0);
 	equal(await readFile(join(paths.activityRoot, journal.run.id, "activity.log"), "utf8"), activityBefore);
 	dependencies.runJournal.replaceActive = originalReplace;
-	dependencies.herdr.inspectManagedAgent = async () => ({ kind: "unavailable", diagnostic: "recorded terminal was replaced" });
+	dependencies.herdr.inspectManagedAgent = async () => ({ kind: "unclear", diagnostic: "recorded terminal was replaced" });
 	const wrong = await steward.observeMonitorProgress(root, "monitor-controller", "manual");
 	equal(wrong.condition, "degraded");
 	equal(effects.reviewerStarts, 0);
@@ -477,7 +477,8 @@ it.sequential("bounds automatic advancement to one workflow action and does not 
 	equal(dispatched.condition, "degraded");
 	equal(effects.reviewerPrompts, 1);
 	const repeatable = await steward.advanceNext(root, "monitor-controller", { interactive: false, maximumActions: 1 });
-	equal(repeatable.action, "none");
+	equal(repeatable.action, "degraded");
+	equal(repeatable.condition, "degraded");
 	equal(effects.reviewerPrompts, 1);
 	const repeat = await steward.advanceNext(root, "monitor-controller", { interactive: false, maximumActions: 1 });
 	equal(effects.reviewerPrompts, 1);

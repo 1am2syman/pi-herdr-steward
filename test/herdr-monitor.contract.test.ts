@@ -64,13 +64,13 @@ it.sequential("forwards AbortSignal and classifies timeout, malformed, and wrong
 		return result("not-json");
 	});
 	deepStrictEqual(await timeout.waitForManagedAgent!(identity, 1_500, new AbortController().signal), { kind: "timeout" });
-	deepStrictEqual(await timeout.inspectManagedAgent!(identity), { kind: "unavailable", diagnostic: "Herdr returned no valid same-identity agent_info envelope." });
+	deepStrictEqual(await timeout.inspectManagedAgent!(identity), { kind: "unclear", diagnostic: "Herdr returned no valid same-identity agent_info envelope." });
 
 	const wrong = createHerdrAdapter(async (_command, args) => {
 		if (args[1] === "get") return result(agentEnvelope("idle", { terminal_id: "terminal-reused-by-other-agent" }));
 		return result("", JSON.stringify({ id: "cli:agent:wait", error: { code: "server_unavailable", message: "server unavailable" } }), 1);
 	});
-	deepStrictEqual(await wrong.inspectManagedAgent!(identity), { kind: "unavailable", diagnostic: "Herdr returned no valid same-identity agent_info envelope." });
+	deepStrictEqual(await wrong.inspectManagedAgent!(identity), { kind: "unclear", diagnostic: "Herdr returned no valid same-identity agent_info envelope." });
 	deepStrictEqual(await wrong.waitForManagedAgent!(identity, 500, new AbortController().signal), { kind: "unavailable", diagnostic: "server unavailable" });
 
 	const aborted = createHerdrAdapter(async (_command, _args, options) => {
@@ -84,7 +84,7 @@ it.sequential("forwards AbortSignal and classifies timeout, malformed, and wrong
 
 it.sequential("rejects non-Pi and still-working wait envelopes", async () => {
 	const nonPi = createHerdrAdapter(async () => result(agentEnvelope("idle", { agent: "claude" })));
-	ok((await nonPi.inspectManagedAgent!(identity)).kind === "unavailable");
+	ok((await nonPi.inspectManagedAgent!(identity)).kind === "unclear");
 	const stillWorking = createHerdrAdapter(async (_command, args) => args[1] === "wait" ? result(agentEnvelope("working", {}, "cli:agent:wait")) : result(agentEnvelope("working")));
 	const value = await stillWorking.waitForManagedAgent!(identity, 500, new AbortController().signal);
 	deepStrictEqual(value, { kind: "unavailable", diagnostic: "Herdr wait returned a still-working agent; no busy-loop was started." });

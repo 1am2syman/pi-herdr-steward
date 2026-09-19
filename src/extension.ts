@@ -153,12 +153,17 @@ export function registerStewardExtension(
 	});
 
 	pi.registerCommand("steward", {
-		description: "Inspect, configure, or start Steward Runs.",
+		description: "Inspect, configure, start, or resume Steward Runs.",
 		handler: async (args, ctx) => {
 			const command = args.trim();
 			if (command === "start" && ctx.mode !== "tui") throw new Error("Steward start requires interactive TUI mode.");
 			if (command === "config" && ctx.mode !== "tui") throw new Error("Steward configuration requires interactive TUI mode.");
+			if (command === "resume" && ctx.mode !== "tui") throw new Error("Steward resume requires interactive TUI mode.");
 			if (ctx.mode !== "tui") return;
+			if (!new Set(["status", "config", "start", "resume"]).has(command)) {
+				ctx.ui.notify("Usage: /steward status | /steward config | /steward start | /steward resume", "info");
+				return;
+			}
 			if (!sameRuntime(runtime, ctx) || !runtime?.monitorStarted) {
 				if (runtime) await runtime.monitor.stop();
 				runtime = makeRuntime(ctx, adapterFactory, exec);
@@ -178,7 +183,10 @@ export function registerStewardExtension(
 					await current.steward.start(ctx.cwd, current.controllerSessionId);
 					return;
 				}
-				ctx.ui.notify("Usage: /steward status | /steward config | /steward start", "info");
+				if (command === "resume") {
+					await current.steward.resume(ctx.cwd, current.controllerSessionId);
+					return;
+				}
 			});
 		},
 	});

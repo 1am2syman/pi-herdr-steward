@@ -8,6 +8,7 @@ import type {
 	ReviewerAttemptRecord,
 	TaskContract,
 } from "./run.ts";
+import { formatTaskFactInstruction } from "./reconciliation.ts";
 import type { ReportedCheck, ReportedLogReference } from "./attempt-report.ts";
 
 export const REVIEW_REPORT_SCHEMA_VERSION = 1 as const;
@@ -369,7 +370,7 @@ export function buildReviewerAssignment(input: {
 	terminalId: string;
 	agentName: string;
 }): ReviewerAssignmentDocument {
-	if (input.attempt.dispatch.phase !== "agent-intended" && input.attempt.dispatch.phase !== "prompt-intended" && input.attempt.dispatch.phase !== "prompted") throw new Error("Reviewer Assignment requires actual Reviewer identities.");
+	if (input.attempt.dispatch.phase !== "agent-intended" && input.attempt.dispatch.phase !== "prompt-intended" && input.attempt.dispatch.phase !== "prompted" && input.attempt.dispatch.phase !== "reconciled-active") throw new Error("Reviewer Assignment requires actual Reviewer identities.");
 	const assignment: ReviewerAssignmentDocument = { schemaVersion: 1, assignment: { runId: input.runId, taskId: input.task.id, attemptId: input.attempt.id, role: "reviewer", requiredOutcome: input.task.requiredOutcome, reportPath: input.attempt.reportPath, evidenceDirectory: input.attempt.evidenceDirectory, actualModel: { ...input.attempt.actualModel }, specificationHash: input.attempt.specificationHash, subject: cloneSubject(input.attempt.subject), builderEvidence: { manifestPath: input.manifestPath, manifestSha256: input.manifestSha256 }, independence: { ...input.attempt.independence }, worktree: { path: input.attempt.worktree.path, baseline: { ...input.attempt.worktree.baseline, dirtyPaths: [...input.attempt.worktree.baseline.dirtyPaths], operationMarkers: [...input.attempt.worktree.baseline.operationMarkers] } }, herdr: { workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, agentName: input.agentName } } };
 	const validation = validateReviewerAssignment(assignment);
 	if (!validation.value || validation.diagnostics.length > 0) throw new Error(`Cannot build Reviewer Assignment: ${validation.diagnostics.map((item) => item.message).join("; ")}`);
@@ -377,7 +378,7 @@ export function buildReviewerAssignment(input: {
 }
 
 export function formatReviewerPrompt(document: ReviewerAssignmentDocument): string {
-	return [`Steward Reviewer Assignment ${document.assignment.runId}/${document.assignment.taskId}/${document.assignment.attemptId}`, "", "The following Assignment is authoritative and bounded:", serializeReviewerAssignment(document).trimEnd(), "", "Inspect only the exact Review subject in the Assignment.", "Treat the worktree as read-only: do not edit, commit, reset, stash, clean, revert, or delete files.", `Write the Reviewer Attempt Report to ${document.assignment.reportPath} using verdict approved or changes-required only after completing the Review.`, "Terminal or Herdr lifecycle state is not a verdict; only the strictly parsed Attempt Report is authoritative.", "Do not dispatch another agent."].join("\n");
+	return [`Steward Reviewer Assignment ${document.assignment.runId}/${document.assignment.taskId}/${document.assignment.attemptId}`, "", "The following Assignment is authoritative and bounded:", serializeReviewerAssignment(document).trimEnd(), "", "Inspect only the exact Review subject in the Assignment.", "Treat the worktree as read-only: do not edit, commit, reset, stash, clean, revert, or delete files.", `Write the Reviewer Attempt Report to ${document.assignment.reportPath} using verdict approved or changes-required only after completing the Review.`, "Terminal or Herdr lifecycle state is not a verdict; only the strictly parsed Attempt Report is authoritative.", formatTaskFactInstruction(), "Do not dispatch another agent."].join("\n");
 }
 
 export function serializeReviewerAttemptReport(report: ReviewerAttemptReport, body = ""): string {

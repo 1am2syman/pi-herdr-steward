@@ -26,6 +26,7 @@
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:resume": "vitest run test/resume.functional.test.ts test/herdr-reconciliation.contract.test.ts --maxWorkers=1",
     "test:completion": "vitest run test/completion.functional.test.ts",
     "test:integration-git": "vitest run test/integration-git.contract.test.ts",
     "test:completion-storage": "vitest run test/completion-storage.contract.test.ts",

@@ -43,8 +43,10 @@ import type {
 	MonitorLifecycle,
 	MonitorWaitResult,
 	ManagedWorktreeProgress,
+	HerdrTaskFactAnswerResult,
 } from "./steward.ts";
 import type { ReviewerChoiceInspection } from "./review.ts";
+import { parseTaskFactRequest, type TaskFactRequestResult } from "./reconciliation.ts";
 import { createHash } from "node:crypto";
 
 const STATUS_KEY = "pi-herdr-steward";
@@ -78,6 +80,8 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		replaceActive: runStore.replaceActive,
 		appendActivity: runStore.appendActivity,
 		inspectAttemptReport: runStore.inspectAttemptReport,
+		inspectAttemptAssignment: runStore.inspectAttemptAssignment,
+		inspectAttemptPreservation: runStore.inspectAttemptPreservation,
 		resolveAssignmentPaths: runStore.resolveAssignmentPaths,
 		createAssignment: runStore.createAssignment,
 		loadBuilderEvidenceInputs: runStore.loadBuilderEvidenceInputs,
@@ -551,6 +555,43 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			const error = safeErrorEnvelope(result);
 			return { kind: "failed", stage: "agent-prompt", code: error?.code ?? (result.killed ? "killed" : "malformed-response"), message: error?.message ?? "Herdr returned no valid Reviewer agent_prompted envelope." };
 		},
+		async readBlockedTaskFactRequest(identity, role): Promise<TaskFactRequestResult> {
+			if (!exec) return { kind: "unclear", diagnostic: "The Pi command runner is unavailable." };
+			let preflight: ManagedAgentInspection;
+			try { preflight = await this.inspectManagedAgent!(identity); } catch (error: unknown) { return { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Blocked-agent preflight failed." }; }
+			if (preflight.kind !== "observed" || preflight.identity.name !== identity.name || preflight.identity.workspaceId !== identity.workspaceId || preflight.identity.paneId !== identity.paneId || preflight.identity.terminalId !== identity.terminalId || preflight.lifecycle !== "blocked") return { kind: "unclear", diagnostic: "The recorded agent was not observed as the exact blocked resource." };
+			try {
+				const result = await exec("herdr", ["agent", "read", identity.name, "--source", "detection", "--lines", "200"], { timeout: 5_000 });
+				if (result.code !== 0 || result.killed || result.stderr.length > 0 || result.stdout.length > 16 * 1024) return { kind: "unclear", diagnostic: result.stderr.trim() || "Herdr blocked-agent detection was unavailable." };
+				return parseTaskFactRequest(result.stdout, role);
+			} catch (error: unknown) { return { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr blocked-agent detection failed." }; }
+		},
+		async answerBlockedTaskFact(input): Promise<HerdrTaskFactAnswerResult> {
+			if (!exec || input.answer.length === 0 || input.answer.length > 16 * 1024 || !/^STEWARD_TASK_FACT_ANSWER [A-Za-z0-9_-]+$/.test(input.answer)) return { kind: "failed", message: "Task-fact answer is not a bounded canonical payload." };
+			let preflight: ManagedAgentInspection;
+			try { preflight = await this.inspectManagedAgent!(input.identity); } catch (error: unknown) { return { kind: "ambiguous", message: error instanceof Error ? error.message : "Blocked-agent preflight failed." }; }
+			if (preflight.kind !== "observed" || preflight.identity.name !== input.identity.name || preflight.identity.workspaceId !== input.identity.workspaceId || preflight.identity.paneId !== input.identity.paneId || preflight.identity.terminalId !== input.identity.terminalId || preflight.lifecycle !== "blocked") return { kind: "ambiguous", message: "The exact recorded blocked agent could not be preflighted." };
+			try {
+				const result = await exec("herdr", ["agent", "send-keys", input.identity.name, input.answer, "enter"], { timeout: 5_000 });
+				const envelope = safeEnvelope(result);
+				const value = resultObject(envelope);
+				const actual = objectValue(value?.agent);
+				if (envelope?.id === "cli:agent:send-keys" && value?.type === "agent_keys_sent" && actual && safeIdentity(actual.name) && safeIdentity(actual.workspace_id) && safeIdentity(actual.pane_id) && safeIdentity(actual.terminal_id) && actual.name === input.identity.name && actual.workspace_id === input.identity.workspaceId && actual.pane_id === input.identity.paneId && actual.terminal_id === input.identity.terminalId) return { kind: "acknowledged", identity: { ...input.identity } };
+				return { kind: result.killed ? "ambiguous" : "failed", message: "Herdr returned no exact same-identity Task-fact acknowledgement." };
+			} catch (error: unknown) { return { kind: "ambiguous", message: error instanceof Error ? error.message : "Task-fact input delivery failed." }; }
+		},
+		async requestAttemptReport(input) {
+			if (!exec || !safeIdentity(input.identity.name) || !safeIdentity(input.identity.workspaceId) || !safeIdentity(input.identity.paneId) || !safeIdentity(input.identity.terminalId) || !isAbsolute(input.reportPath) || !isAbsolute(input.assignmentPath) || !isAbsolute(input.evidenceDirectory)) return { kind: "failed", stage: "agent-prompt", code: "invalid-input", message: "Attempt report request identity or paths are not exact." };
+			const prompt = `Steward ${input.role} report request: write exactly one valid Attempt Report to ${input.reportPath}. Use the existing Assignment at ${input.assignmentPath} and evidence directory ${input.evidenceDirectory}; do not restart the Task, change scope, or dispatch another agent.`;
+			try {
+				const result = await exec("herdr", ["agent", "prompt", input.identity.name, prompt], { timeout: 30_000 });
+				const envelope = safeEnvelope(result);
+				const value = resultObject(envelope);
+				const actual = identityFields(objectValue(value?.agent));
+				if (envelope?.id === "cli:agent:prompt" && value?.type === "agent_prompted" && actual && actual.name === input.identity.name && actual.workspaceId === input.identity.workspaceId && actual.paneId === input.identity.paneId && actual.terminalId === input.identity.terminalId) return { kind: "prompted", name: actual.name, workspaceId: actual.workspaceId, tabId: actual.tabId, paneId: actual.paneId, terminalId: actual.terminalId };
+				return { kind: "failed", stage: "agent-prompt", code: result.killed ? "killed" : "ambiguous-response", message: "Herdr returned no exact same-identity report-request acknowledgement." };
+			} catch (error: unknown) { return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Attempt report request failed." }; }
+		},
 		async stopAgentGracefully(input) {
 			if (!exec) return { kind: "failed", message: "The Pi command runner is unavailable." };
 			let result: ExecResult;
@@ -566,13 +607,16 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 			return { kind: result.killed ? "ambiguous" : "failed", message: error?.message ?? "Herdr returned no valid same-identity /quit acknowledgement." };
 		},
 		async inspectManagedAgent(identity) {
-			if (!exec) return { kind: "unavailable", diagnostic: "The Pi command runner is unavailable." };
+			if (!exec) return { kind: "unclear", diagnostic: "The Pi command runner is unavailable." };
 			try {
 				const result = await exec("herdr", ["agent", "get", identity.name], { timeout: 5000 });
 				const observed = exactManagedAgent(identity, result, "cli:agent:get");
-				return observed ?? { kind: "unavailable", diagnostic: result.killed ? "Herdr agent get was killed." : "Herdr returned no valid same-identity agent_info envelope." };
+				if (observed) return observed;
+				const error = safeErrorEnvelope(result);
+				if (error?.id === "cli:agent:get" && error.code === "agent_not_found" && result.stdout.trim() === "") return { kind: "missing", diagnostic: error.message };
+				return { kind: "unclear", diagnostic: result.killed ? "Herdr agent get was killed." : error?.message ?? "Herdr returned no valid same-identity agent_info envelope." };
 			} catch (error: unknown) {
-				return { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr agent get failed." };
+				return { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr agent get failed." };
 			}
 		},
 		async waitForManagedAgent(identity, timeoutMs, signal): Promise<MonitorWaitResult> {
@@ -994,6 +1038,11 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		ui.notify(result.message, result.kind === "started" || result.kind === "started-and-dispatched" ? "info" : result.kind === "started-with-warning" || result.kind === "started-and-dispatched-with-warning" || result.kind === "started-dispatch-pending" ? "warning" : result.kind === "cancelled" ? "info" : "error");
 	}
 
+	function presentResumeResult(result: import("./steward.ts").ResumeResult): void {
+		const message = result.kind === "reconciled" ? result.result.note : result.message;
+		ui.notify(message, result.kind === "reconciled" && result.result.condition === "ordinary" ? "info" : "warning");
+	}
+
 	function notifyCompletion(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void {
 		ui.notify(`Steward Run ${input.runId} completed on ${input.targetBranch} at ${input.integratedHead}. Final verification: ${input.verificationResultPath} (output: ${input.verificationLogPath}). Archive: ${input.archivePath}`, "info");
 	}
@@ -1016,7 +1065,8 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		draftRun: (input) => draftRun(ui, input),
 		confirmRun: (summary) => ui.confirm!("Confirm Steward Run", summary.markdown),
 		confirmSameFamilyReview,
-		presentStartResult,
+			presentStartResult,
+			presentResumeResult,
 		notifyCompletion,
 		presentMonitorCondition,
 	};

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
-import { chmod, link, lstat, open, readFile, realpath, rename, unlink } from "node:fs/promises";
+import { chmod, link, lstat, open, readFile, realpath, rename, unlink, readdir } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
@@ -23,6 +23,8 @@ import {
 	type ActivityEntry,
 	type RunDiagnostic,
 	type RunJournal,
+	type AttemptRecord,
+	type MonitorReportObservation,
 } from "./run.ts";
 
 export interface RunJournalPaths {
@@ -58,6 +60,14 @@ export type AttemptReportInspection =
 	| { kind: "present"; size: number; sha256: string }
 	| { kind: "unavailable"; diagnostic: string };
 
+export type AttemptPreservationInspection =
+	| { kind: "inspected"; assignment: { path: string; size: number; sha256: string }; report: MonitorReportObservation; evidence: { directory: string; count: number; byteCount: number; sha256: string; entries: Array<{ path: string; size: number; sha256: string }> } }
+	| { kind: "unavailable"; diagnostic: string };
+
+export type AttemptAssignmentInspection =
+	| { kind: "loaded"; path: string; bytes: Buffer; size: number; sha256: string }
+	| { kind: "missing" | "unavailable"; diagnostic: string };
+
 export interface RunJournalStore {
 	resolvePaths(repositoryRoot: string): RunJournalPaths;
 	probeActive(repositoryRoot: string): "missing" | "present";
@@ -66,6 +76,8 @@ export interface RunJournalStore {
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: ActivityEntry): Promise<ActivityAppendResult>;
 	inspectAttemptReport(repositoryRoot: string, reportPath: string): Promise<AttemptReportInspection>;
+	inspectAttemptAssignment(input: { repositoryRoot: string; attempt: AttemptRecord }): Promise<AttemptAssignmentInspection>;
+	inspectAttemptPreservation(input: { repositoryRoot: string; attempt: AttemptRecord }): Promise<AttemptPreservationInspection>;
 	resolveAssignmentPaths(repositoryRoot: string, runId: string, taskId: string, attemptId: string): AssignmentPaths;
 	createAssignment(repositoryRoot: string, document: import("./run.ts").AssignmentDocument): Promise<AssignmentCreateResult>;
 	loadBuilderEvidenceInputs(input: BuilderEvidenceInputRequest): Promise<BuilderEvidenceInputs>;
@@ -222,6 +234,91 @@ async function inspectStableAttemptReport(repositoryRoot: string, reportPath: st
 	}
 }
 
+async function inspectPreservationFile(path: string, maximumBytes: number): Promise<{ size: number; sha256: string } | undefined> {
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		const info = await lstat(path);
+		if (!info.isFile() || info.isSymbolicLink() || info.size > maximumBytes || (await realpath(path)) !== path) return undefined;
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const before = await handle.stat();
+		if (!before.isFile() || before.dev !== info.dev || before.ino !== info.ino || before.size !== info.size) return undefined;
+		const digest = createHash("sha256");
+		const bytes = await handle.readFile();
+		if (bytes.length !== info.size) return undefined;
+		const after = await handle.stat();
+		if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size) return undefined;
+		digest.update(bytes);
+		return { size: bytes.length, sha256: `sha256:${digest.digest("hex")}` };
+	} catch {
+		return undefined;
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
+async function inspectAssignmentBytes(path: string, maximumBytes: number): Promise<AttemptAssignmentInspection> {
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		const info = await lstat(path);
+		if (!info.isFile() || info.isSymbolicLink() || info.size > maximumBytes || (await realpath(path)) !== path) return { kind: "unavailable", diagnostic: "Assignment is not a stable regular non-symlink file." };
+		handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		const before = await handle.stat();
+		if (!before.isFile() || before.dev !== info.dev || before.ino !== info.ino || before.size !== info.size) return { kind: "unavailable", diagnostic: "Assignment changed before observation." };
+		const bytes = await handle.readFile();
+		const after = await handle.stat();
+		if (!after.isFile() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size || bytes.length !== before.size) return { kind: "unavailable", diagnostic: "Assignment changed while it was observed." };
+		return { kind: "loaded", path, bytes, size: bytes.length, sha256: `sha256:${createHash("sha256").update(bytes).digest("hex")}` };
+	} catch (error: unknown) {
+		return missing(error) ? { kind: "missing", diagnostic: "Assignment is missing." } : { kind: "unavailable", diagnostic: filesystemErrorText(error).slice(0, 2_000) };
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
+async function inspectAttemptPreservation(input: { repositoryRoot: string; attempt: AttemptRecord }, configDirName: string): Promise<AttemptPreservationInspection> {
+	const state = resolveProjectStatePaths(input.repositoryRoot, configDirName);
+	const root = resolve(state.stewardDirectory);
+	const expectedRoot = resolve(input.attempt.assignmentPath, "..");
+	if (!isAbsolute(input.attempt.assignmentPath) || !isAbsolute(input.attempt.reportPath) || !isAbsolute(input.attempt.evidenceDirectory) || input.attempt.assignmentPath !== join(expectedRoot, "assignment.json") || input.attempt.reportPath !== join(expectedRoot, "report.md") || input.attempt.evidenceDirectory !== join(expectedRoot, "evidence") || !expectedRoot.startsWith(`${root}/`)) return { kind: "unavailable", diagnostic: "Attempt preservation paths are not deterministic Steward-owned paths." };
+	const assignment = await inspectPreservationFile(input.attempt.assignmentPath, 64 * 1024);
+	if (!assignment) return { kind: "unavailable", diagnostic: "Assignment is missing, unstable, or not a regular non-symlink file." };
+	const report = await inspectStableAttemptReport(input.repositoryRoot, input.attempt.reportPath, configDirName);
+	let evidenceInfo: Awaited<ReturnType<typeof lstat>>;
+	try {
+		evidenceInfo = await lstat(input.attempt.evidenceDirectory);
+		if (!evidenceInfo.isDirectory() || evidenceInfo.isSymbolicLink() || (await realpath(input.attempt.evidenceDirectory)) !== input.attempt.evidenceDirectory) return { kind: "unavailable", diagnostic: "Evidence directory is not a stable non-symlink directory." };
+	} catch {
+		return { kind: "unavailable", diagnostic: "Evidence directory could not be inspected." };
+	}
+	const entries: Array<{ path: string; size: number; sha256: string }> = [];
+	let byteCount = 0;
+	async function walk(directory: string, relativeDirectory: string): Promise<boolean> {
+		let names: string[];
+		try { names = (await readdir(directory)).sort(); } catch { return false; }
+		for (const name of names) {
+			if (name.length === 0 || name === "." || name === ".." || name.includes("\u0000") || entries.length >= 512) return false;
+			const absolute = join(directory, name);
+			const relativePath = relativeDirectory.length > 0 ? `${relativeDirectory}/${name}` : name;
+			let info;
+			try { info = await lstat(absolute); } catch { return false; }
+			if (info.isSymbolicLink()) return false;
+			if (info.isDirectory()) {
+				if (!(await walk(absolute, relativePath))) return false;
+				continue;
+			}
+			if (!info.isFile() || info.size > 256 * 1024 || byteCount + info.size > 16 * 1024 * 1024) return false;
+			const digest = await inspectPreservationFile(absolute, 256 * 1024);
+			if (!digest) return false;
+			entries.push({ path: relativePath, size: digest.size, sha256: digest.sha256 });
+			byteCount += digest.size;
+		}
+		return true;
+	}
+	if (!(await walk(input.attempt.evidenceDirectory, ""))) return { kind: "unavailable", diagnostic: "Evidence inventory was unstable, symlinked, or exceeded bounded preservation limits." };
+	const inventory = JSON.stringify(entries);
+	return { kind: "inspected", assignment: { path: input.attempt.assignmentPath, size: assignment.size, sha256: assignment.sha256 }, report: report.kind === "present" ? { kind: "present", size: report.size, sha256: report.sha256 } : report.kind === "missing" ? { kind: "missing" } : { kind: "unavailable", diagnostic: report.diagnostic }, evidence: { directory: input.attempt.evidenceDirectory, count: entries.length, byteCount, sha256: `sha256:${createHash("sha256").update(inventory, "utf8").digest("hex")}`, entries } };
+}
+
 export function resolveRunJournalPaths(repositoryRoot: string, configDirName = CONFIG_DIR_NAME): RunJournalPaths {
 	return pathsFor(repositoryRoot, configDirName);
 }
@@ -361,6 +458,17 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		return inspectStableAttemptReport(repositoryRoot, reportPath, configDirName);
 	}
 
+	async function inspectAttemptAssignment(input: { repositoryRoot: string; attempt: AttemptRecord }): Promise<AttemptAssignmentInspection> {
+		const root = resolve(resolveProjectStatePaths(input.repositoryRoot, configDirName).stewardDirectory);
+		const path = input.attempt.assignmentPath;
+		if (!isAbsolute(path) || path !== resolve(path) || !path.startsWith(`${root}/`) || !path.endsWith("/assignment.json")) return { kind: "unavailable", diagnostic: "Assignment path is not an exact Steward-owned path." };
+		return inspectAssignmentBytes(path, 64 * 1024);
+	}
+
+	async function inspectAttemptPreservationFor(input: { repositoryRoot: string; attempt: AttemptRecord }): Promise<AttemptPreservationInspection> {
+		return inspectAttemptPreservation(input, configDirName);
+	}
+
 	async function archiveRun(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult> {
 		const paths = resolvePaths(input.repositoryRoot);
 		const active = await readJournalFile(paths.activePath);
@@ -392,6 +500,8 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		replaceActive,
 		appendActivity,
 		inspectAttemptReport,
+		inspectAttemptAssignment,
+		inspectAttemptPreservation: inspectAttemptPreservationFor,
 		resolveAssignmentPaths: (repositoryRoot, runId, taskId, attemptId) => resolveAssignmentPaths(repositoryRoot, runId, taskId, attemptId, configDirName),
 		createAssignment: assignmentStore.createAssignment,
 		loadBuilderEvidenceInputs: evidenceStore.loadBuilderEvidenceInputs,
