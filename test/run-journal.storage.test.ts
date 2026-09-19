@@ -2,14 +2,14 @@ import { existsSync } from "node:fs";
 import { lstat, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { deepStrictEqual, equal, match, ok } from "node:assert/strict";
+import { deepStrictEqual, equal, match, ok, throws } from "node:assert/strict";
 import { afterEach, it, vi } from "vitest";
 
 import { createRunJournalStore } from "../src/run-journal-store.ts";
 import { createAttemptEvidenceStore, sha256Bytes } from "../src/attempt-evidence-store.ts";
 import { resolveAssignmentPaths } from "../src/assignment-store.ts";
-import { buildInitialRunJournal, cloneRunJournal, COMPLETION_GATE_PREDICATES, deserializeRunJournal, serializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type AttemptRecovery, type BuilderAttemptRecord, type MonitorCheckpoint, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
-import type { ReviewSubject } from "../src/review.ts";
+import { buildBuilderAssignment, buildInitialRunJournal, cloneRunJournal, COMPLETION_GATE_PREDICATES, deserializeBuilderAssignment, deserializeRunJournal, serializeBuilderAssignment, serializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type AttemptContinuation, type AttemptRecovery, type BuilderAttemptRecord, type MonitorCheckpoint, type ReviewerAttemptRecord, type ReviewWorktreeSnapshot, type RunJournal } from "../src/run.ts";
+import { buildReviewerAssignment, deserializeReviewerAssignment, serializeReviewerAssignment, type ReviewSubject } from "../src/review.ts";
 import { type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
 import type { BuilderAssignmentDocument } from "../src/run.ts";
 
@@ -153,6 +153,138 @@ function maxHistoryJournal(): RunJournal {
 	if (!finalEvidence || finalEvidence.phase !== "finalized") throw new Error("fixture final Reviewer evidence missing");
 	const result: RunJournal = { ...base, journalRevision: 2, run: { ...base.run, updatedAt: "2026-09-17T18:12:00.000Z", tasks: [{ ...task, phase: "approved", attention: "none", attempts, reworkCycles: 5, approval: { phase: "valid", approvedAt: timestamp, builderAttemptId: finalBuilder.id, reviewerAttemptId: finalReviewer.id, subject: finalSubject, reviewerManifestPath: finalEvidence.manifestPath, reviewerManifestSha256: finalEvidence.manifestSha256, worktreeSnapshot: snapshot(11), verdict: "approved" } }] } };
 	const validated = validateRunJournal(result);
+	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
+	return validated.value;
+}
+
+function replacementThenReworkJournal(): RunJournal {
+	const raw = JSON.parse(JSON.stringify(maxHistoryJournal())) as Record<string, unknown>;
+	const run = raw.run as Record<string, unknown>;
+	const task = (run.tasks as Array<Record<string, unknown>>)[0]!;
+	const history = task.attempts as Array<Record<string, unknown>>;
+	const originalBuilder = JSON.parse(JSON.stringify(history[0])) as Record<string, unknown>;
+	const originalReviewer = JSON.parse(JSON.stringify(history[1])) as Record<string, unknown>;
+	const reworkBuilder = JSON.parse(JSON.stringify(history[2])) as Record<string, unknown>;
+	const timestamp = "2026-09-17T18:01:00.000Z";
+	const hash = `sha256:${"a".repeat(64)}`;
+	const reviewerDispatch = originalReviewer.dispatch as Record<string, unknown>;
+	const reviewerIdentity = {
+		name: reviewerDispatch.agentName,
+		workspaceId: reviewerDispatch.workspaceId,
+		paneId: reviewerDispatch.paneId,
+		terminalId: reviewerDispatch.terminalId,
+	};
+	const preservation = {
+		observedAt: timestamp,
+		worktreePath: reviewerDispatch.worktreePath,
+		branch: "steward/run/task/attempt-02",
+		head: "0".repeat(40),
+		worktree: { kind: "observed", byteCount: 0, sha256: hash },
+		git: { head: "0".repeat(40), digest: hash },
+		assignment: { path: originalReviewer.assignmentPath, sha256: hash, size: 1 },
+		report: { kind: "missing" },
+		evidence: { directory: originalReviewer.evidenceDirectory, count: 0, byteCount: 0, sha256: hash, entries: [] },
+	};
+	const inspection = {
+		attemptId: originalReviewer.id,
+		role: "reviewer",
+		agent: reviewerIdentity,
+		lifecycle: "working",
+		stateChangeSequence: null,
+		terminal: { kind: "observed", byteCount: 0, sha256: hash },
+		worktree: { kind: "observed", byteCount: 0, sha256: hash },
+		git: { head: "0".repeat(40), digest: hash },
+		assignment: { path: originalReviewer.assignmentPath, size: 1, sha256: hash },
+		report: { kind: "missing" },
+		evidence: { directory: originalReviewer.evidenceDirectory, count: 0, byteCount: 0, sha256: hash, entries: [] },
+		process: { kind: "none", paneId: reviewerIdentity.paneId, shellPid: 101, foregroundProcessGroupId: 101, processCount: 1, digest: hash },
+	};
+	originalReviewer.state = "superseded";
+	originalReviewer.recovery = {
+		live: { observedAt: timestamp, kind: "working", lifecycle: "working" },
+		preservation,
+		silence: { phase: "replacement-intended", lastProgressAt: timestamp, phaseAt: timestamp, inspection, target: reviewerIdentity, intendedAt: timestamp, retryOrdinal: 1 },
+	};
+	const replacementReviewer = JSON.parse(JSON.stringify(originalReviewer)) as Record<string, unknown>;
+	delete replacementReviewer.recovery;
+	replacementReviewer.id = "attempt-03";
+	replacementReviewer.state = "reported";
+	replacementReviewer.preparedAt = timestamp;
+	replacementReviewer.activatedAt = timestamp;
+	replacementReviewer.assignmentPath = "/tmp/max-history/replacement-reviewer-03/assignment.json";
+	replacementReviewer.reportPath = "/tmp/max-history/replacement-reviewer-03/report.md";
+	replacementReviewer.evidenceDirectory = "/tmp/max-history/replacement-reviewer-03/evidence";
+	replacementReviewer.dispatch = { ...reviewerDispatch, agentName: "steward-r-abcdef12-01-03", paneId: "reviewer-pane-03", terminalId: "reviewer-terminal-03", promptedAt: timestamp };
+	replacementReviewer.replacement = { kind: "silent-agent-recovery", replacesAttemptId: "attempt-02", retryOrdinal: 1, preservedAt: timestamp };
+	const replacementEvidence = replacementReviewer.evidence as Record<string, unknown>;
+	const reworkDispatch = reworkBuilder.dispatch as Record<string, unknown>;
+	const replacementSubject = replacementReviewer.subject;
+	const replacementManifest = replacementEvidence.manifestSha256;
+	reworkBuilder.id = "attempt-04";
+	reworkBuilder.state = "prepared";
+	delete reworkBuilder.activatedAt;
+	delete reworkBuilder.evidence;
+	delete reworkBuilder.recovery;
+	reworkBuilder.assignmentPath = "/tmp/max-history/rework-builder-04/assignment.json";
+	reworkBuilder.reportPath = "/tmp/max-history/rework-builder-04/report.md";
+	reworkBuilder.evidenceDirectory = "/tmp/max-history/rework-builder-04/evidence";
+	const { assignmentSha256: _assignmentSha256, promptedAt: _promptedAt, ...reworkIdentity } = reworkDispatch;
+	reworkBuilder.dispatch = { ...reworkIdentity, phase: "assignment-intended", cycle: 1, priorBuilderAttemptId: "attempt-01", priorReviewerAttemptId: "attempt-03", reviewedSubject: replacementSubject, reviewerManifestSha256: replacementManifest };
+	task.phase = "reworking";
+	task.attention = "none";
+	delete task.attentionReason;
+	delete task.attentionDiagnostic;
+	delete task.approval;
+	task.reworkCycles = 1;
+	task.attempts = [originalBuilder, originalReviewer, replacementReviewer, reworkBuilder];
+	(run.effectiveSettings as Record<string, unknown>).transientRetryLimit = 2;
+	run.updatedAt = "2026-09-17T18:02:00.000Z";
+	const validated = validateRunJournal(raw);
+	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
+	return validated.value;
+}
+
+function replacementExhaustedJournal(): RunJournal {
+	const raw = JSON.parse(JSON.stringify(recoveryJournal("working"))) as Record<string, unknown>;
+	const run = raw.run as Record<string, unknown>;
+	const task = (run.tasks as Array<Record<string, unknown>>)[0]!;
+	const original = (task.attempts as Array<Record<string, unknown>>)[0]!;
+	const hash = `sha256:${"a".repeat(64)}`;
+	const makeAttempt = (index: number, state: "active" | "superseded", preparedAt: string, activatedAt: string, name: string, paneId: string, terminalId: string, silence: Record<string, unknown>, replacement?: Record<string, unknown>): Record<string, unknown> => {
+		const assignmentPath = `/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-${String(index).padStart(2, "0")}/assignment.json`;
+		const attempt = JSON.parse(JSON.stringify(original)) as Record<string, unknown>;
+		attempt.id = `attempt-${String(index).padStart(2, "0")}`;
+		attempt.state = state;
+		attempt.preparedAt = preparedAt;
+		attempt.activatedAt = activatedAt;
+		attempt.assignmentPath = assignmentPath;
+		attempt.reportPath = assignmentPath.replace("assignment.json", "report.md");
+		attempt.evidenceDirectory = assignmentPath.replace("assignment.json", "evidence");
+		attempt.dispatch = { phase: "prompted", branch: "steward/run/task/attempt-01", agentName: name, worktreePath: "/tmp/recovery-run/worktree", workspaceId: "workspace-1", paneId, terminalId, assignmentSha256: hash, promptedAt: activatedAt };
+		const inspectedSilence = silence.inspection as Record<string, unknown>;
+		attempt.recovery = { live: { observedAt: activatedAt, kind: "working", lifecycle: "working" }, silence: { ...silence, inspection: { ...inspectedSilence, attemptId: attempt.id, agent: { name, workspaceId: "workspace-1", paneId, terminalId }, assignment: { path: assignmentPath, size: 1, sha256: hash }, evidence: { directory: attempt.evidenceDirectory, count: 0, byteCount: 0, sha256: hash, entries: [] }, process: { kind: "none", paneId, shellPid: 101 + index, foregroundProcessGroupId: 101 + index, processCount: 1, digest: hash } } } };
+		if (state === "superseded") {
+			(attempt.recovery as Record<string, unknown>).preservation = { observedAt: silence.intendedAt, worktreePath: "/tmp/recovery-run/worktree", branch: "steward/run/task/attempt-01", head: "0".repeat(40), worktree: { kind: "observed", byteCount: 0, sha256: hash }, git: { head: "0".repeat(40), digest: hash }, assignment: { path: assignmentPath, sha256: hash, size: 1 }, report: { kind: "missing" }, evidence: { directory: attempt.evidenceDirectory, count: 0, byteCount: 0, sha256: hash, entries: [] } };
+		}
+		if (replacement) attempt.replacement = replacement;
+		return attempt;
+	};
+	const inspection = { attemptId: "attempt-01", role: "builder", agent: { name: "steward-b-abcdef12-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "working", stateChangeSequence: null, terminal: { kind: "observed", byteCount: 0, sha256: hash }, worktree: { kind: "observed", byteCount: 0, sha256: hash }, git: { head: "0".repeat(40), digest: hash }, assignment: { path: original.assignmentPath, size: 1, sha256: hash }, report: { kind: "missing" }, evidence: { directory: original.evidenceDirectory, count: 0, byteCount: 0, sha256: hash, entries: [] }, process: { kind: "none", paneId: "pane-1", shellPid: 101, foregroundProcessGroupId: 101, processCount: 1, digest: hash } };
+	const firstSilence = { phase: "replacement-intended", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: "2026-09-18T00:00:04.000Z", inspection, target: inspection.agent, intendedAt: "2026-09-18T00:00:04.000Z", retryOrdinal: 1 };
+	const secondSilence = { phase: "replacement-intended", lastProgressAt: "2026-09-18T00:00:06.000Z", phaseAt: "2026-09-18T00:00:07.000Z", inspection: { ...inspection, attemptId: "attempt-02", agent: { ...inspection.agent, name: "steward-b-abcdef12-01-02", paneId: "pane-2", terminalId: "terminal-2" }, assignment: { path: "/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-02/assignment.json", size: 1, sha256: hash }, evidence: { ...inspection.evidence, directory: "/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-02/evidence" }, process: { ...inspection.process, paneId: "pane-2", shellPid: 102, foregroundProcessGroupId: 102 } }, target: { name: "steward-b-abcdef12-01-02", workspaceId: "workspace-1", paneId: "pane-2", terminalId: "terminal-2" }, intendedAt: "2026-09-18T00:00:07.000Z", retryOrdinal: 2 };
+	const exhaustedSilence = { phase: "exhausted", lastProgressAt: "2026-09-18T00:00:08.000Z", phaseAt: "2026-09-18T00:00:09.000Z", inspection: { ...inspection, attemptId: "attempt-03", agent: { ...inspection.agent, name: "steward-b-abcdef12-01-03", paneId: "pane-3", terminalId: "terminal-3" }, assignment: { path: "/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-03/assignment.json", size: 1, sha256: hash }, evidence: { ...inspection.evidence, directory: "/tmp/recovery-run/runs/run-20260918T000000000Z-recovery/tasks/task-01/attempt-03/evidence" }, process: { ...inspection.process, paneId: "pane-3", shellPid: 103, foregroundProcessGroupId: 103 } }, retryOrdinal: 2 };
+	const first = makeAttempt(1, "superseded", "2026-09-18T00:00:01.000Z", "2026-09-18T00:00:02.000Z", "steward-b-abcdef12-01-01", "pane-1", "terminal-1", firstSilence);
+	const second = makeAttempt(2, "superseded", "2026-09-18T00:00:04.000Z", "2026-09-18T00:00:05.000Z", "steward-b-abcdef12-01-02", "pane-2", "terminal-2", secondSilence, { kind: "silent-agent-recovery", replacesAttemptId: "attempt-01", retryOrdinal: 1, preservedAt: "2026-09-18T00:00:04.000Z" });
+	const third = makeAttempt(3, "active", "2026-09-18T00:00:07.000Z", "2026-09-18T00:00:08.000Z", "steward-b-abcdef12-01-03", "pane-3", "terminal-3", exhaustedSilence, { kind: "silent-agent-recovery", replacesAttemptId: "attempt-02", retryOrdinal: 2, preservedAt: "2026-09-18T00:00:07.000Z" });
+	(task.attempts as Array<Record<string, unknown>>).splice(0, 1, first, second, third);
+	task.phase = "building";
+	task.attention = "needs-user";
+	task.attentionReason = "silence-recovery-exhausted";
+	delete task.attentionDiagnostic;
+	task.reworkCycles = 0;
+	(run.effectiveSettings as Record<string, unknown>).transientRetryLimit = 2;
+	run.updatedAt = "2026-09-18T00:00:10.000Z";
+	const validated = validateRunJournal(raw);
 	if (!validated.value) throw new Error(validated.diagnostics.map((item) => item.message).join("; "));
 	return validated.value;
 }
@@ -419,6 +551,175 @@ it.sequential("keeps schema-v1 journals additive and rejects impossible silence 
 	const impossibleAttempt = ((impossibleSuperseded.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>;
 	impossibleAttempt[0]!.state = "superseded";
 	ok(!validateRunJournal(impossibleSuperseded).value, "superseded Attempt without replacement-intended state was accepted");
+
+	const exhausted = JSON.parse(JSON.stringify(candidate)) as Record<string, unknown>;
+	((exhausted.run as Record<string, unknown>).effectiveSettings as Record<string, unknown>).transientRetryLimit = 0;
+	const exhaustedTask = ((exhausted.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!;
+	const exhaustedAttempt = (exhaustedTask.attempts as Array<Record<string, unknown>>)[0]!;
+	exhaustedTask.attention = "needs-user";
+	exhaustedTask.attentionReason = "silence-recovery-exhausted";
+	const exhaustedSilence = (exhaustedAttempt.recovery as Record<string, unknown>).silence as Record<string, unknown>;
+	exhaustedSilence.phase = "exhausted";
+	exhaustedSilence.retryOrdinal = 0;
+	delete exhaustedSilence.target;
+	delete exhaustedSilence.intendedAt;
+	delete exhaustedSilence.promptSha256;
+	delete exhaustedSilence.observedAt;
+	delete exhaustedSilence.diagnostic;
+	const validZeroBudget = validateRunJournal(exhausted);
+	ok(validZeroBudget.value, validZeroBudget.diagnostics.map((item) => item.message).join("; "));
+	const boundedTwoResult = deserializeRunJournal(serializeRunJournal(replacementExhaustedJournal()), "active-run.json");
+	ok(boundedTwoResult.value, boundedTwoResult.diagnostics.map((item) => item.message).join("; "));
+	const impossibleExhaustion = JSON.parse(JSON.stringify(exhausted)) as Record<string, unknown>;
+	const impossibleExhaustionTask = ((impossibleExhaustion.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!;
+	const impossibleExhaustionSilence = ((((impossibleExhaustionTask.attempts as Array<Record<string, unknown>>)[0]!).recovery as Record<string, unknown>).silence as Record<string, unknown>);
+	impossibleExhaustionSilence.retryOrdinal = 1;
+	ok(!validateRunJournal(impossibleExhaustion).value, "exhausted silence with no consumed replacement was accepted");
+	const overLimit = JSON.parse(JSON.stringify(replacementExhaustedJournal())) as Record<string, unknown>;
+	(overLimit.run as Record<string, unknown>).effectiveSettings = { ...(overLimit.run as Record<string, unknown>).effectiveSettings as Record<string, unknown>, transientRetryLimit: 1 };
+	ok(!validateRunJournal(overLimit).value, "replacement links beyond the frozen retry limit were accepted");
+	const brokenOrdinal = JSON.parse(JSON.stringify(replacementExhaustedJournal())) as Record<string, unknown>;
+	const brokenAttempts = (((brokenOrdinal.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>);
+	(brokenAttempts[2]!.replacement as Record<string, unknown>).retryOrdinal = 1;
+	ok(!validateRunJournal(brokenOrdinal).value, "replacement link ordinals not derived from ordered links were accepted");
+	});
+
+it.sequential("round-trips every ticket-11 silence union branch", async () => {
+	const timestamp = "2026-09-18T00:00:04.000Z";
+	const later = "2026-09-18T00:00:05.000Z";
+	const final = "2026-09-18T00:00:06.000Z";
+	const hash = `sha256:${"a".repeat(64)}`;
+	const base = JSON.parse(serializeRunJournal(recoveryJournal("working"))) as Record<string, unknown>;
+	const baseRun = base.run as Record<string, unknown>;
+	const baseTask = (baseRun.tasks as Array<Record<string, unknown>>)[0]!;
+	const baseAttempt = (baseTask.attempts as Array<Record<string, unknown>>)[0]!;
+	const baseDispatch = baseAttempt.dispatch as Record<string, unknown>;
+	const identity = { name: baseDispatch.agentName, workspaceId: baseDispatch.workspaceId, paneId: baseDispatch.paneId, terminalId: baseDispatch.terminalId };
+	const inspection = {
+		attemptId: baseAttempt.id,
+		role: "builder",
+		agent: identity,
+		lifecycle: "working",
+		stateChangeSequence: null,
+		terminal: { kind: "observed", byteCount: 0, sha256: hash },
+		worktree: { kind: "observed", byteCount: 0, sha256: hash },
+		git: { head: "0".repeat(40), digest: hash },
+		assignment: { path: baseAttempt.assignmentPath, size: 1, sha256: hash },
+		report: { kind: "missing" },
+		evidence: { directory: baseAttempt.evidenceDirectory, count: 0, byteCount: 0, sha256: hash, entries: [] },
+		process: { kind: "none", paneId: baseDispatch.paneId, shellPid: 101, foregroundProcessGroupId: 101, processCount: 1, digest: hash },
+	};
+	const target = identity;
+	const promptSha256 = hash;
+	const branches: Array<{ name: string; attention: string; attentionReason?: string; silence: Record<string, unknown> }> = [
+		{ name: "suspected", attention: "suspected-stall", attentionReason: "silence-passive-inspection", silence: { phase: "suspected", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection } },
+		{ name: "inspection-incomplete", attention: "suspected-stall", attentionReason: "silence-passive-inspection", silence: { phase: "inspection-incomplete", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection: { ...inspection, process: { kind: "unavailable", diagnostic: "process observer unavailable" } }, diagnostic: "passive source unavailable" } },
+		{ name: "waiting-external", attention: "waiting-external", attentionReason: "external-process-live", silence: { phase: "waiting-external", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection: { ...inspection, process: { kind: "live-external", paneId: baseDispatch.paneId, shellPid: 101, foregroundProcessGroupId: 101, processCount: 2, digest: hash, classification: "test", executableName: "vitest" } }, firstObservedAt: timestamp, lastObservedAt: later, process: { kind: "live-external", paneId: baseDispatch.paneId, shellPid: 101, foregroundProcessGroupId: 101, processCount: 2, digest: hash, classification: "test", executableName: "vitest" }, warnedAt: later } },
+		{ name: "external-grace", attention: "waiting-external", attentionReason: "external-process-grace", silence: { phase: "external-grace", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection, firstObservedAt: timestamp, lastObservedAt: later, exitedAt: final, process: { kind: "live-external", paneId: baseDispatch.paneId, shellPid: 101, foregroundProcessGroupId: 101, processCount: 2, digest: hash, classification: "test", executableName: "vitest" }, warnedAt: later } },
+		{ name: "nudge-intended", attention: "suspected-stall", silence: { phase: "nudge-intended", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection, target, intendedAt: timestamp, promptSha256 } },
+		{ name: "nudged", attention: "suspected-stall", silence: { phase: "nudged", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: final, inspection, target, intendedAt: timestamp, nudgedAt: final, promptSha256 } },
+		{ name: "nudge-ambiguous", attention: "needs-user", attentionReason: "silence-effect-ambiguous", silence: { phase: "nudge-ambiguous", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: final, inspection, target, intendedAt: timestamp, observedAt: final, promptSha256, diagnostic: "nudge result was malformed" } },
+		{ name: "interrupt-intended", attention: "suspected-stall", silence: { phase: "interrupt-intended", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection, target, intendedAt: timestamp } },
+		{ name: "interrupted", attention: "suspected-stall", silence: { phase: "interrupted", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: final, inspection, target, intendedAt: timestamp, interruptedAt: final } },
+		{ name: "interrupt-ambiguous", attention: "needs-user", attentionReason: "silence-effect-ambiguous", silence: { phase: "interrupt-ambiguous", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: final, inspection, target, intendedAt: timestamp, observedAt: final, diagnostic: "interrupt result was killed" } },
+		{ name: "resume-intended", attention: "suspected-stall", silence: { phase: "resume-intended", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection, target, intendedAt: timestamp, promptSha256 } },
+		{ name: "resumed", attention: "suspected-stall", silence: { phase: "resumed", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: final, inspection, target, intendedAt: timestamp, resumedAt: final, promptSha256 } },
+		{ name: "resume-ambiguous", attention: "needs-user", attentionReason: "silence-effect-ambiguous", silence: { phase: "resume-ambiguous", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: final, inspection, target, intendedAt: timestamp, observedAt: final, promptSha256, diagnostic: "resume identity was wrong" } },
+		{ name: "exhausted", attention: "needs-user", attentionReason: "silence-recovery-exhausted", silence: { phase: "exhausted", lastProgressAt: "2026-09-18T00:00:03.000Z", phaseAt: timestamp, inspection, retryOrdinal: 0 } },
+	];
+	for (const branch of branches) {
+		const candidate = JSON.parse(JSON.stringify(base)) as Record<string, unknown>;
+		const run = candidate.run as Record<string, unknown>;
+		const task = (run.tasks as Array<Record<string, unknown>>)[0]!;
+		const attempt = (task.attempts as Array<Record<string, unknown>>)[0]!;
+		task.attention = branch.attention;
+		if (branch.attentionReason) task.attentionReason = branch.attentionReason;
+		else delete task.attentionReason;
+		attempt.recovery = { live: { observedAt: "2026-09-18T00:00:03.000Z", kind: "working", lifecycle: "working" }, silence: branch.silence };
+		if (branch.name === "exhausted") (run.effectiveSettings as Record<string, unknown>).transientRetryLimit = 0;
+		run.updatedAt = "2026-09-18T00:00:10.000Z";
+		const validated = validateRunJournal(candidate);
+		ok(validated.value, `${branch.name} did not validate: ${validated.diagnostics.map((item) => item.message).join("; ")}`);
+		if (validated.value) {
+			const decoded = deserializeRunJournal(serializeRunJournal(validated.value), "active-run.json");
+			ok(decoded.value, `${branch.name} did not round-trip`);
+		}
+	}
+	for (const name of ["replacement-intended", "replacement-ambiguous"] as const) {
+		const candidate = JSON.parse(JSON.stringify(replacementExhaustedJournal())) as Record<string, unknown>;
+		const task = ((candidate.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!;
+		const attempt = (task.attempts as Array<Record<string, unknown>>)[0]!;
+		const silence = (attempt.recovery as Record<string, unknown>).silence as Record<string, unknown>;
+		if (name === "replacement-ambiguous") Object.assign(silence, { phase: name, observedAt: final, diagnostic: "replacement pane acknowledgement was lost" });
+		const validated = validateRunJournal(candidate);
+		ok(validated.value, `${name} did not validate: ${validated.diagnostics.map((item) => item.message).join("; ")}`);
+		if (validated.value) ok(deserializeRunJournal(serializeRunJournal(validated.value), "active-run.json").value, `${name} did not round-trip`);
+	}
+});
+
+it.sequential("accepts a logical rework after a linked same-role replacement", async () => {
+	const value = replacementThenReworkJournal();
+	ok(value.run.tasks[0]?.attempts[3]?.role === "builder");
+	equal((value.run.tasks[0]?.attempts[3]?.dispatch as { cycle: number }).cycle, 1);
+});
+
+it.sequential("accepts only exact replacement Assignment continuation and rejects stale or misplaced continuation", async () => {
+	const value = cloneRunJournal(replacementExhaustedJournal());
+	const task = value.run.tasks[0]!;
+	const source = task.attempts.at(-1);
+	const predecessor = task.attempts.at(-2);
+	if (!source || source.role !== "builder" || !predecessor || predecessor.role !== "builder" || !predecessor.recovery?.preservation) throw new Error("replacement Builder fixture is incomplete");
+	const sourceDispatch = source.dispatch;
+	if (!("worktreePath" in sourceDispatch) || !("workspaceId" in sourceDispatch) || !("paneId" in sourceDispatch) || !("terminalId" in sourceDispatch)) throw new Error("replacement Builder dispatch identity is incomplete");
+	const prepared: BuilderAttemptRecord = { ...source, state: "prepared", dispatch: { phase: "agent-intended", branch: sourceDispatch.branch, agentName: sourceDispatch.agentName, worktreePath: sourceDispatch.worktreePath, workspaceId: sourceDispatch.workspaceId, paneId: sourceDispatch.paneId, terminalId: sourceDispatch.terminalId } };
+	delete prepared.activatedAt;
+	delete prepared.recovery;
+	const preparedDispatch = prepared.dispatch as Extract<BuilderAttemptRecord["dispatch"], { phase: "agent-intended" }>;
+	(task.attempts as Array<typeof prepared | typeof predecessor>).splice(task.attempts.length - 1, 1, prepared);
+	task.attention = "none";
+	delete task.attentionReason;
+	delete task.attentionDiagnostic;
+	const preservation = predecessor.recovery.preservation;
+	const continuation: AttemptContinuation = { predecessorAttemptId: predecessor.id, retryOrdinal: source.replacement?.retryOrdinal ?? 2, preservedWorktree: { path: preservation.worktreePath, branch: preservation.branch, head: preservation.head }, priorAssignmentPath: predecessor.assignmentPath, priorReportPath: predecessor.reportPath, priorEvidenceDirectory: predecessor.evidenceDirectory };
+	const assignment = buildBuilderAssignment({ run: value.run, task, attempt: prepared, worktreePath: preparedDispatch.worktreePath, branch: preparedDispatch.branch, workspaceId: preparedDispatch.workspaceId, paneId: preparedDispatch.paneId, terminalId: preparedDispatch.terminalId, agentName: preparedDispatch.agentName, continuation });
+	const bytes = serializeBuilderAssignment(assignment);
+	const decoded = deserializeBuilderAssignment(bytes, prepared.assignmentPath);
+	ok(decoded.value, decoded.diagnostics.map((item) => item.message).join("; "));
+	deepStrictEqual(decoded.value?.assignment.continuation, continuation);
+	const malformed = JSON.parse(bytes) as { assignment: { continuation: { retryOrdinal: number } } };
+	malformed.assignment.continuation.retryOrdinal = 3;
+	ok(!deserializeBuilderAssignment(JSON.stringify(malformed), prepared.assignmentPath).value, "out-of-range continuation ordinal was accepted");
+	throws(() => buildBuilderAssignment({ run: value.run, task, attempt: prepared, worktreePath: preparedDispatch.worktreePath, branch: preparedDispatch.branch, workspaceId: preparedDispatch.workspaceId, paneId: preparedDispatch.paneId, terminalId: preparedDispatch.terminalId, agentName: preparedDispatch.agentName }));
+	const ordinary = { ...prepared };
+	delete ordinary.replacement;
+	throws(() => buildBuilderAssignment({ run: value.run, task, attempt: ordinary, worktreePath: preparedDispatch.worktreePath, branch: preparedDispatch.branch, workspaceId: preparedDispatch.workspaceId, paneId: preparedDispatch.paneId, terminalId: preparedDispatch.terminalId, agentName: preparedDispatch.agentName, continuation }));
+});
+
+it.sequential("executes and parses the replacement Reviewer Assignment continuation contract", async () => {
+	const value = replacementThenReworkJournal();
+	const task = value.run.tasks[0]!;
+	const source = task.attempts[2];
+	const predecessor = task.attempts[1];
+	const builder = task.attempts[0];
+	if (!source || source.role !== "reviewer" || !predecessor || predecessor.role !== "reviewer" || !predecessor.recovery?.preservation || !builder || builder.role !== "builder" || !builder.evidence || builder.evidence.phase !== "finalized") throw new Error("replacement Reviewer fixture is incomplete");
+	const builderEvidence = builder.evidence;
+	if (source.dispatch.phase !== "prompted") throw new Error("replacement Reviewer dispatch is not promptable");
+	const prepared = { ...source, state: "prepared" as const, dispatch: { ...source.dispatch, phase: "agent-intended" as const } };
+	delete prepared.activatedAt;
+	delete prepared.evidence;
+	delete prepared.integrity;
+	delete prepared.recovery;
+	const dispatch = prepared.dispatch;
+	const continuation: AttemptContinuation = { predecessorAttemptId: predecessor.id, retryOrdinal: source.replacement?.retryOrdinal ?? 1, preservedWorktree: { path: predecessor.recovery.preservation.worktreePath, branch: predecessor.recovery.preservation.branch, head: predecessor.recovery.preservation.head }, priorAssignmentPath: predecessor.assignmentPath, priorReportPath: predecessor.reportPath, priorEvidenceDirectory: predecessor.evidenceDirectory };
+	const assignment = buildReviewerAssignment({ runId: value.run.id, task: task.contract, attempt: prepared, manifestPath: builderEvidence.manifestPath, manifestSha256: builderEvidence.manifestSha256, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, agentName: dispatch.agentName, continuation });
+	const bytes = serializeReviewerAssignment(assignment);
+	const decoded = deserializeReviewerAssignment(bytes, prepared.reportPath);
+	ok(decoded.value, decoded.diagnostics.map((item) => item.message).join("; "));
+	deepStrictEqual(decoded.value?.assignment.continuation, continuation);
+	throws(() => buildReviewerAssignment({ runId: value.run.id, task: task.contract, attempt: prepared, manifestPath: builderEvidence.manifestPath, manifestSha256: builderEvidence.manifestSha256, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, agentName: dispatch.agentName }));
+	const ordinary = { ...prepared };
+	delete ordinary.replacement;
+	throws(() => buildReviewerAssignment({ runId: value.run.id, task: task.contract, attempt: ordinary, manifestPath: builderEvidence.manifestPath, manifestSha256: builderEvidence.manifestSha256, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, agentName: dispatch.agentName, continuation }));
 });
 
 it.sequential("accepts an optional strict monitor checkpoint, clones it, and rejects unknown monitor keys", async () => {
@@ -449,6 +750,22 @@ it.sequential("accepts an optional strict monitor checkpoint, clones it, and rej
 	const rejected = await store.replaceActive(root, candidate as unknown as RunJournal);
 	equal(rejected.kind, "invalid-candidate");
 	equal(await readFile(paths.activePath, "utf8"), serializeRunJournal(monitored));
+});
+
+it.sequential("rejects a stale silence CAS candidate without clobbering newer recovery evidence", async () => {
+	const root = await makeRoot();
+	const store = createRunJournalStore();
+	const seed = replacementExhaustedJournal();
+	const current = { ...seed, journalRevision: 1, run: { ...seed.run, updatedAt: seed.run.createdAt } };
+	if ((await store.createActive(root, current)).kind !== "created") throw new Error("silence CAS fixture was not created");
+	const newer = { ...current, journalRevision: 2, run: { ...current.run, updatedAt: "2026-09-18T00:00:11.000Z", declaredOutcome: "newer recovery evidence" } };
+	if ((await store.replaceActive(root, newer)).kind !== "replaced") throw new Error("newer silence Journal was not installed");
+	const stale = await store.replaceActive(root, current);
+	equal(stale.kind, "invalid-candidate");
+	const loaded = await store.loadActive(root);
+	if (loaded.kind !== "loaded") throw new Error("newer silence Journal disappeared");
+	equal(loaded.journal.journalRevision, newer.journalRevision);
+	equal(loaded.journal.run.declaredOutcome, "newer recovery evidence");
 });
 
 it.sequential("rejects a stale monitor replacement without clobbering the newer Journal", async () => {

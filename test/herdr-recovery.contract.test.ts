@@ -65,6 +65,10 @@ it.sequential("uses exact same-identity recovery inputs and the no-focus linked 
 		{ command: "herdr", args: ["agent", "get", replacementIdentity.name], options: { timeout: 5_000 } },
 		{ command: "herdr", args: ["agent", "prompt", replacementIdentity.name, "Immutable replacement Assignment"], options: { cwd: "/repo", timeout: 30_000 } },
 	]);
+	for (const call of calls) {
+		ok(!/ctrl\+c|signal|kill|quit/i.test(`${call.command} ${call.args.join(" ")}`));
+		ok(!(call.command === "git" || call.args[0] === "worktree" || (call.args[0] === "pane" && call.args[1] === "close")));
+	}
 });
 
 it.sequential("does not turn malformed or wrong-identity recovery acknowledgements into proof", async () => {
@@ -81,4 +85,40 @@ it.sequential("does not turn malformed or wrong-identity recovery acknowledgemen
 	const malformed = createHerdrAdapter(async () => result(JSON.stringify({ id: "cli:agent:send-keys", result: { type: "agent_keys_sent" } })));
 	const value = await malformed.interruptAgent!({ repositoryRoot: "/repo", identity });
 	equal(value.kind, "failed");
+});
+
+it.each([
+	"nudge-killed",
+	"nudge-malformed",
+	"resume-killed",
+	"resume-malformed",
+	"pane-killed",
+	"pane-malformed",
+	"start-killed",
+	"start-malformed",
+	"name-collision",
+] as const)("rejects %s recovery acknowledgements without adopting an uncertain resource", async (scenario) => {
+	let effectCalls = 0;
+	const adapter = createHerdrAdapter(async (_command, args) => {
+		if (args[0] === "agent" && args[1] === "get") return result(agent("agent_info", identity));
+		if (scenario === "name-collision") return result("", JSON.stringify({ id: "cli:agent:start", error: { code: "agent_name_taken", message: "name already exists" } }), 1);
+		if (scenario.endsWith("-killed")) return result("", "", 0, true);
+		if (scenario.endsWith("-malformed")) return result("{");
+		effectCalls += 1;
+		return result(agent(args[0] === "pane" ? "agent_info" : args[1] === "start" ? "agent_started" : "agent_prompted", args[2] === replacementIdentity.name ? replacementIdentity : identity));
+	});
+	if (scenario.startsWith("nudge")) {
+		const value = await adapter.nudgeAgent!({ repositoryRoot: "/repo", identity, prompt: "bounded nudge" });
+		equal(value.kind, "failed");
+	} else if (scenario.startsWith("resume")) {
+		const value = await adapter.resumeAgent!({ repositoryRoot: "/repo", identity, prompt: "bounded resume" });
+		equal(value.kind, "failed");
+	} else if (scenario.startsWith("pane")) {
+		const value = await adapter.createRecoveryPane!({ repositoryRoot: "/repo", sourcePaneId: identity.paneId, workspaceId: replacementIdentity.workspaceId, worktreePath: "/repo/worktree", branch: "steward/run/task/attempt-02", agentName: replacementIdentity.name });
+		equal(value.kind, "failed");
+	} else {
+		const value = await adapter.startReplacementAgent!({ repositoryRoot: "/repo", name: replacementIdentity.name, paneId: replacementIdentity.paneId, model });
+		equal(value.kind, scenario === "name-collision" ? "name-collision" : "failed");
+	}
+	equal(effectCalls, 0);
 });

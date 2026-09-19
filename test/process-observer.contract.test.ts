@@ -82,6 +82,45 @@ describe("ticket-11 process observer boundary", () => {
 		expect(calls).toBe(1);
 	});
 
+	it.each([
+		"stderr",
+		"nonzero-exit",
+		"thrown",
+		"bad-pid",
+		"duplicate-pid",
+		"negative-pid",
+		"oversized-argv",
+		"oversized-cmdline",
+		"oversized-cwd",
+		"oversized-process-list",
+		"malformed-json",
+	] as const)("fails closed for process-info %s", async (scenario) => {
+		const processes = managedProcesses();
+		if (scenario === "bad-pid" || scenario === "negative-pid") processes[0] = { ...processes[0], pid: scenario === "bad-pid" ? 0 : -1 };
+		if (scenario === "duplicate-pid") processes[1] = { ...processes[1], pid: processes[0]?.pid };
+		if (scenario === "oversized-argv") processes[1] = { ...processes[1], argv: ["x".repeat(4_097)] };
+		if (scenario === "oversized-cmdline") processes[1] = { ...processes[1], cmdline: "x".repeat(32_769) };
+		if (scenario === "oversized-cwd") processes[1] = { ...processes[1], cwd: `/repo/${"x".repeat(4_096)}` };
+		if (scenario === "oversized-process-list") {
+			processes.length = 0;
+			for (let index = 0; index < 513; index += 1) processes.push({ pid: index + 1, ppid: 1, process_group_id: 1, cwd: "/repo", argv: ["bash"], cmdline: "bash", executable_name: "bash" });
+		}
+		const execute = async () => {
+			if (scenario === "thrown") throw new Error("process observer threw");
+			if (scenario === "malformed-json") return result("{");
+			if (scenario === "stderr") return result(processInfo(processes), { stderr: "diagnostic" });
+			if (scenario === "nonzero-exit") return result(processInfo(processes), { code: 1 });
+			return result(processInfo(processes));
+		};
+		const observed = await createProcessAdapter(execute).inspectAttemptProcesses!({ repositoryRoot: "/repo", identity });
+		expect(observed.kind).toBe("unavailable");
+	});
+
+	it("reports adapter absence as unavailable without invoking a command", async () => {
+		const observed = await createProcessAdapter(undefined).inspectAttemptProcesses!({ repositoryRoot: "/repo", identity });
+		expect(observed).toMatchObject({ kind: "unavailable" });
+	});
+
 	it("produces a stable bounded digest from normalized process facts", async () => {
 		const adapter = createProcessAdapter(async () => result(processInfo(managedProcesses())));
 		const observed = await adapter.inspectAttemptProcesses!({ repositoryRoot: "/repo", identity });

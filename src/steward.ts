@@ -2281,7 +2281,8 @@ function preservationForSilenceSnapshot(task: TaskRecord, attempt: AttemptRecord
 }
 
 function sameFact(left: unknown, right: unknown): boolean {
-	return JSON.stringify(left) === JSON.stringify(right);
+	const canonical = (value: unknown): unknown => Array.isArray(value) ? value.map(canonical) : value && typeof value === "object" ? Object.fromEntries(Object.entries(value as Record<string, unknown>).sort(([left], [right]) => left.localeCompare(right)).map(([key, item]) => [key, canonical(item)])) : value;
+	return JSON.stringify(canonical(left)) === JSON.stringify(canonical(right));
 }
 
 function factValueFromAssignment(field: TaskFactKey, task: TaskRecord, attempt: AttemptRecord, assignment: import("./run.ts").AssignmentDocument): unknown {
@@ -2345,8 +2346,8 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 		return true;
 	};
 
-	const continuePreparedDispatch = async (): Promise<ReconciliationWorkflowResult | undefined> => {
-		if (attempt.state !== "prepared") return undefined;
+		const continuePreparedDispatch = async (): Promise<ReconciliationWorkflowResult | undefined> => {
+			if (attempt.state !== "prepared") return undefined;
 		const markReplacementAmbiguous = async (diagnostic: string): Promise<RunJournal | undefined> => {
 			if (!attempt.replacement) return undefined;
 			const loaded = await dependencies.runJournal.loadActive(repositoryRoot).catch(() => undefined);
@@ -2370,13 +2371,87 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 				});
 		} catch { return undefined; }
 			const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate).catch(() => undefined);
-			return replaced?.kind === "replaced" ? replaced.journal : undefined;
-		};
-		if (attempt.replacement) {
-			const predecessor = task.attempts.find((candidate) => candidate.id === attempt.replacement?.replacesAttemptId);
-			if (predecessor?.recovery?.silence?.phase === "replacement-ambiguous") return { kind: "degraded", journal, note: "The linked replacement has an ambiguity tombstone; no pane, start, Assignment, or prompt effect will be repeated." };
-		}
-		if (attempt.dispatch.phase === "prompt-intended") {
+				return replaced?.kind === "replaced" ? replaced.journal : undefined;
+			};
+			const refreshReplacementPreservation = async (): Promise<{ kind: "ready"; journal: RunJournal; task: TaskRecord; attempt: AttemptRecord } | { kind: "blocked"; journal: RunJournal; note: string }> => {
+				if (!attempt.replacement) return { kind: "ready", journal, task, attempt };
+				const loaded = await dependencies.runJournal.loadActive(repositoryRoot).catch(() => undefined);
+				if (!loaded || loaded.kind !== "loaded") return { kind: "blocked", journal, note: "The replacement reservation could not be freshly reloaded; no pane, start, Assignment, or prompt effect was attempted." };
+				const freshTask = loaded.journal.run.tasks[index];
+				const freshAttempt = freshTask?.attempts.find((candidate) => candidate.id === attempt.id);
+				const predecessorId = attempt.replacement.replacesAttemptId;
+				const predecessor = freshTask?.attempts.find((candidate) => candidate.id === predecessorId);
+				const reservation = predecessor?.recovery?.preservation;
+				if (!freshTask || !freshAttempt || freshAttempt.state !== "prepared" || JSON.stringify(freshAttempt.dispatch) !== JSON.stringify(attempt.dispatch) || !freshAttempt.replacement || freshAttempt.replacement.replacesAttemptId !== predecessorId || !predecessor || predecessor.state !== "superseded" || !reservation) return { kind: "blocked", journal: loaded.journal, note: "The replacement reservation or exact resource identity changed while its preserved resources were being re-inspected; no replacement effect was attempted." };
+				const branch = branchForAttempt(freshTask, predecessor);
+				const worktreePath = "worktreePath" in predecessor.dispatch ? predecessor.dispatch.worktreePath : predecessor.role === "reviewer" ? predecessor.worktree.path : undefined;
+				if (!branch || !worktreePath || !dependencies.runJournal.inspectAttemptPreservation || !dependencies.git.inspectManagedWorktreeProgress) {
+					journal = loaded.journal;
+					task = freshTask;
+					attempt = freshAttempt;
+					const ambiguous = await markReplacementAmbiguous("Fresh replacement preservation inspection is unavailable; the reserved work and resources remain untouched.");
+					return { kind: "blocked", journal: ambiguous ?? loaded.journal, note: ambiguous ? "Fresh replacement preservation inspection was unavailable; no replacement effect will be attempted again." : "Fresh replacement preservation inspection was unavailable and its no-resend tombstone could not be persisted." };
+				}
+				const preserved = await dependencies.runJournal.inspectAttemptPreservation({ repositoryRoot, attempt: predecessor }).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Attempt preservation inspection failed." } as import("./run-journal-store.ts").AttemptPreservationInspection));
+				const progress = await dependencies.git.inspectManagedWorktreeProgress(worktreePath).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Managed worktree inspection failed." } as ManagedWorktreeProgress));
+				if (preserved.kind !== "inspected" || progress.kind !== "observed" || progress.git.digest.kind !== "observed") {
+					journal = loaded.journal;
+					task = freshTask;
+					attempt = freshAttempt;
+					const diagnostic = preserved.kind !== "inspected" ? preserved.diagnostic : progress.kind !== "observed" ? progress.diagnostic : "Managed Git digest was unavailable during fresh replacement preservation inspection.";
+					const ambiguous = await markReplacementAmbiguous(diagnostic);
+					return { kind: "blocked", journal: ambiguous ?? loaded.journal, note: ambiguous ? "Fresh replacement preservation was unavailable; both resources remain retained and no replacement effect will be attempted again." : "Fresh replacement preservation was unavailable and its no-resend tombstone could not be persisted." };
+				}
+				const freshPreservation: import("./run.ts").RecoveryPreservation = {
+					observedAt: transitionTimestamp(loaded.journal, dependencies.clock.now()),
+					worktreePath,
+					branch,
+					head: progress.head,
+					worktree: progress.worktree,
+					git: { head: progress.git.head, digest: progress.git.digest.sha256 },
+					assignment: preserved.assignment,
+					report: preserved.report,
+					evidence: preserved.evidence,
+				};
+				const sameReservation = sameFact({ ...reservation, observedAt: "" }, { ...freshPreservation, observedAt: "" });
+				if (sameReservation) {
+					journal = loaded.journal;
+					task = freshTask;
+					attempt = freshAttempt;
+					return { kind: "ready", journal, task, attempt };
+				}
+				const observedAt = transitionTimestamp(loaded.journal, dependencies.clock.now());
+				const diagnostic = "Preserved worktree, HEAD, Assignment, report, or evidence changed after replacement reservation; both resources were retained and no replacement effect was attempted.";
+				let candidate: RunJournal;
+				try {
+					candidate = advanceRunJournal(loaded.journal, dependencies.clock.now(), (next) => {
+						const nextTask = next.run.tasks[index];
+						const nextAttempt = nextTask?.attempts.find((item) => item.id === freshAttempt.id);
+						const nextPredecessor = nextTask?.attempts.find((item) => item.id === predecessorId);
+						const current = nextPredecessor?.recovery?.silence;
+						if (!nextTask || !nextAttempt || nextAttempt.state !== "prepared" || !nextAttempt.replacement || nextAttempt.replacement.replacesAttemptId !== predecessorId || !nextPredecessor || nextPredecessor.state !== "superseded" || !nextPredecessor.recovery || !current || !["replacement-intended", "replacement-ambiguous"].includes(current.phase)) throw new Error("Replacement reservation changed before fresh preservation evidence could be retained.");
+						const silence: SilencePhase = current.phase === "replacement-intended"
+							? { ...current, phase: "replacement-ambiguous", phaseAt: observedAt, observedAt, diagnostic }
+							: current.phase === "replacement-ambiguous"
+								? { ...current, phaseAt: observedAt, observedAt, diagnostic }
+								: (() => { throw new Error("Replacement silence phase changed before fresh preservation evidence could be retained."); })();
+						nextPredecessor.recovery = { ...nextPredecessor.recovery, preservation: freshPreservation, silence };
+						nextTask.attention = "needs-user";
+						nextTask.attentionReason = "silence-effect-ambiguous";
+						nextTask.attentionDiagnostic = diagnostic;
+					});
+				} catch {
+					return { kind: "blocked", journal: loaded.journal, note: "Preserved resources changed after replacement reservation, but the no-resend attention state could not be built; no replacement effect was attempted." };
+				}
+				const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate).catch(() => undefined);
+				if (!replaced || replaced.kind !== "replaced") return { kind: "blocked", journal: loaded.journal, note: "Preserved resources changed after replacement reservation, but the fresh evidence and no-resend attention state lost a Journal race; no replacement effect was attempted." };
+				return { kind: "blocked", journal: replaced.journal, note: "Preserved resources changed after replacement reservation; fresh evidence was retained, both resources remain untouched, and no replacement effect was attempted." };
+			};
+			if (attempt.replacement) {
+				const predecessor = task.attempts.find((candidate) => candidate.id === attempt.replacement?.replacesAttemptId);
+				if (predecessor?.recovery?.silence?.phase === "replacement-ambiguous") return { kind: "degraded", journal, note: "The linked replacement has an ambiguity tombstone; no pane, start, Assignment, or prompt effect will be repeated." };
+			}
+			if (attempt.dispatch.phase === "prompt-intended") {
 			if (!attempt.replacement) return undefined;
 			const dispatch = attempt.dispatch;
 			if (!("workspaceId" in dispatch) || !("paneId" in dispatch) || !("terminalId" in dispatch) || !("assignmentSha256" in dispatch)) return { kind: "degraded", journal, note: "The reserved replacement prompt intent lacks an exact resource identity; no prompt was resent." };
@@ -2395,8 +2470,13 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 					if (!assignment) throw new Error("Replacement Reviewer Assignment is invalid.");
 					prompt = formatReviewerPrompt(assignment);
 				}
-			} catch (error: unknown) { return { kind: "degraded", journal, note: `The reserved replacement Assignment could not be formatted; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment decode failed."}` }; }
-			let prompted: HerdrPromptResult;
+				} catch (error: unknown) { return { kind: "degraded", journal, note: `The reserved replacement Assignment could not be formatted; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment decode failed."}` }; }
+				const promptPreservation = await refreshReplacementPreservation();
+				if (promptPreservation.kind === "blocked") return { kind: "degraded", journal: promptPreservation.journal, note: promptPreservation.note };
+				journal = promptPreservation.journal;
+				task = promptPreservation.task;
+				attempt = promptPreservation.attempt;
+				let prompted: HerdrPromptResult;
 			try { prompted = dependencies.herdr.promptReplacementAgent ? await dependencies.herdr.promptReplacementAgent({ repositoryRoot, identity, assignmentPrompt: prompt }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Replacement prompt adapter is unavailable." }; }
 			catch (error: unknown) { prompted = { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Replacement prompt failed." }; }
 			const exact = prompted.kind === "prompted" && prompted.name === identity.name && prompted.workspaceId === identity.workspaceId && prompted.paneId === identity.paneId && prompted.terminalId === identity.terminalId;
@@ -2416,9 +2496,14 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 			return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "Replacement prompt activation is ambiguous; its durable tombstone forbids a resend." : "Replacement prompt succeeded, but activation could not be persisted; no prompt will be resent." };
 		}
 		const dispatch = attempt.dispatch;
-		if (dispatch.phase === "replacement-pane-intended") {
-			if (!dependencies.herdr.createRecoveryPane || !dependencies.herdr.inspectManagedAgent || !("sourcePaneId" in dispatch) || !("worktreePath" in dispatch)) return { kind: "degraded", journal, note: "The reserved silent replacement is missing its exact no-focus recovery-pane adapter; no pane or agent effect was attempted." };
-			let pane: HerdrReviewerPaneResult;
+			if (dispatch.phase === "replacement-pane-intended") {
+				if (!dependencies.herdr.createRecoveryPane || !dependencies.herdr.inspectManagedAgent || !("sourcePaneId" in dispatch) || !("worktreePath" in dispatch)) return { kind: "degraded", journal, note: "The reserved silent replacement is missing its exact no-focus recovery-pane adapter; no pane or agent effect was attempted." };
+				const panePreservation = await refreshReplacementPreservation();
+				if (panePreservation.kind === "blocked") return { kind: "degraded", journal: panePreservation.journal, note: panePreservation.note };
+				journal = panePreservation.journal;
+				task = panePreservation.task;
+				attempt = panePreservation.attempt;
+				let pane: HerdrReviewerPaneResult;
 			try { pane = await dependencies.herdr.createRecoveryPane({ repositoryRoot, sourcePaneId: dispatch.sourcePaneId, workspaceId: dispatch.workspaceId, worktreePath: dispatch.worktreePath, branch: dispatch.branch, agentName: dispatch.agentName }); }
 			catch (error: unknown) {
 				const ambiguous = await markReplacementAmbiguous(error instanceof Error ? error.message : "Recovery pane split failed.");
@@ -2470,9 +2555,16 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 			let inspected: ManagedAgentInspection;
 			try { inspected = await inspectManagedAgent(identity); }
 			catch (error: unknown) { return { kind: "degraded", journal, note: `Prepared Agent-intended identity inspection failed; no start or Assignment effect was attempted. ${error instanceof Error ? error.message : "Herdr inspection failed."}` }; }
-			if (inspected.kind === "unclear") return { kind: "degraded", journal, note: `Prepared Agent-intended identity is unclear; the same Attempt remains pending. ${inspected.diagnostic}` };
-			if (inspected.kind === "missing") {
-				let started: HerdrAgentStartResult;
+				if (inspected.kind === "unclear") return { kind: "degraded", journal, note: `Prepared Agent-intended identity is unclear; the same Attempt remains pending. ${inspected.diagnostic}` };
+				if (inspected.kind === "missing") {
+					if (attempt.replacement) {
+						const startPreservation = await refreshReplacementPreservation();
+						if (startPreservation.kind === "blocked") return { kind: "degraded", journal: startPreservation.journal, note: startPreservation.note };
+						journal = startPreservation.journal;
+						task = startPreservation.task;
+						attempt = startPreservation.attempt;
+					}
+					let started: HerdrAgentStartResult;
 				try {
 					started = dependencies.herdr.startReplacementAgent && attempt.replacement
 						? await dependencies.herdr.startReplacementAgent({ repositoryRoot, name: identity.name, paneId: identity.paneId, model: attempt.actualModel })
@@ -2484,7 +2576,7 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 					return { kind: "degraded", journal: ambiguous ?? journal, note: ambiguous ? "The replacement start effect is ambiguous; its durable tombstone forbids another start." : "The prepared replacement start failed; no later effect was attempted." };
 				}
 				if (started.kind === "name-collision") {
-					const replacement = `${attempt.role === "builder" ? "steward-b" : "steward-r"}-${compactUuid(dependencies.clock)}-${attempt.id.replace(/[^0-9]/g, "") || "01"}`;
+					const replacement = `${attempt.role === "builder" ? "steward-b" : "steward-r"}-${compactUuid(dependencies.clock)}-${attempt.id.replace(/[^0-9]/g, "") || "01"}-r`;
 					if (!safeHerdrName(replacement)) return { kind: "degraded", journal, note: "The prepared Attempt's exact name collided, but a safe same-Attempt name could not be derived." };
 					const changed = await persist((_nextTask, nextAttempt) => {
 						if (nextAttempt.role !== attempt.role || nextAttempt.dispatch.phase !== dispatch.phase) throw new Error("Prepared Attempt changed during same-Attempt name collision handling.");
@@ -2514,9 +2606,16 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 					assignment = buildReviewerAssignment({ runId: journal.run.id, task: task.contract, attempt, manifestPath: builder.evidence.manifestPath, manifestSha256: builder.evidence.manifestSha256, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, agentName: identity.name, ...(attempt.replacement ? { continuation: continuationForReplacement(task, attempt) } : {}) });
 				}
 			} catch (error: unknown) { return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment could not be rebuilt; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment validation failed."}` }; }
-			const continuation = assignment.assignment.continuation;
-			if ((attempt.replacement && !continuationMatchesReplacement(task, attempt, continuation)) || (!attempt.replacement && continuation !== undefined)) return { kind: "degraded", journal, note: "The prepared Assignment continuation did not match the exact replacement predecessor and preservation facts; no prompt was attempted." };
-			let created: AssignmentCreateResult;
+				const continuation = assignment.assignment.continuation;
+				if ((attempt.replacement && !continuationMatchesReplacement(task, attempt, continuation)) || (!attempt.replacement && continuation !== undefined)) return { kind: "degraded", journal, note: "The prepared Assignment continuation did not match the exact replacement predecessor and preservation facts; no prompt was attempted." };
+				if (attempt.replacement) {
+					const assignmentPreservation = await refreshReplacementPreservation();
+					if (assignmentPreservation.kind === "blocked") return { kind: "degraded", journal: assignmentPreservation.journal, note: assignmentPreservation.note };
+					journal = assignmentPreservation.journal;
+					task = assignmentPreservation.task;
+					attempt = assignmentPreservation.attempt;
+				}
+				let created: AssignmentCreateResult;
 			try { created = await dependencies.runJournal.createAssignment(repositoryRoot, assignment); }
 			catch (error: unknown) { return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment could not be persisted; no prompt was attempted. ${error instanceof Error ? error.message : "Assignment storage failed."}` }; }
 			if (created.kind !== "created" && created.kind !== "existing-match") return { kind: "degraded", journal, note: `The prepared ${attempt.role} Assignment conflicts with existing bytes; no prompt was attempted.` };
@@ -3170,7 +3269,6 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 	}
 
 	async function advanceSilenceRecovery(repositoryRoot: string, journalInput: RunJournal, taskIndex: number, taskInput: TaskRecord, attemptInput: AttemptRecord): Promise<SilencePass> {
-		if (!process.inspectAttemptProcesses) return { kind: "none", journal: journalInput, note: "Process observer is not available; ticket-11 silence policy remains dormant for this adapter." };
 		if (!hasProvenAgentIdentity(attemptInput) || attemptInput.state !== "active") return { kind: "none", journal: journalInput, note: "The current Attempt is not an active proven resource for silence recovery." };
 		const identity = attemptIdentity(attemptInput);
 		if (!identity) return { kind: "none", journal: journalInput, note: "The current Attempt has no exact identity for silence recovery." };
@@ -3179,6 +3277,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (inspected.kind === "incomplete" && !inspected.snapshot) return { kind: "degraded", journal: journalInput, note: `Passive silence inspection was incomplete; no recovery input was attempted. ${inspected.diagnostic}`, diagnostic: inspected.diagnostic };
 		const snapshot = inspected.snapshot;
 		if (!snapshot) return { kind: "degraded", journal: journalInput, note: "Passive silence inspection returned no bounded snapshot; no recovery input was attempted.", diagnostic: "Missing passive silence snapshot." };
+		if (existingSilence?.phase === "exhausted") return { kind: "none", journal: journalInput, note: "Silent-agent recovery is durably exhausted; no replacement effect will be repeated." };
 		const now = clock.now().getTime();
 		const nowIso = transitionTimestamp(journalInput, clock.now());
 		const previousSnapshot = existingSilence?.inspection;
@@ -3327,7 +3426,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			return recorded ? { kind: "effect", journal: recorded, note: exact ? "The same exact agent was resumed once; no retry was consumed." : "Same-agent resume delivery is ambiguous; its durable tombstone forbids a resend.", action: "silence-resume" } : { kind: "degraded", journal: intentJournal, note: "Same-agent resume was attempted, but its acknowledgement state could not be persisted; no resend will occur.", diagnostic: "Silence acknowledgement CAS failed." };
 		}
 		if (decision.kind === "exhausted") {
-			const phase: SilencePhase = { phase: "exhausted", lastProgressAt, phaseAt, inspection: snapshot, retryOrdinal: (base.retryOrdinal ?? 0) + 1 };
+			const phase: SilencePhase = { phase: "exhausted", lastProgressAt, phaseAt: nowIso, inspection: snapshot, retryOrdinal: decision.retryOrdinal };
 			const persisted = await persistPhase(phase, "needs-user", "silence-recovery-exhausted", "The frozen silent-agent replacement limit is exhausted; all existing work and resources were retained.");
 			return persisted ? { kind: "changed", journal: persisted, note: "Silent-agent recovery is exhausted; no replacement or destructive effect was attempted." } : { kind: "degraded", journal: journalInput, note: "Silent-agent exhaustion could not be persisted; no replacement was attempted." };
 		}

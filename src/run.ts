@@ -262,9 +262,9 @@ export type SilencePhase =
 	| { phase: "resume-intended"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; target: RecoveryAgentIdentity; intendedAt: string; promptSha256: string }
 	| { phase: "resumed"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; target: RecoveryAgentIdentity; intendedAt: string; resumedAt: string; promptSha256: string }
 	| { phase: "resume-ambiguous"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; target: RecoveryAgentIdentity; intendedAt: string; observedAt: string; promptSha256: string; diagnostic: string }
-	| { phase: "replacement-intended"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; target: RecoveryAgentIdentity; intendedAt: string; retryOrdinal: number }
-	| { phase: "replacement-ambiguous"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; target: RecoveryAgentIdentity; intendedAt: string; observedAt: string; retryOrdinal: number; diagnostic: string }
-	| { phase: "exhausted"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; retryOrdinal: number };
+	| { phase: "replacement-intended"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; target: RecoveryAgentIdentity; intendedAt: string; retryOrdinal: 1 | 2 }
+	| { phase: "replacement-ambiguous"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; target: RecoveryAgentIdentity; intendedAt: string; observedAt: string; retryOrdinal: 1 | 2; diagnostic: string }
+	| { phase: "exhausted"; lastProgressAt: string; phaseAt: string; inspection: SilenceInspectionSnapshot; retryOrdinal: 0 | 1 | 2 };
 
 export interface AttemptReplacement {
 	kind: "silent-agent-recovery";
@@ -998,7 +998,8 @@ function validateSilence(value: unknown, path: string, attemptId: string, role: 
 	if (Object.prototype.hasOwnProperty.call(value, "intendedAt") && canonicalTimestamp(value.intendedAt) && value.intendedAt < value.lastProgressAt) diagnostics.push(diagnostic("invalid-task", "Silence effect intent cannot precede the last authoritative progress.", `${path}.intendedAt`));
 	if (["nudged", "interrupted", "resumed", "nudge-ambiguous", "interrupt-ambiguous", "resume-ambiguous"].includes(phase) && canonicalTimestamp(value.phaseAt) && canonicalTimestamp(value.intendedAt) && value.phaseAt < value.intendedAt) diagnostics.push(diagnostic("invalid-task", "Silence effect phase timestamp must include its durable intent.", `${path}.phaseAt`));
 	if (["nudge-ambiguous", "interrupt-ambiguous", "resume-ambiguous", "replacement-ambiguous"].includes(phase) && !boundedText(value.diagnostic, 2_000)) diagnostics.push(diagnostic("invalid-task", "Ambiguous silence phase requires a bounded diagnostic.", `${path}.diagnostic`));
-	if (["replacement-intended", "replacement-ambiguous", "exhausted"].includes(phase) && (value.retryOrdinal !== 1 && value.retryOrdinal !== 2)) diagnostics.push(diagnostic("invalid-task", "Silent replacement ordinal must be 1 or 2.", `${path}.retryOrdinal`));
+	if (["replacement-intended", "replacement-ambiguous"].includes(phase) && (value.retryOrdinal !== 1 && value.retryOrdinal !== 2)) diagnostics.push(diagnostic("invalid-task", "Silent replacement ordinal must be 1 or 2.", `${path}.retryOrdinal`));
+	if (phase === "exhausted" && (value.retryOrdinal !== 0 && value.retryOrdinal !== 1 && value.retryOrdinal !== 2)) diagnostics.push(diagnostic("invalid-task", "Exhausted silent replacement ordinal must be 0, 1, or 2.", `${path}.retryOrdinal`));
 	if (["suspected", "nudge-intended", "nudged", "nudge-ambiguous", "interrupt-intended", "interrupted", "interrupt-ambiguous", "resume-intended", "resumed", "resume-ambiguous", "replacement-intended", "replacement-ambiguous", "exhausted"].includes(phase) && inspection.value?.process.kind !== "none") diagnostics.push(diagnostic("invalid-task", "A silence recovery phase that can authorize or record a ladder rung requires proof that no external process is live.", `${path}.inspection.process`));
 	if (phase === "replacement-intended" && attemptState !== "superseded") diagnostics.push(diagnostic("invalid-task", "A reserved silent replacement must supersede its predecessor in the same CAS transition.", path));
 	if (!["replacement-intended", "replacement-ambiguous"].includes(phase) && attemptState === "superseded") diagnostics.push(diagnostic("invalid-task", "A superseded Attempt must retain the replacement reservation or ambiguity phase.", path));
@@ -1853,7 +1854,7 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 		if (isReplacement) {
 			const predecessorSilence = predecessor?.recovery?.silence;
 			const replacementSilence = predecessorSilence && (predecessorSilence.phase === "replacement-intended" || predecessorSilence.phase === "replacement-ambiguous") ? predecessorSilence : undefined;
-			if (!predecessor || predecessor.role !== attempt.role || predecessor.state !== "superseded" || attempt.replacement?.replacesAttemptId !== predecessor.id || attempt.replacement.preservedAt < (predecessor.recovery?.silence ? predecessor.recovery.silence.phaseAt : predecessor.preparedAt) || attempt.preparedAt !== attempt.replacement?.preservedAt || attempt.specificationHash !== predecessor.specificationHash || JSON.stringify(attempt.actualModel) !== JSON.stringify(predecessor.actualModel) || !predecessor.recovery?.preservation || !replacementSilence || replacementSilence.intendedAt !== attempt.replacement?.preservedAt) diagnostics.push(diagnostic("invalid-task", "Silent replacement must immediately follow and exactly link the superseded same-role Attempt.", `${path}.attempts[${index}].replacement`));
+				if (!predecessor || predecessor.role !== attempt.role || predecessor.state !== "superseded" || attempt.replacement?.replacesAttemptId !== predecessor.id || attempt.replacement.preservedAt < (replacementSilence?.intendedAt ?? predecessor.preparedAt) || attempt.preparedAt !== attempt.replacement?.preservedAt || attempt.specificationHash !== predecessor.specificationHash || JSON.stringify(attempt.actualModel) !== JSON.stringify(predecessor.actualModel) || !predecessor.recovery?.preservation || !replacementSilence || replacementSilence.intendedAt !== attempt.replacement?.preservedAt) diagnostics.push(diagnostic("invalid-task", "Silent replacement must immediately follow and exactly link the superseded same-role Attempt.", `${path}.attempts[${index}].replacement`));
 			if (attempt.replacement && predecessor?.replacement && attempt.replacement.retryOrdinal !== predecessor.replacement.retryOrdinal + 1) diagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals must be contiguous.", `${path}.attempts[${index}].replacement.retryOrdinal`));
 			if (attempt.replacement && !predecessor?.replacement && attempt.replacement.retryOrdinal !== 1) diagnostics.push(diagnostic("invalid-task", "The first silent replacement must have retryOrdinal 1.", `${path}.attempts[${index}].replacement.retryOrdinal`));
 			const attemptWorktree = attempt.role === "builder" && "worktreePath" in attempt.dispatch ? attempt.dispatch.worktreePath : attempt.role === "reviewer" ? attempt.worktree.path : undefined;
@@ -1872,12 +1873,19 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 			if (preceding?.role !== "builder" || preceding.state === "prepared" || preceding.evidence?.phase !== "finalized" || !reviewSubjectBindsBuilder(attempt.subject, preceding)) diagnostics.push(diagnostic("invalid-task", "Each Reviewer must bind the immediately preceding finalized Builder subject.", `${path}.attempts[${index}]`));
 		}
 		if (attempt.role === "builder" && index > 0 && isReworkDispatch(attempt.dispatch)) {
-			const priorBuilder = attempts[index - 2];
 			const priorReviewer = attempts[index - 1];
+			let priorBuilder: AttemptRecord | undefined;
+			for (let priorIndex = index - 2; priorIndex >= 0; priorIndex -= 1) {
+				if (attempts[priorIndex]?.role === "builder") {
+					priorBuilder = attempts[priorIndex];
+					break;
+				}
+			}
 			const priorDispatch = priorBuilder?.role === "builder" ? priorBuilder.dispatch : undefined;
 			const sameBuilder = (priorDispatch?.phase === "prompted" || priorDispatch?.phase === "reconciled-active") && (attempt.dispatch.phase === "assignment-intended" || attempt.dispatch.phase === "prompt-intended" || attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active") && attempt.dispatch.branch === priorDispatch.branch && attempt.dispatch.agentName === priorDispatch.agentName && attempt.dispatch.worktreePath === priorDispatch.worktreePath && attempt.dispatch.workspaceId === priorDispatch.workspaceId && attempt.dispatch.paneId === priorDispatch.paneId && attempt.dispatch.terminalId === priorDispatch.terminalId;
 			const sameReviewEvidence = priorReviewer?.role === "reviewer" && priorReviewer.evidence?.phase === "finalized" && attempt.dispatch.reviewerManifestPath === priorReviewer.evidence.manifestPath && attempt.dispatch.reviewerManifestSha256 === priorReviewer.evidence.manifestSha256;
-			if (!priorBuilder || priorBuilder.role !== "builder" || !priorReviewer || priorReviewer.role !== "reviewer" || priorReviewer.state !== "reported" || priorReviewer.evidence?.phase !== "finalized" || priorReviewer.evidence.verdict !== "changes-required" || attempt.dispatch.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.priorReviewerAttemptId !== priorReviewer.id || attempt.dispatch.cycle !== Math.ceil(index / 2) || !reviewSubjectsEqual(attempt.dispatch.reviewedSubject, priorReviewer.subject) || !sameReviewEvidence || !sameBuilder) diagnostics.push(diagnostic("invalid-task", "Rework Builder backlinks, protected evidence, subject, identity, and cycle must match the immediately preceding changes-required Review.", `${path}.attempts[${index}]`));
+			const expectedCycle = attempts.slice(0, index).filter((candidate) => candidate.role === "builder" && candidate.replacement === undefined && isReworkDispatch(candidate.dispatch)).length + 1;
+			if (!priorBuilder || priorBuilder.role !== "builder" || !priorReviewer || priorReviewer.role !== "reviewer" || priorReviewer.state !== "reported" || priorReviewer.evidence?.phase !== "finalized" || priorReviewer.evidence.verdict !== "changes-required" || attempt.dispatch.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.priorReviewerAttemptId !== priorReviewer.id || attempt.dispatch.cycle !== expectedCycle || !reviewSubjectsEqual(attempt.dispatch.reviewedSubject, priorReviewer.subject) || !sameReviewEvidence || !sameBuilder) diagnostics.push(diagnostic("invalid-task", "Rework Builder backlinks, protected evidence, subject, identity, and logical lineage cycle must match the preceding changes-required Review.", `${path}.attempts[${index}]`));
 		}
 	}
 	const expectedRework = attempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && isReworkDispatch(attempt.dispatch)).length;
@@ -1885,6 +1893,8 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 	if (attempts.length > 20) diagnostics.push(diagnostic("invalid-task", "A Task allows a bounded alternating history plus silent replacements.", `${path}.attempts`));
 	const replacementOrdinals = attempts.flatMap((attempt) => attempt.replacement ? [attempt.replacement.retryOrdinal] : []);
 	if (new Set(replacementOrdinals).size !== replacementOrdinals.length || replacementOrdinals.some((ordinal, index) => ordinal !== index + 1)) diagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals must be unique and derive from the ordered Attempt links.", `${path}.attempts`));
+	const exhaustedSilence = attempts.at(-1)?.recovery?.silence;
+	if (exhaustedSilence?.phase === "exhausted" && (exhaustedSilence.retryOrdinal !== replacementOrdinals.length || exhaustedSilence.retryOrdinal > 2)) diagnostics.push(diagnostic("invalid-task", "Exhausted silence state must record exactly the bounded replacement links already consumed.", `${path}.attempts`));
 }
 
 function reviewSubjectBindsBuilder(subject: ReviewSubject, builder: AttemptRecord): boolean {
@@ -2011,6 +2021,9 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		validateAttemptSequence(attempts, task as Record<string, unknown>, contractResult.value, taskPath, taskDiagnostics);
 		const transientLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.transientRetryLimit) ? value.effectiveSettings.transientRetryLimit as number : 2;
 		if (attempts.some((attempt) => attempt.replacement !== undefined && attempt.replacement.retryOrdinal > transientLimit)) taskDiagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals cannot exceed the frozen transient retry limit.", `${taskPath}.attempts`));
+		const currentSilence = attempts.at(-1)?.recovery?.silence;
+		const expectedExhaustedOrdinal = transientLimit >= 2 ? 2 : transientLimit === 1 ? 1 : 0;
+		if (currentSilence?.phase === "exhausted" && currentSilence.retryOrdinal !== expectedExhaustedOrdinal) taskDiagnostics.push(diagnostic("invalid-task", "Exhausted silence state must record the bounded ordinal implied by the frozen transient retry limit.", `${taskPath}.attempts`));
 		const latest = attempts[attempts.length - 1];
 		const latestReviewer = latest?.role === "reviewer" ? latest : undefined;
 		const latestBuilder = latest?.role === "builder" ? latest : undefined;
@@ -2298,6 +2311,8 @@ export function buildBuilderAssignment(input: {
 	if (input.run.integrationBase.kind !== "git" || (input.task.phase !== "building" && input.task.phase !== "reworking") || input.attempt.state !== "prepared") throw new Error("Builder Assignment requires a prepared Builder Task with a Git base.");
 	if (input.attempt.dispatch.phase !== "agent-intended" && input.attempt.dispatch.phase !== "prompt-intended" && input.attempt.dispatch.phase !== "prompted" && input.attempt.dispatch.phase !== "assignment-intended") throw new Error("Builder Assignment requires actual Builder resources.");
 	if (input.task.specificationHash !== specificationHash(input.task.contract) || input.attempt.specificationHash !== input.task.specificationHash) throw new Error("Builder Assignment requires the exact approved Task specification hash.");
+	if (input.attempt.replacement && !input.continuation) throw new Error("Replacement Builder Assignment requires its exact predecessor continuation.");
+	if (!input.attempt.replacement && input.continuation) throw new Error("A non-replacement Builder Assignment cannot carry a replacement continuation.");
 	const dispatch = input.attempt.dispatch;
 	const rework = "cycle" in dispatch ? {
 		cycle: dispatch.cycle,

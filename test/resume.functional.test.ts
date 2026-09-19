@@ -13,7 +13,7 @@ import { serializeBuilderAttemptReport, type BuilderAttemptReport } from "../src
 import { deserializeReviewerAssignment, serializeReviewerAttemptReport, type ReviewerAttemptReport } from "../src/review.ts";
 import { advanceRunJournal, buildBuilderAssignment, buildInitialRunJournal, builderAssignmentSha256, type AttemptRecord, type BuilderDispatchRecord, type RunDraft, type RunJournal } from "../src/run.ts";
 import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
-import type { ManagedAgentInspection, StewardDependencies, StewardHerdrAdapter, StewardUiAdapter } from "../src/steward.ts";
+import type { ManagedAgentInspection, SilenceProcessObservation, StewardDependencies, StewardHerdrAdapter, StewardUiAdapter } from "../src/steward.ts";
 import { parseTaskFactRequest, resolveTaskFactAnswer } from "../src/reconciliation.ts";
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -57,6 +57,7 @@ type ResumeEffects = {
 type SetupOptions = {
 	reviewRequired?: boolean;
 	reviewFailure?: "pane";
+	processObservation?: SilenceProcessObservation;
 };
 
 function bump(effects: ResumeEffects, key: "worktreeCreates" | "builderStarts" | "reviewerPanes" | "reviewerStarts" | "reviewerPrompts" | "assignmentCreates" | "gitInspections" | "processCalls"): void {
@@ -142,20 +143,22 @@ function makeDependencies(root: string, lifecycle: () => ManagedAgentInspection,
 		runJournal,
 		herdr,
 		git,
-		process: {},
+		process: options.processObservation ? { inspectAttemptProcesses: async () => options.processObservation! } : {},
 		model: { listModelChoices: () => [], async validateModelPlans() { return []; }, async inspectModelChoice(choice) { return { choice, available: true, diagnostics: [] }; } },
 		clock: { now: () => new Date("2026-09-18T00:00:00.000Z"), randomUUID: () => "01234567-89ab-cdef-0123-456789abcdef" },
 		ui,
 	};
 }
 
-async function setup(lifecycle: () => ManagedAgentInspection, effects: ResumeEffects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 }, options: SetupOptions = {}): Promise<{ root: string; command: StewardCommandHandler; deps: StewardDependencies; journal: RunJournal; names: string[]; effects: ResumeEffects }> {
+async function setup(lifecycle: () => ManagedAgentInspection, effects: ResumeEffects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 }, options: SetupOptions = {}): Promise<{ root: string; command: StewardCommandHandler; deps: StewardDependencies; journal: RunJournal; names: string[]; effects: ResumeEffects; setNow(iso: string): void }> {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-resume-"));
 	roots.push(root);
 	const config = createConfigStore();
 	await config.saveRecoveryDefaults(settings);
 	await config.saveModelPlans(root, modelPlans);
 	const deps = makeDependencies(root, lifecycle, effects, options);
+	let nowMs = Date.parse("2026-09-18T00:00:00.000Z");
+	deps.clock = { ...deps.clock, now: () => new Date(nowMs) };
 	let command: StewardCommandHandler | undefined;
 	const names: string[] = [];
 	registerStewardExtension({
@@ -166,7 +169,7 @@ async function setup(lifecycle: () => ManagedAgentInspection, effects: ResumeEff
 	await command("start", context(root));
 	const loaded = await deps.runJournal.loadActive(root);
 	if (loaded.kind !== "loaded") throw new Error("start did not persist an active Journal");
-	return { root, command, deps, journal: loaded.journal, names, effects };
+	return { root, command, deps, journal: loaded.journal, names, effects, setNow(iso) { nowMs = Date.parse(iso); } };
 }
 
 const continuationCommit = "2222222222222222222222222222222222222222";
@@ -245,6 +248,44 @@ async function loadResumeJournal(fixture: { deps: StewardDependencies; root: str
 	if (loaded.kind !== "loaded") throw new Error("active Journal is not loaded");
 	return loaded.journal;
 }
+
+it.sequential.each(["valid-report", "blocked", "settled", "unclear", "missing"] as const)("registered resume ordering keeps %s reconciliation ahead of silence actions", async (scenario) => {
+	const effects: ResumeEffects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const lifecycle = (): ManagedAgentInspection => {
+		const exact = { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" };
+		if (scenario === "blocked") return { kind: "observed", identity: exact, lifecycle: "blocked", stateChangeSequence: 9 };
+		if (scenario === "settled") return { kind: "observed", identity: exact, lifecycle: "idle", stateChangeSequence: 10 };
+		if (scenario === "unclear") return { kind: "unclear", diagnostic: "lifecycle unclear" };
+		if (scenario === "missing") return { kind: "missing", diagnostic: "agent missing" };
+		return { kind: "observed", identity: exact, lifecycle: "working", stateChangeSequence: 11 };
+	};
+	const processObservation: SilenceProcessObservation = { kind: "none", paneId: "pane-1", shellPid: 101, foregroundProcessGroupId: 101, processCount: 1, digest: "sha256:" + "0".repeat(64) };
+	const fixture = await setup(lifecycle, effects, { processObservation });
+	if (scenario === "valid-report") await writeResumeBuilderReport(fixture.root, fixture.journal);
+	fixture.setNow("2026-09-18T00:01:00.000Z");
+	await fixture.command("resume", context(fixture.root));
+	const journal = await loadResumeJournal(fixture);
+	const task = journal.run.tasks[0]!;
+	if (scenario === "valid-report") {
+		equal(task.attempts[0]?.state, "reported");
+		equal(task.attempts[0]?.evidence?.phase, "finalized");
+		equal(effects.reportRequests, 0);
+	} else if (scenario === "settled") {
+		equal(task.attempts[0]?.state, "awaiting-report");
+		equal(task.attempts[0]?.recovery?.reportRequest?.phase, "requested");
+		equal(effects.reportRequests, 1);
+	} else if (scenario === "blocked") {
+		equal(task.attentionReason, "reconciliation-blocked-question");
+		equal(effects.reportRequests, 0);
+	} else if (scenario === "unclear") {
+		equal(task.attentionReason, "reconciliation-live-unclear");
+	} else {
+		equal(task.attentionReason, "reconciliation-agent-missing");
+		ok(effects.worktreeProgress > 0);
+	}
+	ok(task.attention !== "suspected-stall", "ticket-10 reconciliation must preempt silence attention");
+	equal(effects.prompts, 1, "no silence or duplicate lifecycle prompt was sent");
+}, 60_000);
 
 it.sequential("registered resume reconciles an exact working agent in the same Attempt", async () => {
 	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };

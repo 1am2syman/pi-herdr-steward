@@ -63,8 +63,8 @@ export type SilenceRecoveryDecision =
 	| { kind: "nudge" }
 	| { kind: "interrupt" }
 	| { kind: "resume" }
-	| { kind: "replace"; retryOrdinal: number }
-	| { kind: "exhausted" }
+	| { kind: "replace"; retryOrdinal: 1 | 2 }
+	| { kind: "exhausted"; retryOrdinal: 0 | 1 | 2 }
 	| { kind: "inspection-incomplete" };
 
 export interface SilenceRecoveryTiming {
@@ -83,6 +83,16 @@ export interface SilenceRecoveryTiming {
 	retryLimit: number;
 	process: "none" | "live" | "unavailable";
 	unchanged: boolean;
+}
+
+function boundedRetryOrdinal(value: number | undefined): 0 | 1 | 2 {
+	if (value === undefined || !Number.isSafeInteger(value) || value <= 0) return 0;
+	return value >= 2 ? 2 : 1;
+}
+
+function boundedRetryLimit(value: number): 0 | 1 | 2 {
+	if (!Number.isSafeInteger(value) || value <= 0) return 0;
+	return value >= 2 ? 2 : 1;
 }
 
 /** Pure deadline/rung selection for ticket-11. No adapter or mutation authority. */
@@ -113,8 +123,11 @@ export function decideSilenceRecovery(input: SilenceRecoveryTiming): SilenceReco
 	if (input.phase === "resumed") {
 		const deadline = input.phaseAt + input.nudgeGraceMs;
 		if (input.now < deadline) return { kind: "wait", deadline };
-		const ordinal = (input.retryOrdinal ?? 0) + 1;
-		return ordinal > input.retryLimit ? { kind: "exhausted" } : { kind: "replace", retryOrdinal: ordinal };
+		const consumed = boundedRetryOrdinal(input.retryOrdinal);
+		const limit = boundedRetryLimit(input.retryLimit);
+		if (limit === 0 || consumed >= limit || consumed >= 2) return { kind: "exhausted", retryOrdinal: consumed };
+		const ordinal = (consumed + 1) as 1 | 2;
+		return { kind: "replace", retryOrdinal: ordinal };
 	}
 	return { kind: "wait", deadline: input.now + input.passiveInspectionMs };
 }

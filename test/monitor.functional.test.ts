@@ -267,6 +267,9 @@ function makeDependencies(root: string, presentations: Array<{ condition: string
 				if (active.kind !== "loaded" || active.journal.run.finalVerificationExecution?.phase !== "intended") throw new Error("Verification effect was attempted without a persisted verification intent.");
 				return { kind: "completed", code: 0, stdout: `verified ${input.command}\n`, stderr: "", killed: false };
 			},
+			async inspectAttemptProcesses(input) {
+				return { kind: "none", paneId: input.identity.paneId, shellPid: 101, foregroundProcessGroupId: 101, processCount: 1, digest: digest("managed-process") };
+			},
 		},
 		model: {
 			listModelChoices: () => [],
