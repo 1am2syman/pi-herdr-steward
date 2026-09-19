@@ -2,14 +2,18 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deepStrictEqual, equal, ok } from "node:assert/strict";
-import { afterEach, it } from "vitest";
+import { afterEach, it, vi } from "vitest";
 
 import { createConfigStore } from "../src/config-store.ts";
 import { createRunJournalAdapter } from "../src/adapters.ts";
+import { resolveRunJournalPaths } from "../src/run-journal-store.ts";
 import { registerStewardExtension, type StewardCommandContext, type StewardCommandHandler, type StewardRegistrationSurface } from "../src/extension.ts";
 import { buildInitialRunJournal, type RunDraft, type RunJournal } from "../src/run.ts";
 import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 import type { ManagedAgentInspection, StewardDependencies, StewardHerdrAdapter, StewardUiAdapter } from "../src/steward.ts";
+import { parseTaskFactRequest, resolveTaskFactAnswer } from "../src/reconciliation.ts";
+
+vi.setConfig({ testTimeout: 60_000 });
 
 const roots: string[] = [];
 const baseRevision = "0123456789abcdef0123456789abcdef01234567";
@@ -162,6 +166,189 @@ it.sequential("settled resume requests one report and then blocks without a rese
 	equal(effects.reportRequests, 1);
 });
 
+it.sequential.each(["throw", "killed", "malformed", "wrong-identity"] as const)("registered report-request %s is durable and never retried", async (scenario) => {
+	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const fixture = await setup(() => ({ kind: "observed", identity: { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "idle", stateChangeSequence: 14 }), effects);
+	fixture.deps.herdr.requestAttemptReport = async () => {
+		effects.reportRequests += 1;
+		if (scenario === "throw") throw new Error("request runner threw");
+		if (scenario === "killed") return { kind: "failed", stage: "agent-prompt", code: "killed", message: "request killed" };
+		if (scenario === "malformed") return { kind: "failed", stage: "agent-prompt", code: "malformed-response", message: "malformed" };
+		return { kind: "prompted", name: "wrong-agent", workspaceId: "workspace-1", tabId: "tab-1", paneId: "pane-1", terminalId: "terminal-1" };
+	};
+	await fixture.command("resume", context(fixture.root));
+	let loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing report-request failure Journal");
+	equal(loaded.journal.run.tasks[0]?.attentionReason, "reconciliation-report-missing");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.reportRequest?.phase, "ambiguous");
+	equal(effects.reportRequests, 1);
+	await fixture.command("resume", context(fixture.root));
+	loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing repeated report-request Journal");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.reportRequest?.phase, "blocked");
+	equal(effects.reportRequests, 1);
+});
+
+it.sequential("registered report-request CAS ambiguity preserves intent and prevents a duplicate request", async () => {
+	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const fixture = await setup(() => ({ kind: "observed", identity: { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "idle", stateChangeSequence: 15 }), effects);
+	const replaceActive = fixture.deps.runJournal.replaceActive.bind(fixture.deps.runJournal);
+	fixture.deps.runJournal.replaceActive = async (repositoryRoot, candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.reportRequest?.phase === "requested"
+		? { kind: "active-missing", paths: resolveRunJournalPaths(repositoryRoot) }
+		: replaceActive(repositoryRoot, candidate);
+	await fixture.command("resume", context(fixture.root));
+	let loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing report-request intent Journal");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.reportRequest?.phase, "intended");
+	equal(effects.reportRequests, 1);
+	await fixture.command("resume", context(fixture.root));
+	loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing CAS ambiguity Journal");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.reportRequest?.phase, "blocked");
+	equal(effects.reportRequests, 1);
+});
+
+it.sequential("registered resume answers one canonical blocked Task fact exactly once and acknowledges the same identity", async () => {
+	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const fixture = await setup(() => ({ kind: "observed", identity: { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "blocked", stateChangeSequence: 11 }), effects);
+	const parsed = parseTaskFactRequest('STEWARD_TASK_FACT_REQUEST {"schemaVersion":1,"field":"reportPath"}', "builder");
+	if (parsed.kind !== "fact-request") throw new Error("canonical Task-fact fixture did not parse");
+	fixture.deps.herdr.readBlockedTaskFactRequest = async () => parsed;
+	fixture.deps.herdr.answerBlockedTaskFact = async (input) => {
+		effects.answers += 1;
+		const beforeAck = await fixture.deps.runJournal.loadActive(fixture.root);
+		if (beforeAck.kind !== "loaded") throw new Error("missing intended blocked answer Journal");
+		const attempt = beforeAck.journal.run.tasks[0]?.attempts[0];
+		if (!attempt) throw new Error("missing blocked Builder Attempt");
+		if (!("workspaceId" in attempt.dispatch) || !("paneId" in attempt.dispatch) || !("terminalId" in attempt.dispatch)) throw new Error("blocked Builder identity is not complete");
+		equal(attempt.recovery?.blockedAnswer?.phase, "intended");
+		const expected = resolveTaskFactAnswer("reportPath", attempt.reportPath);
+		if (expected.kind !== "answer") throw new Error("reportPath should be answerable");
+		equal(input.answer, expected.answer.answer);
+		equal(input.identity.name, attempt.dispatch.agentName);
+		equal(input.identity.workspaceId, attempt.dispatch.workspaceId);
+		equal(input.identity.paneId, attempt.dispatch.paneId);
+		equal(input.identity.terminalId, attempt.dispatch.terminalId);
+		return { kind: "acknowledged", identity: { ...input.identity } };
+	};
+	await fixture.command("resume", context(fixture.root));
+	let loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing acknowledged blocked Journal");
+	let task = loaded.journal.run.tasks[0]!;
+	let attempt = task.attempts[0]!;
+	equal(task.attention, "none");
+	equal(attempt.recovery?.live.kind, "blocked");
+	equal(attempt.recovery?.blockedAnswer?.phase, "acknowledged");
+	equal(effects.answers, 1);
+	await fixture.command("resume", context(fixture.root));
+	loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing repeated blocked Journal");
+	task = loaded.journal.run.tasks[0]!;
+	attempt = task.attempts[0]!;
+	equal(attempt.recovery?.blockedAnswer?.phase, "acknowledged");
+	equal(effects.answers, 1);
+	equal(effects.reportRequests, 0);
+});
+
+it.sequential.each([
+	["credentials", { kind: "unstructured", diagnostic: "credentials requested" }],
+	["scope change", { kind: "unstructured", diagnostic: "scope change requested" }],
+	["model choice", { kind: "unstructured", diagnostic: "model choice requested" }],
+	["remote instruction", { kind: "unstructured", diagnostic: "remote instruction requested" }],
+	["destructive Git", { kind: "unstructured", diagnostic: "destructive Git requested" }],
+	["approval", { kind: "unstructured", diagnostic: "approval requested" }],
+	["free prose", { kind: "unstructured", diagnostic: "free prose is not canonical" }],
+	["multiple", parseTaskFactRequest('STEWARD_TASK_FACT_REQUEST {"schemaVersion":1,"field":"reportPath"}\nSTEWARD_TASK_FACT_REQUEST {"schemaVersion":1,"field":"reportPath"}', "builder")],
+	["unsupported", parseTaskFactRequest('STEWARD_TASK_FACT_REQUEST {"schemaVersion":1,"field":"credentials"}', "builder")],
+	] as const)("registered blocked unsafe Task-fact %s requests require attention without input or report request", async (_label, request) => {
+	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const fixture = await setup(() => ({ kind: "observed", identity: { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "blocked", stateChangeSequence: 12 }), effects);
+	fixture.deps.herdr.readBlockedTaskFactRequest = async () => request;
+	await fixture.command("resume", context(fixture.root));
+	const loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing unsafe-question Journal");
+	const task = loaded.journal.run.tasks[0]!;
+	equal(task.attention, "blocked");
+	equal(task.attentionReason, "reconciliation-blocked-question");
+	equal(task.attempts[0]?.recovery?.blockedAnswer, undefined);
+	equal(effects.answers, 0);
+	equal(effects.reportRequests, 0);
+	await fixture.command("resume", context(fixture.root));
+	equal(effects.answers, 0);
+	equal(effects.reportRequests, 0);
+});
+
+it.sequential("registered blocked changed-Assignment question is preserved as attention without input", async () => {
+	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const fixture = await setup(() => ({ kind: "observed", identity: { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "blocked", stateChangeSequence: 13 }), effects);
+	const parsed = parseTaskFactRequest('STEWARD_TASK_FACT_REQUEST {"schemaVersion":1,"field":"reportPath"}', "builder");
+	if (parsed.kind !== "fact-request") throw new Error("canonical Task-fact fixture did not parse");
+	fixture.deps.herdr.readBlockedTaskFactRequest = async () => parsed;
+	const inspectAssignment = fixture.deps.runJournal.inspectAttemptAssignment;
+	if (!inspectAssignment) throw new Error("Assignment inspection adapter missing");
+	fixture.deps.runJournal.inspectAttemptAssignment = async (input) => {
+		const observed = await inspectAssignment(input);
+		return observed.kind === "loaded" ? { ...observed, sha256: "sha256:" + "f".repeat(64) } : observed;
+	};
+	await fixture.command("resume", context(fixture.root));
+	const loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing changed-Assignment Journal");
+	equal(loaded.journal.run.tasks[0]?.attentionReason, "reconciliation-blocked-question");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.blockedAnswer, undefined);
+	equal(effects.answers, 0);
+	equal(effects.reportRequests, 0);
+});
+
+it.sequential.each(["throw", "wrong-identity", "failed", "ambiguous"] as const)("registered blocked Task-fact acknowledgement %s is ambiguous without a resend", async (scenario) => {
+	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const fixture = await setup(() => ({ kind: "observed", identity: { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "blocked", stateChangeSequence: 16 }), effects);
+	const parsed = parseTaskFactRequest('STEWARD_TASK_FACT_REQUEST {"schemaVersion":1,"field":"reportPath"}', "builder");
+	if (parsed.kind !== "fact-request") throw new Error("canonical Task-fact fixture did not parse");
+	fixture.deps.herdr.readBlockedTaskFactRequest = async () => parsed;
+	fixture.deps.herdr.answerBlockedTaskFact = async (input) => {
+		effects.answers += 1;
+		if (scenario === "throw") throw new Error("send-keys threw");
+		if (scenario === "failed") return { kind: "failed", message: "send-keys failed" };
+		if (scenario === "ambiguous") return { kind: "ambiguous", message: "send-keys killed" };
+		return { kind: "acknowledged", identity: { ...input.identity, paneId: "other-pane" } };
+	};
+	await fixture.command("resume", context(fixture.root));
+	let loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing blocked answer Journal");
+	equal(loaded.journal.run.tasks[0]?.attentionReason, "reconciliation-blocked-question");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.blockedAnswer?.phase, "ambiguous");
+	equal(effects.answers, 1);
+	await fixture.command("resume", context(fixture.root));
+	loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing repeated blocked answer Journal");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.blockedAnswer?.phase, "ambiguous");
+	equal(effects.answers, 1);
+});
+
+it.sequential("registered blocked Task-fact acknowledgement CAS ambiguity preserves intended input and never resends", async () => {
+	const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
+	const fixture = await setup(() => ({ kind: "observed", identity: { name: "steward-b-01234567-01-01", workspaceId: "workspace-1", paneId: "pane-1", terminalId: "terminal-1" }, lifecycle: "blocked", stateChangeSequence: 17 }), effects);
+	const parsed = parseTaskFactRequest('STEWARD_TASK_FACT_REQUEST {"schemaVersion":1,"field":"reportPath"}', "builder");
+	if (parsed.kind !== "fact-request") throw new Error("canonical Task-fact fixture did not parse");
+	fixture.deps.herdr.readBlockedTaskFactRequest = async () => parsed;
+	fixture.deps.herdr.answerBlockedTaskFact = async (input) => { effects.answers += 1; return { kind: "acknowledged", identity: { ...input.identity } }; };
+	const replaceActive = fixture.deps.runJournal.replaceActive.bind(fixture.deps.runJournal);
+	let injected = true;
+	fixture.deps.runJournal.replaceActive = async (repositoryRoot, candidate) => injected && candidate.run.tasks[0]?.attempts[0]?.recovery?.blockedAnswer?.phase === "acknowledged"
+		? (injected = false, { kind: "active-missing", paths: resolveRunJournalPaths(repositoryRoot) })
+		: replaceActive(repositoryRoot, candidate);
+	await fixture.command("resume", context(fixture.root));
+	let loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing blocked answer intent Journal");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.blockedAnswer?.phase, "intended");
+	equal(effects.answers, 1);
+	await fixture.command("resume", context(fixture.root));
+	loaded = await fixture.deps.runJournal.loadActive(fixture.root);
+	if (loaded.kind !== "loaded") throw new Error("missing blocked answer CAS Journal");
+	equal(loaded.journal.run.tasks[0]?.attempts[0]?.recovery?.blockedAnswer?.phase, "ambiguous");
+	equal(effects.answers, 1);
+});
+
 it.sequential("unclear and exact missing outcomes never replace the Attempt", async () => {
 	for (const kind of ["unclear", "missing"] as const) {
 		const effects = { prompts: 0, reportRequests: 0, answers: 0, worktreeProgress: 0 };
@@ -214,6 +401,7 @@ it.sequential("the pure policy keeps report, live, settled, unclear, and missing
 	const { decideReconciliation } = await import("../src/reconciliation.ts");
 	deepStrictEqual(decideReconciliation({ report: "valid", live: { kind: "missing" } }), { kind: "report" });
 	deepStrictEqual(decideReconciliation({ report: "invalid", live: { kind: "working", lifecycle: "working" } }), { kind: "working-or-blocked", lifecycle: "working" });
+	deepStrictEqual(decideReconciliation({ report: "invalid", live: { kind: "blocked", lifecycle: "blocked" } }), { kind: "working-or-blocked", lifecycle: "blocked" });
 	deepStrictEqual(decideReconciliation({ report: "missing", live: { kind: "settled", lifecycle: "idle" } }), { kind: "settled", lifecycle: "idle" });
 	deepStrictEqual(decideReconciliation({ report: "unclear", live: { kind: "unclear" } }), { kind: "unclear" });
 	deepStrictEqual(decideReconciliation({ report: "missing", live: { kind: "missing" } }), { kind: "missing" });

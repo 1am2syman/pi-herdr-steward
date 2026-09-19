@@ -351,6 +351,22 @@ it.sequential("round-trips ticket-10 recovery branches and rejects impossible re
 	const unknownAttempt = ((unknown.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>;
 	((unknownAttempt[0]!.recovery as Record<string, unknown>).live as Record<string, unknown>).unexpected = true;
 	ok(!deserializeRunJournal(JSON.stringify(unknown), "active-run.json").value, "unknown recovery keys were accepted");
+	const mismatchedIdentity = JSON.parse(serializeRunJournal(recoveryJournal("awaiting"))) as Record<string, unknown>;
+	const mismatchedRecovery = (((mismatchedIdentity.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>)[0]!.recovery as Record<string, unknown>;
+	((mismatchedRecovery.reportRequest as Record<string, unknown>).agent as Record<string, unknown>).paneId = "other-pane";
+	ok(!deserializeRunJournal(JSON.stringify(mismatchedIdentity), "active-run.json").value, "mismatched recovery identity was accepted");
+	const badTimestamp = JSON.parse(serializeRunJournal(recoveryJournal("working"))) as Record<string, unknown>;
+	const badTimestampRecovery = (((badTimestamp.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>)[0]!.recovery as Record<string, unknown>;
+	(badTimestampRecovery.live as Record<string, unknown>).observedAt = "not-a-timestamp";
+	ok(!deserializeRunJournal(JSON.stringify(badTimestamp), "active-run.json").value, "bad recovery timestamp was accepted");
+	const badPath = JSON.parse(serializeRunJournal(recoveryJournal("awaiting"))) as Record<string, unknown>;
+	const badPathRecovery = (((badPath.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>)[0]!.recovery as Record<string, unknown>;
+	(badPathRecovery.reportRequest as Record<string, unknown>).reportPath = "/tmp/recovery-run/other-report.md";
+	ok(!deserializeRunJournal(JSON.stringify(badPath), "active-run.json").value, "mismatched recovery path was accepted");
+	const awaitingWithFinalizedEvidence = JSON.parse(serializeRunJournal(recoveryJournal("awaiting"))) as Record<string, unknown>;
+	const awaitingWithFinalizedAttempt = (((awaitingWithFinalizedEvidence.run as Record<string, unknown>).tasks as Array<Record<string, unknown>>)[0]!.attempts as Array<Record<string, unknown>>)[0]!;
+	awaitingWithFinalizedAttempt.evidence = { phase: "finalized", finalizedAt: "2026-09-18T00:00:05.000Z", status: "completed", reportSha256: `sha256:${"f".repeat(64)}`, manifestPath: "/tmp/recovery-run/finalized/manifest.json", manifestSha256: `sha256:${"e".repeat(64)}`, producedRevision: "1".repeat(40) };
+	ok(!deserializeRunJournal(JSON.stringify(awaitingWithFinalizedEvidence), "active-run.json").value, "awaiting-report with finalized evidence was accepted");
 });
 
 it.sequential("accepts an optional strict monitor checkpoint, clones it, and rejects unknown monitor keys", async () => {

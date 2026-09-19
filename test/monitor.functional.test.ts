@@ -386,6 +386,27 @@ it.sequential("records lifecycle, terminal, worktree, Git, and report progress i
 	equal(effects.reviewerPrompts, 0);
 }, 60_000);
 
+it.sequential.each(["absent", "truncated", "contradictory"] as const)("does not read an $0 activity log while persisting the authoritative monitor checkpoint", async (activityState) => {
+	const root = await mkdtemp(join(tmpdir(), `pi-herdr-steward-monitor-activity-${activityState}-`));
+	roots.push(root);
+	const presentations: Array<{ condition: string; footerText: string; notification?: string }> = [];
+	const effects = { builderPrompts: 0, reviewerStarts: 0, reviewerPrompts: 0 };
+	const dependencies = makeDependencies(root, presentations, effects, {});
+	const { journal } = await startDormantRegisteredRun(root, dependencies);
+	const activityPath = join(resolveRunJournalPaths(root).activityRoot, journal.run.id, "activity.log");
+	dependencies.herdr.inspectManagedAgent = async (identity) => ({ kind: "observed", identity, lifecycle: "idle", stateChangeSequence: 9 });
+	if (activityState === "absent") await rm(activityPath, { force: true });
+	else if (activityState === "truncated") await writeFile(activityPath, "{\"event\":\n", "utf8");
+	else await writeFile(activityPath, JSON.stringify({ event: "monitor-observed", runId: "contradictory-run", message: "not authoritative" }) + "\n", "utf8");
+	const before = await dependencies.runJournal.loadActive(root);
+	if (before.kind !== "loaded") throw new Error("missing activity independence fixture");
+	const result = await createSteward(dependencies).observeMonitorProgress(root, "monitor-controller", "manual");
+	if (!result.journal) throw new Error(`${activityState} activity log prevented monitor checkpoint`);
+	equal(result.condition, "ordinary");
+	equal(result.action, "record-observation");
+	equal(result.journal.journalRevision, before.journal.journalRevision + 1);
+}, 60_000);
+
 it.sequential("uses the exact lifecycle wait first and the frozen passive interval for timeout or unavailable fallback", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-monitor-wait-"));
 	roots.push(root);

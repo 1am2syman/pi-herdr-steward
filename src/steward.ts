@@ -714,7 +714,7 @@ function intentEquivalent(left: BuilderEvidenceRecord | undefined, right: Builde
 async function validateActiveBuilderEvidence(repositoryRoot: string, controllerSessionId: string, loadedJournal: RunJournal, dependencies: StewardDependencies): Promise<EvidenceDecision> {
 	const selected = activeBuilder(loadedJournal);
 	if (!selected) return { kind: "waiting", journal: loadedJournal, note: "Evidence validation is waiting for exactly one active prompted Builder Attempt." };
-	const { task, attempt } = selected;
+	let { task, attempt } = selected;
 	const paths = evidencePathsFor(attempt);
 	let deterministic: AssignmentPaths;
 	try {
@@ -770,11 +770,33 @@ async function validateActiveBuilderEvidence(repositoryRoot: string, controllerS
 		if (!changedPathsInAllowedScope(inspected, task.contract.allowedScope)) return persistEvidenceRejection(repositoryRoot, loadedJournal, task, attempt, dependencies, ["scope-violation"], ["Git Artifact changed a path outside allowedScope."], inputs.reportSha256);
 		gitFacts = inspected;
 	}
-	const manifest = buildEvidenceManifest({ journal: loadedJournal, task, attempt, report: parsed.value, reportSize: inputs.reportBytes.length, reportSha256: inputs.reportSha256, assignmentSha256: inputs.assignmentSha256, paths, files: referenced.files, ...(gitFacts ? { gitFacts } : {}) });
+	let journal = loadedJournal;
+	if (attempt.state === "prepared" && attempt.dispatch.phase === "prompt-intended") {
+		const reconciledAt = transitionTimestamp(journal, dependencies.clock.now());
+		let promoted: RunJournal;
+		try {
+			promoted = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const nextTask = next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id);
+				const nextAttempt = nextTask?.attempts.find((candidate) => candidate.id === attempt.id);
+				if (!nextTask || !nextAttempt || nextAttempt.role !== "builder" || nextAttempt.state !== "prepared" || nextAttempt.dispatch.phase !== "prompt-intended") throw new Error("Builder Attempt disappeared before valid-report reconciliation.");
+				promoteMatchingDispatch(nextTask, nextAttempt, reconciledAt, "valid-report");
+			});
+		} catch (error: unknown) {
+			return { kind: "unaccepted", journal, note: `Valid Builder report could not first reconcile its prepared dispatch; no evidence finalization was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+		}
+		const persistedPromotion = await dependencies.runJournal.replaceActive(repositoryRoot, promoted);
+		if (persistedPromotion.kind !== "replaced") return { kind: "unaccepted", journal, note: "Valid Builder report reconciliation lost a Journal race; no evidence finalization was attempted." };
+		journal = persistedPromotion.journal;
+		const refreshedTask = journal.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id);
+		const refreshedAttempt = refreshedTask?.attempts.find((candidate) => candidate.id === attempt.id);
+		if (!refreshedTask || !refreshedAttempt || refreshedAttempt.role !== "builder") return { kind: "unaccepted", journal, note: "Valid Builder report reconciliation changed the current Attempt; no evidence finalization was attempted." };
+		task = refreshedTask;
+		attempt = refreshedAttempt;
+	}
+	const manifest = buildEvidenceManifest({ journal, task, attempt, report: parsed.value, reportSize: inputs.reportBytes.length, reportSha256: inputs.reportSha256, assignmentSha256: inputs.assignmentSha256, paths, files: referenced.files, ...(gitFacts ? { gitFacts } : {}) });
 	const manifestBytes = Buffer.from(serializeFinalizedEvidenceManifest(manifest), "utf8");
 	const manifestSha256 = finalizedEvidenceManifestSha256(manifest);
-	const intent: BuilderEvidenceRecord = { phase: "finalization-intended", checkedAt: transitionTimestamp(loadedJournal, dependencies.clock.now()), reportSha256: inputs.reportSha256, manifestPath: join(paths.finalizedDirectory, "manifest.json"), manifestSha256 };
-	let journal = loadedJournal;
+	const intent: BuilderEvidenceRecord = { phase: "finalization-intended", checkedAt: transitionTimestamp(journal, dependencies.clock.now()), reportSha256: inputs.reportSha256, manifestPath: join(paths.finalizedDirectory, "manifest.json"), manifestSha256 };
 	if (!intentEquivalent(attempt.evidence, intent)) {
 		const candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const nextAttempt = [...(next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts ?? [])].reverse().find((candidate): candidate is BuilderAttemptRecord => candidate.role === "builder");
@@ -800,12 +822,6 @@ async function validateActiveBuilderEvidence(repositoryRoot: string, controllerS
 	const reportedJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 		const nextAttempt = [...(next.run.tasks.find((candidateTask) => candidateTask.contract.id === task.contract.id)?.attempts ?? [])].reverse().find((candidate): candidate is BuilderAttemptRecord => candidate.role === "builder");
 		if (!nextAttempt) throw new Error("Builder Attempt disappeared before finalization.");
-		const reconciledAt = nextAttempt.dispatch.phase === "prompt-intended" ? transitionTimestamp(journal, dependencies.clock.now()) : undefined;
-		if (reconciledAt && nextAttempt.dispatch.phase === "prompt-intended") {
-			const dispatch = nextAttempt.dispatch;
-			nextAttempt.dispatch = { ...dispatch, phase: "reconciled-active", reconciledAt, basis: "valid-report" };
-			nextAttempt.activatedAt = reconciledAt;
-		}
 		nextAttempt.state = "reported";
 		delete nextAttempt.recovery;
 		nextAttempt.evidence = finalized;
@@ -1044,9 +1060,31 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	try { after = await dependencies.git.inspectReviewWorktree(reviewer.worktree.path); } catch (error: unknown) { return { journal, note: `Reviewer worktree inspection failed before finalization; no verdict was inferred. ${error instanceof Error ? error.message : "Inspection failed."}` }; }
 	if ("kind" in after) return { journal, note: `Reviewer worktree inspection is unavailable before finalization; no verdict was inferred. ${after.message}` };
 	if (!worktreeSnapshotsEqual(after, reviewer.worktree.baseline)) return recordReviewerViolation(repositoryRoot, journal, candidate, reviewer, after, dependencies);
+	let currentReviewer = reviewer;
+	if (currentReviewer.dispatch.phase === "prompt-intended") {
+		const reconciledAt = transitionTimestamp(journal, dependencies.clock.now());
+		let promoted: RunJournal;
+		try {
+			promoted = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const nextTask = next.run.tasks[candidate.index];
+				const nextReviewer = nextTask ? latestReviewerAttempt(nextTask) : undefined;
+				if (!nextTask || !nextReviewer || nextReviewer.id !== currentReviewer.id || nextReviewer.state !== currentReviewer.state || nextReviewer.dispatch.phase !== "prompt-intended") throw new Error("Reviewer Attempt disappeared before valid-report reconciliation.");
+				promoteMatchingDispatch(nextTask, nextReviewer, reconciledAt, "valid-report");
+			});
+		} catch (error: unknown) {
+			return { journal, note: `Valid Reviewer report could not first reconcile its prepared dispatch; no evidence finalization was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+		}
+		const persistedPromotion = await persistReviewJournal(repositoryRoot, promoted, dependencies);
+		if (!persistedPromotion) return { journal, note: "Valid Reviewer report reconciliation lost a Journal race; no evidence finalization was attempted." };
+		journal = persistedPromotion;
+		const refreshedTask = journal.run.tasks[candidate.index];
+		const refreshedReviewer = refreshedTask ? latestReviewerAttempt(refreshedTask) : undefined;
+		if (!refreshedTask || !refreshedReviewer || refreshedReviewer.id !== currentReviewer.id) return { journal, note: "Valid Reviewer report reconciliation changed the current Attempt; no evidence finalization was attempted." };
+		currentReviewer = refreshedReviewer;
+	}
 	const finalDirectory = paths.finalizedDirectory;
 	const logs = referenced.files.map((file) => { const log = parsed.value!.logReferences.find((item) => item.path === file.path)!; return { id: log.id, originalPath: file.path, finalizedPath: join(finalDirectory, "logs", `${log.id}.log`), size: file.size, sha256: file.sha256 }; });
-	const manifest = buildFinalizedReviewerEvidenceManifest({ runId: journal.run.id, taskId: candidate.task.contract.id, attempt: reviewer, report: parsed.value, reportSize: inputs.reportBytes.length, reportSha256: inputs.reportSha256, assignmentSha256: inputs.assignmentSha256, finalizedDirectory: finalDirectory, logs, after });
+	const manifest = buildFinalizedReviewerEvidenceManifest({ runId: journal.run.id, taskId: candidate.task.contract.id, attempt: currentReviewer, report: parsed.value, reportSize: inputs.reportBytes.length, reportSha256: inputs.reportSha256, assignmentSha256: inputs.assignmentSha256, finalizedDirectory: finalDirectory, logs, after });
 	const manifestBytes = Buffer.from(serializeFinalizedReviewerEvidenceManifest(manifest), "utf8");
 	const manifestSha256 = finalizedReviewerEvidenceManifestSha256(manifest);
 	let intended: RunJournal;
@@ -1056,7 +1094,7 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 			const attempt = task ? latestReviewerAttempt(task) : undefined;
 			if (!task || !attempt) throw new Error("Reviewer Attempt disappeared before finalization intent.");
 			attempt.integrity = { kind: "preserved", after: reviewSnapshotFor(after as import("./run.ts").ReviewWorktreeSnapshot) };
-			attempt.evidence = { phase: "finalization-intended", checkedAt: transitionTimestamp(journal, dependencies.clock.now()), reportSha256: inputs.reportSha256, manifestPath: join(finalDirectory, "manifest.json"), manifestSha256, subject: { ...reviewer.subject, ...(reviewer.subject.kind === "git" ? { commits: [...reviewer.subject.commits] } : { artifacts: reviewer.subject.artifacts.map((artifact) => ({ ...artifact })) }) } };
+			attempt.evidence = { phase: "finalization-intended", checkedAt: transitionTimestamp(journal, dependencies.clock.now()), reportSha256: inputs.reportSha256, manifestPath: join(finalDirectory, "manifest.json"), manifestSha256, subject: { ...currentReviewer.subject, ...(currentReviewer.subject.kind === "git" ? { commits: [...currentReviewer.subject.commits] } : { artifacts: currentReviewer.subject.artifacts.map((artifact) => ({ ...artifact })) }) } };
 		});
 	} catch (error: unknown) { return { journal, note: `Reviewer finalization intent could not be persisted; no verdict was accepted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
 	const persistedIntent = await persistReviewJournal(repositoryRoot, intended, dependencies);
@@ -1075,18 +1113,10 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 			const task = next.run.tasks[candidate.index];
 			const attempt = task ? latestReviewerAttempt(task) : undefined;
 			if (!task || !attempt) throw new Error("Reviewer Attempt disappeared after evidence finalization.");
-				const reconciledAt = attempt.dispatch.phase === "prompt-intended" ? transitionTimestamp(persistedIntent, dependencies.clock.now()) : undefined;
-				if (reconciledAt && attempt.dispatch.phase === "prompt-intended") {
-					const dispatch = attempt.dispatch;
-					const builder = candidate.builder;
-					if (!hasProvenAgentIdentity(builder)) throw new Error("Reviewer report cannot establish the Builder branch identity.");
-					attempt.dispatch = { ...dispatch, phase: "reconciled-active", branch: builder.dispatch.branch, reconciledAt, basis: "valid-report" };
-				attempt.activatedAt = reconciledAt;
-			}
 			attempt.state = "reported";
 			delete attempt.recovery;
 			attempt.integrity = { kind: "preserved", after: reviewSnapshotFor(after as import("./run.ts").ReviewWorktreeSnapshot) };
-			attempt.evidence = { phase: "finalized", finalizedAt: transitionTimestamp(persistedIntent, dependencies.clock.now()), verdict: parsed.value!.verdict, reportSha256: inputs.reportSha256, manifestPath: finalizedManifestPath, manifestSha256: finalizedManifestSha256, subject: { ...reviewer.subject, ...(reviewer.subject.kind === "git" ? { commits: [...reviewer.subject.commits] } : { artifacts: reviewer.subject.artifacts.map((artifact) => ({ ...artifact })) }) } };
+			attempt.evidence = { phase: "finalized", finalizedAt: transitionTimestamp(persistedIntent, dependencies.clock.now()), verdict: parsed.value!.verdict, reportSha256: inputs.reportSha256, manifestPath: finalizedManifestPath, manifestSha256: finalizedManifestSha256, subject: { ...currentReviewer.subject, ...(currentReviewer.subject.kind === "git" ? { commits: [...currentReviewer.subject.commits] } : { artifacts: currentReviewer.subject.artifacts.map((artifact) => ({ ...artifact })) }) } };
 		});
 	} catch (error: unknown) { return { journal: persistedIntent, note: `Reviewer evidence was finalized but the reported Journal state could not be persisted; no resend will be attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
 	const persisted = await persistReviewJournal(repositoryRoot, reported, dependencies);
@@ -1543,7 +1573,7 @@ function completionResources(journal: RunJournal): CompletionAgentIdentity[] {
 	for (const task of journal.run.tasks) {
 		for (const attempt of task.attempts) {
 			const dispatch = attempt.dispatch;
-			if (dispatch.phase !== "prompted") continue;
+			if (dispatch.phase !== "prompted" && dispatch.phase !== "reconciled-active") continue;
 			const resource: CompletionAgentIdentity = { role: attempt.role, agentName: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
 			const key = `${resource.role}/${resource.agentName}/${resource.workspaceId}/${resource.paneId}/${resource.terminalId}`;
 			if (!seen.has(key)) { seen.add(key); resources.push(resource); }
@@ -1828,7 +1858,7 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, findings: import("./review.ts").ReviewerFinding[], dependencies: StewardDependencies): Promise<ReviewDecision> {
 	let journal = journalInput;
 	const previousDispatch = candidate.builder.dispatch;
-	if (previousDispatch.phase !== "prompted" || !dependencies.git.inspectBuilderWorktree || !dependencies.herdr.promptBuilder) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Rework requires the original prompted Builder identity and read-only worktree/prompt adapters; no replacement Builder was created.");
+	if ((previousDispatch.phase !== "prompted" && previousDispatch.phase !== "reconciled-active") || !dependencies.git.inspectBuilderWorktree || !dependencies.herdr.promptBuilder) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Rework requires the original proven Builder identity and read-only worktree/prompt adapters; no replacement Builder was created.");
 	if (reviewer.subject.kind !== "git") return pauseReview(repositoryRoot, candidate, journal, dependencies, "Automatic same-Builder rework is only available for the existing Git flow; preserved non-Git evidence requires user attention.");
 	let inspected: { kind: "ready"; head: string; clean: true } | { kind: "unavailable"; message: string };
 	try { inspected = await dependencies.git.inspectBuilderWorktree(previousDispatch.worktreePath, reviewer.subject.headRevision); } catch (error: unknown) { return pauseReview(repositoryRoot, candidate, journal, dependencies, `Rework preflight failed; no Attempt was reserved. ${error instanceof Error ? error.message : "Builder worktree inspection failed."}`); }
@@ -2424,7 +2454,16 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 			const changed = await persist((nextTask, nextAttempt) => { nextTask.attention = "blocked"; nextTask.attentionReason = "reconciliation-blocked-question"; nextTask.attentionDiagnostic = request.diagnostic.slice(0, 2_000); const existing = nextAttempt.recovery; nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}) }; });
 			return changed ? { kind: "blocked", journal, note: "The blocked agent did not present one canonical approved Task-fact request; user attention is required." } : { kind: "degraded", journal, note: "The blocked-agent question could not be persisted." };
 		}
-		if (request.request.field === "reviewSubject" && attempt.role !== "reviewer") return { kind: "blocked", journal, note: "The blocked agent requested a Reviewer-only fact; no input was sent." };
+		if (request.request.field === "reviewSubject" && attempt.role !== "reviewer") {
+			const changed = await persist((nextTask, nextAttempt) => {
+				nextTask.attention = "blocked";
+				nextTask.attentionReason = "reconciliation-blocked-question";
+				nextTask.attentionDiagnostic = "The blocked Builder requested a Reviewer-only Task fact; no input was sent.";
+				const existing = nextAttempt.recovery;
+				nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}) };
+			});
+			return changed ? { kind: "blocked", journal, note: "The blocked agent requested a Reviewer-only Task fact; no input was sent." } : { kind: "degraded", journal, note: "The blocked Reviewer-only Task-fact question could not be persisted." };
+		}
 		const verifiedFact = await verifiedTaskFactValue(repositoryRoot, journal.run.id, task, attempt, dependencies, request.request.field);
 		if (verifiedFact.kind !== "verified") {
 			const diagnostic = verifiedFact.diagnostic;
@@ -2435,7 +2474,12 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 		if (answer.kind !== "answer") return { kind: "blocked", journal, note: "The blocked Task-fact request is not derivable from the current frozen contract; no input was sent." };
 		const intended = await persist((nextTask, nextAttempt) => { promoteMatchingDispatch(nextTask, nextAttempt, observedAt, "matching-live-agent"); nextTask.attention = "none"; delete nextTask.attentionReason; delete nextTask.attentionDiagnostic; const existing = nextAttempt.recovery; nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "blocked", lifecycle: "blocked", stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), blockedAnswer: { phase: "intended", intendedAt: observedAt, agent: liveIdentity, questionSha256: request.request.questionSha256, fact: request.request.field, answerSha256: answer.answer.answerSha256 }, ...(existing?.preservation ? { preservation: existing.preservation } : {}) }; });
 		if (!intended) return { kind: "degraded", journal, note: "Task-fact answer intent could not be persisted; no input was sent." };
-		const delivered = dependencies.herdr.answerBlockedTaskFact ? await dependencies.herdr.answerBlockedTaskFact({ repositoryRoot, identity: liveIdentity, answer: answer.answer.answer }) : { kind: "failed", message: "Task-fact answer adapter is unavailable." };
+		let delivered: HerdrTaskFactAnswerResult;
+		try {
+			delivered = dependencies.herdr.answerBlockedTaskFact ? await dependencies.herdr.answerBlockedTaskFact({ repositoryRoot, identity: liveIdentity, answer: answer.answer.answer }) : { kind: "failed", message: "Task-fact answer adapter is unavailable." };
+		} catch (error: unknown) {
+			delivered = { kind: "ambiguous", message: error instanceof Error ? error.message : "Task-fact answer delivery failed." };
+		}
 		const acknowledged = delivered.kind === "acknowledged" && "identity" in delivered ? exactIdentity(delivered.identity, liveIdentity) : false;
 		const recorded = await persist((nextTask, nextAttempt) => {
 			const current = nextAttempt.recovery?.blockedAnswer;
@@ -2467,7 +2511,12 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 		}
 		const requestIntent = await persist((nextTask, nextAttempt) => { promoteMatchingDispatch(nextTask, nextAttempt, observedAt, "matching-live-agent"); nextTask.attention = "none"; delete nextTask.attentionReason; delete nextTask.attentionDiagnostic; nextAttempt.state = "awaiting-report"; const existing = nextAttempt.recovery; nextAttempt.recovery = { live: recoveryLiveRecord({ observedAt, kind: "settled", lifecycle: decision.lifecycle, stateChangeSequence: inspected.kind === "observed" ? inspected.stateChangeSequence : null }), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), ...(existing?.preservation ? { preservation: existing.preservation } : {}), reportRequest: { phase: "intended", intendedAt: observedAt, agent: liveIdentity, reportPath: attempt.reportPath } }; });
 		if (!requestIntent) return { kind: "degraded", journal, note: "Attempt report-request intent could not be persisted; no prompt was sent." };
-		const requested = dependencies.herdr.requestAttemptReport ? await dependencies.herdr.requestAttemptReport({ repositoryRoot, identity: liveIdentity, role: attempt.role, reportPath: attempt.reportPath, assignmentPath: attempt.assignmentPath, evidenceDirectory: attempt.evidenceDirectory }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Attempt report-request adapter is unavailable." } as HerdrPromptResult;
+		let requested: HerdrPromptResult;
+		try {
+			requested = dependencies.herdr.requestAttemptReport ? await dependencies.herdr.requestAttemptReport({ repositoryRoot, identity: liveIdentity, role: attempt.role, reportPath: attempt.reportPath, assignmentPath: attempt.assignmentPath, evidenceDirectory: attempt.evidenceDirectory }) : { kind: "failed", stage: "agent-prompt", code: "adapter-unavailable", message: "Attempt report-request adapter is unavailable." };
+		} catch (error: unknown) {
+			requested = { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Attempt report request failed." };
+		}
 		const exact = requested.kind === "prompted" && requested.name === liveIdentity.name && requested.workspaceId === liveIdentity.workspaceId && requested.paneId === liveIdentity.paneId && requested.terminalId === liveIdentity.terminalId;
 		const recorded = await persist((nextTask, nextAttempt) => {
 			const current = nextAttempt.recovery?.reportRequest;

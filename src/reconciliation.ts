@@ -44,7 +44,7 @@ export type ReconciliationDecision =
  */
 export function decideReconciliation(facts: ReconciliationFacts): ReconciliationDecision {
 	if (facts.report === "valid") return { kind: "report" };
-	if (facts.live?.kind === "working" && (facts.live.lifecycle === "working" || facts.live.lifecycle === "blocked")) {
+	if ((facts.live?.kind === "working" && facts.live.lifecycle === "working") || (facts.live?.kind === "blocked" && facts.live.lifecycle === "blocked")) {
 		return { kind: "working-or-blocked", lifecycle: facts.live.lifecycle };
 	}
 	if (facts.live?.kind === "settled" && (facts.live.lifecycle === "idle" || facts.live.lifecycle === "done")) {

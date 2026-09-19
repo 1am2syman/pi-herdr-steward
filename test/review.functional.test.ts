@@ -10,7 +10,7 @@ import { createSteward } from "../src/steward.ts";
 import { registerStewardExtension, type StewardCommandContext, type StewardCommandHandler, type StewardRegistrationSurface } from "../src/extension.ts";
 import { serializeBuilderAttemptReport, type BuilderAttemptReport } from "../src/attempt-report.ts";
 import { buildReviewerAssignment, deserializeReviewerAssignment, reviewerAssignmentSha256, serializeReviewerAssignment, serializeReviewerAttemptReport, type ReviewerAttemptReport } from "../src/review.ts";
-import { builderAssignmentSha256, specificationHash, type ReviewerAttemptRecord, type RunDraft, type RunJournal, type TaskContract } from "../src/run.ts";
+import { advanceRunJournal, builderAssignmentSha256, specificationHash, type ReviewerAttemptRecord, type RunDraft, type RunJournal, type TaskContract } from "../src/run.ts";
 import type { ModelChoice, ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 import type { StewardDependencies, StewardUiAdapter, StatusView } from "../src/steward.ts";
 
@@ -59,6 +59,12 @@ async function invoke(root: string, dependencies: StewardDependencies, command: 
 	registerStewardExtension(registered.surface, () => dependencies);
 	await registered.handler()(command, context(root, sessionId));
 	return view;
+}
+
+async function resumeOnce(root: string, dependencies: StewardDependencies, sessionId = "controller-session"): Promise<void> {
+	const registered = capture();
+	registerStewardExtension(registered.surface, () => dependencies);
+	await registered.handler()("resume", context(root, sessionId));
 }
 
 function makeDependencies(root: string, options: { snapshots?: Snapshot[]; snapshotState?: { value: Snapshot }; confirmSameFamily?: boolean; sameFamilyOnly?: boolean; noReviewerModels?: boolean; inspectionCalls?: string[]; confirmationCalls?: number[]; builderPrimaryModel?: string; builderActualModel?: ModelChoice; reworkCycleLimit?: number; reviewFailure?: "pane" | "agent" | "prompt"; builderPreflight?: (expectedRevision: string) => { kind: "unavailable"; message: string } | { kind: "ready"; head: string; clean: true }; failReworkAssignment?: boolean; failReworkBuilderPrompt?: "throw" | "malformed"; failRepairPrompt?: "throw" | "malformed"; failJournalReplace?: "rework-reservation" | "rework-prompt-intent" | "repair-intent"; effectCounts?: EffectCounts; reviewHooks?: ReviewHooks } = {}): StewardDependencies {
@@ -334,6 +340,153 @@ it.sequential.each([
 	equal(reviewer.evidence, undefined);
 	equal(await readFile(dispatchedReviewer.reportPath, "utf8"), acceptedReportBytes);
 	equal(await readFile(sourcePath, "utf8"), sourceBytes);
+}, 60_000);
+
+it.sequential("ticket-10 sends changes-required rework to the same reconciled-active Builder without resending the original prompt", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-reconciled-rework-"));
+	roots.push(root);
+	const effects: EffectCounts = { builderPrompts: 0, reviewerPanes: 0, reviewerStarts: 0, reviewerPrompts: 0 };
+	const dependencies = makeDependencies(root, { effectCounts: effects });
+	const started = await startRun(root, dependencies);
+	await writeBuilderReport(root, started);
+	await invoke(root, dependencies, "status");
+	const reviewerDispatch = await dependencies.runJournal.loadActive(root);
+	if (reviewerDispatch.kind !== "loaded") throw new Error("missing Reviewer dispatch");
+	const reconciled = advanceRunJournal(reviewerDispatch.journal, new Date("2026-09-18T00:00:01.000Z"), (next) => {
+		const builder = next.run.tasks[0]?.attempts[0];
+		if (!builder || builder.role !== "builder" || builder.dispatch.phase !== "prompted") throw new Error("missing prompted original Builder");
+		const dispatch = builder.dispatch;
+		builder.dispatch = { phase: "reconciled-active", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, assignmentSha256: dispatch.assignmentSha256, reconciledAt: "2026-09-18T00:00:01.000Z", basis: "matching-live-agent" };
+		builder.activatedAt = "2026-09-18T00:00:01.000Z";
+	});
+	const replaced = await dependencies.runJournal.replaceActive(root, reconciled);
+	if (replaced.kind !== "replaced") throw new Error("failed to persist reconciled Builder");
+	await writeReviewerReport(reconciled, "changes-required");
+	const view = await invoke(root, dependencies, "status");
+	match(view?.markdown ?? "", /Rework cycle 1 reserved and prompted/);
+	const after = await dependencies.runJournal.loadActive(root);
+	if (after.kind !== "loaded") throw new Error("missing rework journal");
+	const task = after.journal.run.tasks[0]!;
+	const original = task.attempts[0]!;
+	const rework = task.attempts[2]!;
+	if (original.role !== "builder" || rework.role !== "builder") throw new Error("Builder attempts missing after rework");
+	if (!("workspaceId" in original.dispatch) || !("paneId" in original.dispatch) || !("workspaceId" in rework.dispatch) || !("paneId" in rework.dispatch)) throw new Error("Builder dispatch identity missing after rework");
+	equal(task.phase, "reworking");
+	equal(task.attention, "none");
+	equal(task.reworkCycles, 1);
+	equal(rework.state, "active");
+	equal(rework.dispatch.phase, "prompted");
+	equal(rework.dispatch.agentName, original.dispatch.agentName);
+	equal(rework.dispatch.workspaceId, original.dispatch.workspaceId);
+	equal(rework.dispatch.paneId, original.dispatch.paneId);
+	equal(effects.builderPrompts, 2);
+	const assignment = JSON.parse(await readFile(rework.assignmentPath, "utf8")) as { assignment: { rework?: { priorBuilderAttemptId: string; priorReviewerAttemptId: string } } };
+	equal(assignment.assignment.rework?.priorBuilderAttemptId, "attempt-01");
+	equal(assignment.assignment.rework?.priorReviewerAttemptId, "attempt-02");
+}, 60_000);
+
+it.sequential("ticket-10 validates a prepared Builder report by promoting first, then finalizing evidence", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-prepared-builder-report-"));
+	roots.push(root);
+	const effects: EffectCounts = { builderPrompts: 0, reviewerPanes: 0, reviewerStarts: 0, reviewerPrompts: 0 };
+	const dependencies = makeDependencies(root, { effectCounts: effects });
+	const started = await startRun(root, dependencies);
+	const prepared = advanceRunJournal(started, new Date("2026-09-18T00:00:01.000Z"), (next) => {
+		const builder = next.run.tasks[0]?.attempts[0];
+		if (!builder || builder.role !== "builder" || builder.dispatch.phase !== "prompted") throw new Error("missing prompted Builder");
+		const dispatch = builder.dispatch;
+		builder.state = "prepared";
+		delete builder.activatedAt;
+		builder.dispatch = { phase: "prompt-intended", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, assignmentSha256: dispatch.assignmentSha256 };
+	});
+	const preparedWrite = await dependencies.runJournal.replaceActive(root, prepared);
+	if (preparedWrite.kind !== "replaced") throw new Error("prepared Builder Journal was not persisted");
+	await writeBuilderReport(root, prepared);
+	let liveInspections = 0;
+	dependencies.herdr.inspectManagedAgent = async () => { liveInspections += 1; return { kind: "missing", diagnostic: "live Builder is gone" }; };
+	const transitions: Array<{ state: string; dispatch: string; evidence: string | undefined }> = [];
+	const replaceActive = dependencies.runJournal.replaceActive.bind(dependencies.runJournal);
+	dependencies.runJournal.replaceActive = async (repositoryRoot, candidate) => {
+		const attempt = candidate.run.tasks[0]?.attempts[0];
+		if (attempt) transitions.push({ state: attempt.state, dispatch: attempt.dispatch.phase, evidence: attempt.evidence?.phase });
+		return replaceActive(repositoryRoot, candidate);
+	};
+	await resumeOnce(root, dependencies);
+	const after = await dependencies.runJournal.loadActive(root);
+	if (after.kind !== "loaded") throw new Error("missing Builder report Journal");
+	const task = after.journal.run.tasks[0]!;
+	const builder = task.attempts[0]!;
+	equal(task.attempts.length, 1);
+	if (builder.role !== "builder") throw new Error("Builder missing after report");
+	equal(builder.state, "reported");
+	equal(builder.dispatch.phase, "reconciled-active");
+	equal(builder.dispatch.basis, "valid-report");
+	equal(builder.evidence?.phase, "finalized");
+	equal(liveInspections, 0);
+	const promotionIndex = transitions.findIndex((entry) => entry.state === "active" && entry.dispatch === "reconciled-active" && entry.evidence === undefined);
+	const finalizationIndex = transitions.findIndex((entry) => entry.state === "active" && entry.dispatch === "reconciled-active" && entry.evidence === "finalization-intended");
+	ok(promotionIndex >= 0);
+	ok(finalizationIndex > promotionIndex);
+	ok(!transitions.some((entry) => entry.state === "prepared" && entry.evidence === "finalization-intended"));
+	equal(effects.builderPrompts, 1);
+	await invoke(root, dependencies, "status");
+	const later = await dependencies.runJournal.loadActive(root);
+	if (later.kind !== "loaded") throw new Error("missing later Builder continuation Journal");
+	equal(later.journal.run.tasks[0]?.attempts.filter((attempt) => attempt.role === "builder").length, 1);
+}, 60_000);
+
+it.sequential("ticket-10 validates a prepared Reviewer report by promoting first, then finalizing evidence", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-review-prepared-reviewer-report-"));
+	roots.push(root);
+	const effects: EffectCounts = { builderPrompts: 0, reviewerPanes: 0, reviewerStarts: 0, reviewerPrompts: 0 };
+	const dependencies = makeDependencies(root, { effectCounts: effects });
+	const started = await startRun(root, dependencies);
+	await writeBuilderReport(root, started);
+	await invoke(root, dependencies, "status");
+	const reviewerDispatch = await dependencies.runJournal.loadActive(root);
+	if (reviewerDispatch.kind !== "loaded") throw new Error("missing Reviewer dispatch");
+	await writeReviewerReport(reviewerDispatch.journal, "approved");
+	const prepared = advanceRunJournal(reviewerDispatch.journal, new Date("2026-09-18T00:00:01.000Z"), (next) => {
+		const reviewer = next.run.tasks[0]?.attempts.at(-1);
+		if (!reviewer || reviewer.role !== "reviewer" || reviewer.dispatch.phase !== "prompted") throw new Error("missing prompted Reviewer");
+		const dispatch = reviewer.dispatch;
+		reviewer.state = "prepared";
+		delete reviewer.activatedAt;
+		reviewer.dispatch = { phase: "prompt-intended", agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, assignmentSha256: dispatch.assignmentSha256 } as unknown as ReviewerAttemptRecord["dispatch"];
+	});
+	const preparedWrite = await dependencies.runJournal.replaceActive(root, prepared);
+	if (preparedWrite.kind !== "replaced") throw new Error("prepared Reviewer Journal was not persisted");
+	let liveInspections = 0;
+	dependencies.herdr.inspectManagedAgent = async () => { liveInspections += 1; return { kind: "missing", diagnostic: "live Reviewer is gone" }; };
+	const transitions: Array<{ state: string; dispatch: string; evidence: string | undefined }> = [];
+	const replaceActive = dependencies.runJournal.replaceActive.bind(dependencies.runJournal);
+	dependencies.runJournal.replaceActive = async (repositoryRoot, candidate) => {
+		const reviewer = candidate.run.tasks[0]?.attempts.at(-1);
+		if (reviewer?.role === "reviewer") transitions.push({ state: reviewer.state, dispatch: reviewer.dispatch.phase, evidence: reviewer.evidence?.phase });
+		return replaceActive(repositoryRoot, candidate);
+	};
+	await resumeOnce(root, dependencies);
+	const after = await dependencies.runJournal.loadActive(root);
+	if (after.kind !== "loaded") throw new Error("missing Reviewer report Journal");
+	const task = after.journal.run.tasks[0]!;
+	const reviewer = task.attempts.at(-1)!;
+	equal(task.attempts.length, 2);
+	if (reviewer.role !== "reviewer") throw new Error("Reviewer missing after report");
+	equal(reviewer.state, "reported");
+	equal(reviewer.dispatch.phase, "reconciled-active");
+	equal(reviewer.dispatch.basis, "valid-report");
+	equal(reviewer.evidence?.phase, "finalized");
+	equal(liveInspections, 0);
+	const promotionIndex = transitions.findIndex((entry) => entry.state === "active" && entry.dispatch === "reconciled-active" && entry.evidence === undefined);
+	const finalizationIndex = transitions.findIndex((entry) => entry.state === "active" && entry.dispatch === "reconciled-active" && entry.evidence === "finalization-intended");
+	ok(promotionIndex >= 0);
+	ok(finalizationIndex > promotionIndex);
+	ok(!transitions.some((entry) => entry.state === "prepared" && entry.evidence === "finalization-intended"));
+	equal(effects.reviewerPrompts, 1);
+	await invoke(root, dependencies, "status");
+	const later = await dependencies.runJournal.loadActive(root);
+	if (later.kind !== "loaded") throw new Error("missing later Reviewer continuation Journal");
+	equal(later.journal.run.tasks[0]?.attempts.filter((attempt) => attempt.role === "reviewer").length, 1);
 }, 60_000);
 
 it.sequential.each([

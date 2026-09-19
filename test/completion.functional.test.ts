@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { createRunJournalAdapter } from "../src/adapters.ts";
 import { registerStewardExtension, type StewardCommandContext, type StewardCommandHandler, type StewardRegistrationSurface } from "../src/extension.ts";
-import { builderAssignmentSha256, deserializeRunJournal, evaluateCompletionGate, type RunDraft, type RunJournal } from "../src/run.ts";
+import { advanceRunJournal, builderAssignmentSha256, deserializeRunJournal, evaluateCompletionGate, type RunDraft, type RunJournal } from "../src/run.ts";
 import { resolveRunJournalPaths } from "../src/run-journal-store.ts";
 import { serializeBuilderAttemptReport, type BuilderAttemptReport } from "../src/attempt-report.ts";
 import { deserializeReviewerAssignment, serializeReviewerAttemptReport, type ReviewerAttemptReport } from "../src/review.ts";
@@ -180,6 +180,46 @@ async function reachIntegrated(root: string, deps: StewardDependencies): Promise
 }
 
 describe("ticket-08 registered completion flow", () => {
+	it("ticket-10 includes a reconciled-active Builder in the stop inventory and archives only after one graceful stop", async () => {
+		const root = await mkdtemp(join(tmpdir(), "steward-t10-reconciled-completion-"));
+		roots.push(root);
+		const effects: { merges: number; processes: number; stops: string[]; notifications: number; state: "base" | "integrated" } = { merges: 0, processes: 0, stops: [], notifications: 0, state: "base" };
+		const deps = dependencies(root, effects);
+		const started = await start(root, deps);
+		await writeBuilder(root, started);
+		await invoke(root, deps, "status");
+		const reviewerDispatch = await deps.runJournal.loadActive(root);
+		if (reviewerDispatch.kind !== "loaded") throw new Error("missing Reviewer dispatch");
+		const reconciled = advanceRunJournal(reviewerDispatch.journal, new Date("2026-09-18T00:00:01.000Z"), (next) => {
+			const attempt = next.run.tasks[0]?.attempts[0];
+			if (!attempt || attempt.role !== "builder" || attempt.dispatch.phase !== "prompted") throw new Error("missing prompted Builder dispatch identity");
+			const dispatch = attempt.dispatch;
+			attempt.dispatch = { phase: "reconciled-active", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, assignmentSha256: dispatch.assignmentSha256, reconciledAt: "2026-09-18T00:00:01.000Z", basis: "valid-report" };
+			attempt.activatedAt = "2026-09-18T00:00:01.000Z";
+		});
+		const replaced = await deps.runJournal.replaceActive(root, reconciled);
+		expect(replaced.kind).toBe("replaced");
+		await writeReviewer(reconciled);
+		const phases: string[] = [];
+		const replaceActive = deps.runJournal.replaceActive.bind(deps.runJournal);
+		deps.runJournal.replaceActive = async (repositoryRoot, candidate) => {
+			if (candidate.run.completion) phases.push(candidate.run.completion.phase);
+			return replaceActive(repositoryRoot, candidate);
+		};
+		let finalView: StatusView | undefined;
+		for (let pass = 0; pass < 8; pass += 1) {
+			finalView = await invoke(root, deps, "status");
+			if (finalView.kind === "present" && "completed" in finalView && finalView.completed) break;
+		}
+		expect(finalView).toMatchObject({ kind: "present", completed: true });
+		expect(phases).toEqual(expect.arrayContaining(["gate-passed", "stops-intended", "stops-complete", "archive-intended"]));
+		expect(effects.stops.filter((name) => name === "steward-b-01234567-01-01")).toHaveLength(1);
+		expect(new Set(effects.stops).size).toBe(effects.stops.length);
+		expect(effects.notifications).toBe(1);
+		expect(await deps.runJournal.probeActive(root)).toBe("missing");
+		expect(await readdir(join(root, ".pi", "steward", "archives"))).toHaveLength(1);
+	}, 60_000);
+
 	it("takes one confirmed Run through integration, verification, stop, archive, and one notification", async () => {
 		const root = await mkdtemp(join(tmpdir(), "steward-t08-flow-"));
 		roots.push(root);
