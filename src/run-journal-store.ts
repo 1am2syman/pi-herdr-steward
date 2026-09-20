@@ -6,7 +6,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
 import { createAttemptEvidenceStore, type BuilderEvidenceInputRequest, type BuilderEvidenceInputs, type FinalizeBuilderEvidenceRequest, type FinalizeBuilderEvidenceResult, type ReferencedEvidenceRequest, type ReferencedEvidenceResult, type ReviewerEvidenceInputRequest, type ReviewerEvidenceInputs, type ReferencedReviewerEvidenceRequest, type ReferencedReviewerEvidenceResult, type FinalizeReviewerEvidenceRequest, type FinalizeReviewerEvidenceResult, type FinalizedManifestLoadResult } from "./attempt-evidence-store.ts";
-import { archiveCompletedRun, finalizeVerificationResult, resolveCompletionPaths, type ArchiveCompletedRunRequest, type ArchiveCompletedRunResult, type CompletionJournalPointers, type CompletionPaths, type VerificationEvidenceInput, type VerificationFinalizeResult } from "./completion-store.ts";
+import { archiveCompletedRun, finalizeVerificationResult, inspectFinalVerificationResult, resolveCompletionPaths, type ArchiveCompletedRunRequest, type ArchiveCompletedRunResult, type CompletionJournalPointers, type CompletionPaths, type FinalVerificationResultInspection, type VerificationEvidenceInput, type VerificationFinalizeResult } from "./completion-store.ts";
 import {
 	ensureProjectStateDirectory,
 	ensureOwnedDirectory,
@@ -87,8 +87,9 @@ export interface RunJournalStore {
 	inspectReferencedReviewerEvidence(input: ReferencedReviewerEvidenceRequest): Promise<ReferencedReviewerEvidenceResult>;
 	finalizeBuilderEvidence(input: FinalizeBuilderEvidenceRequest): Promise<FinalizeBuilderEvidenceResult>;
 	finalizeReviewerEvidence(input: FinalizeReviewerEvidenceRequest): Promise<FinalizeReviewerEvidenceResult>;
-	resolveCompletionPaths(repositoryRoot: string, runId: string): CompletionPaths;
+	resolveCompletionPaths(repositoryRoot: string, runId: string, configDirNameOrAttempt?: string, attemptId?: import("./run.ts").FinalVerificationAttemptId): CompletionPaths;
 	finalizeVerificationResult(input: VerificationEvidenceInput): Promise<VerificationFinalizeResult>;
+	inspectFinalVerificationResult(input: { repositoryRoot: string; runId: string; command: string; cwd: string; attemptId: import("./run.ts").FinalVerificationAttemptId; executionNonce?: string; argvSha256?: string }): Promise<FinalVerificationResultInspection>;
 	archiveCompletedRun(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult>;
 	loadCompletionJournalPointers(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: CompletionJournalPointers } | { kind: "unavailable"; message: string }>;
 }
@@ -522,8 +523,9 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		inspectReferencedReviewerEvidence: evidenceStore.inspectReferencedReviewerEvidence,
 		finalizeBuilderEvidence: evidenceStore.finalizeBuilderEvidence,
 		finalizeReviewerEvidence: evidenceStore.finalizeReviewerEvidence,
-		resolveCompletionPaths: (repositoryRoot, runId) => resolveCompletionPaths(repositoryRoot, runId, configDirName),
+		resolveCompletionPaths: (repositoryRoot, runId, configDirNameOrAttempt, attemptId) => resolveCompletionPaths(repositoryRoot, runId, configDirNameOrAttempt ?? configDirName, attemptId),
 		finalizeVerificationResult,
+		inspectFinalVerificationResult: (input) => inspectFinalVerificationResult({ ...input, configDirName }),
 		archiveCompletedRun: archiveRun,
 		loadCompletionJournalPointers,
 	};

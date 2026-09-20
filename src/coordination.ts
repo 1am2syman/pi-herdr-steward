@@ -36,8 +36,16 @@ function currentIntegrationHead(run: Pick<RunRecord, "integrationBase" | "tasks"
 	let head = run.integrationBase.revision;
 	for (const task of run.tasks) {
 		if (!isCodeTask(task)) continue;
-		if (task.integration?.phase !== "integrated") break;
-		head = task.integration.observedHead;
+		if (task.integration?.phase === "integrated") {
+			head = task.integration.observedHead;
+			continue;
+		}
+		const preserved = task.finalVerificationReworks?.at(-1)?.priorIntegration;
+		if (preserved?.phase === "integrated") {
+			head = preserved.observedHead;
+			continue;
+		}
+		break;
 	}
 	return head;
 }
@@ -115,7 +123,8 @@ export function selectIntegrationQueueHead(run: Pick<RunRecord, "tasks" | "integ
 		const builder = task.attempts.find((attempt) => attempt.role === "builder" && attempt.id === task.approval?.builderAttemptId);
 		if (!builder || builder.evidence?.phase !== "finalized" || builder.evidence.producedRevision !== subject.headRevision) return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: "source" };
 		const recoveryHead = task.integrationRecoveries?.at(-1)?.observed.head;
-		const targetRevision = recoveryHead ?? previousHead;
+		const verificationReworkHead = task.finalVerificationReworks?.at(-1)?.priorIntegration.observedHead;
+		const targetRevision = recoveryHead ?? verificationReworkHead ?? previousHead;
 		return {
 			kind: "ready",
 			taskId: task.contract.id,

@@ -34,6 +34,7 @@ export type TaskAttentionReason =
 	| "final-verification-unexecutable"
 	| "final-verification-failed"
 	| "final-verification-ambiguous"
+	| "final-verification-ownership-unclear"
 	| "verification-dirtied-checkout"
 	| "agent-stop-failed"
 	| "archive-failed"
@@ -273,7 +274,79 @@ export type IntegrationReworkDispatchRecord =
 			basis: "valid-report" | "matching-live-agent";
 	  };
 
-export type BuilderDispatchRecord = DispatchRecord | ReworkDispatchRecord | IntegrationReworkDispatchRecord;
+export interface FinalVerificationReworkFacts {
+	failedCommand: string;
+	failedAttemptId: "verification-01" | "verification-02";
+	failedLogPath: string;
+	failedResultPath: string;
+	failedLogSha256: string;
+	failedResultSha256: string;
+	priorIntegration: Extract<TaskIntegration, { phase: "integrated" }>;
+	priorBuilderAttemptId: string;
+	priorReviewerAttemptId: string;
+}
+
+export type FinalVerificationReworkDispatchRecord =
+	| {
+			phase: "assignment-intended";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			verificationRework: FinalVerificationReworkFacts;
+	  }
+	| {
+			phase: "prompt-intended";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			verificationRework: FinalVerificationReworkFacts;
+			assignmentSha256: string;
+	  }
+	| {
+			phase: "prompted";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			verificationRework: FinalVerificationReworkFacts;
+			assignmentSha256: string;
+			promptedAt: string;
+	  }
+	| {
+			phase: "reconciled-active";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			verificationRework: FinalVerificationReworkFacts;
+			assignmentSha256: string;
+			reconciledAt: string;
+			basis: "valid-report" | "matching-live-agent";
+	  };
+
+export type BuilderDispatchRecord = DispatchRecord | ReworkDispatchRecord | IntegrationReworkDispatchRecord | FinalVerificationReworkDispatchRecord;
 
 export type ReviewerDispatchRecord =
 	| { phase: "pane-intended"; sourcePaneId: string; worktreePath: string; agentName: string; branch: string; workspaceId?: string; paneId?: string; terminalId?: string }
@@ -573,6 +646,7 @@ export interface BuilderAssignmentDocument {
 			herdr: { workspaceId: string; paneId: string; terminalId: string; agentName: string };
 			rework?: ReworkAssignmentFacts;
 			integrationRework?: IntegrationReworkAssignmentFacts;
+			verificationRework?: FinalVerificationReworkFacts;
 			continuation?: AttemptContinuation;
 	};
 }
@@ -606,6 +680,24 @@ export interface IntegrationReworkAssignmentFacts {
 	integrationRecovery: IntegrationReworkFacts;
 }
 
+export interface FinalVerificationReworkRecord {
+	kind: "final-verification-failure";
+	failedExecution: {
+		command: string;
+		attemptId: "verification-01" | "verification-02";
+		exitCode: number;
+		logPath: string;
+		resultPath: string;
+		logSha256: string;
+		resultSha256: string;
+	};
+	priorIntegration: Extract<TaskIntegration, { phase: "integrated" }>;
+	priorBuilderAttemptId: string;
+	priorReviewerAttemptId: string;
+	replacementBuilderAttemptId: string;
+	observedAt: string;
+}
+
 export interface TaskRecord {
 	specificationVersion: 1;
 	specificationHash: string;
@@ -619,6 +711,7 @@ export interface TaskRecord {
 	approval?: TaskApproval;
 	integration?: TaskIntegration;
 	integrationRecoveries?: IntegrationReworkRecord[];
+	finalVerificationReworks?: FinalVerificationReworkRecord[];
 }
 
 export type TaskApproval =
@@ -644,7 +737,7 @@ export type TaskApproval =
 			worktreeSnapshot: ReviewWorktreeSnapshot;
 			verdict: "approved";
 			invalidatedAt: string;
-			reason: "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced";
+			reason: "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced" | "final-verification-failed";
 			diagnostic: string;
 			observedSnapshot?: ReviewWorktreeSnapshot;
 	  };
@@ -713,7 +806,83 @@ export type TaskIntegration =
 	| (ApprovedIntegrationIdentity & { phase: "failed"; intendedAt: string; observedAt: string; exitCode: number | null; diagnostic: string })
 	| (ApprovedIntegrationIdentity & { phase: "ambiguous"; intendedAt: string; observedAt: string; exitCode: number | null; diagnostic: string; observed: IntegrationCheckoutObservation; difference?: IntegrationTargetDifference });
 
+export type FinalVerificationAttemptId = "verification-01" | "verification-02";
+
+export interface FinalVerificationAttemptPaths {
+	runtimeDirectory: string;
+	descriptorPath: string;
+	stdoutPath: string;
+	stderrPath: string;
+	candidateResultPath: string;
+	logPath: string;
+	resultPath: string;
+}
+
+export interface FinalVerificationProcessIdentity {
+	pid: number;
+	startToken: string;
+	executionNonce: string;
+	commandSha256: string;
+	argvSha256: string;
+	launchedAt: string;
+}
+
+export type FinalVerificationAttemptObservation =
+	| { kind: "live"; observedAt: string }
+	| { kind: "inconclusive"; observedAt: string; diagnostic: string }
+	| {
+			kind: "complete";
+			startedAt: string;
+			completedAt: string;
+			exitCode: number;
+			killed: false;
+			logSha256: string;
+			resultSha256: string;
+			checkout: IntegrationCheckoutObservation;
+	  }
+	| { kind: "ambiguous"; observedAt: string; diagnostic: string };
+
+export interface FinalVerificationAttempt {
+	id: FinalVerificationAttemptId;
+	kind: "initial" | "recovery-rerun";
+	intendedAt: string;
+	paths: FinalVerificationAttemptPaths;
+	process?: FinalVerificationProcessIdentity;
+	observation?: FinalVerificationAttemptObservation;
+}
+
+export interface RecoverableFinalVerificationExecution {
+	phase: "executing" | "passed" | "failed" | "ambiguous";
+	command: string;
+	cwd: string;
+	attempts: [FinalVerificationAttempt] | [FinalVerificationAttempt, FinalVerificationAttempt];
+}
+
+type CompleteFinalVerificationObservation = Extract<FinalVerificationAttemptObservation, { kind: "complete" }>;
+type LegacyPassedFinalVerification = {
+	phase: "passed";
+	id: "verification-01";
+	command: string;
+	cwd: string;
+	logPath: string;
+	resultPath: string;
+	intendedAt: string;
+	startedAt: string;
+	completedAt: string;
+	exitCode: number;
+	killed: false;
+	logSha256: string;
+	resultSha256: string;
+	checkout: IntegrationCheckoutObservation;
+};
+
+function managedCompleteObservation(execution: RecoverableFinalVerificationExecution | undefined): CompleteFinalVerificationObservation | undefined {
+	const observation = execution?.attempts.at(-1)?.observation;
+	return observation?.kind === "complete" ? observation : undefined;
+}
+
 export type FinalVerificationExecution =
+	| RecoverableFinalVerificationExecution
 	| {
 			phase: "intended";
 			id: "verification-01";
@@ -945,19 +1114,22 @@ export function evaluateCompletionGate(journal: RunJournal, checkout: Integratio
 	const integrationMatches = Boolean(integration && integration.phase === "integrated" && approval?.phase === "valid" && base.kind === "git" && subject?.kind === "git" && subject.commits.at(-1) === subject.headRevision && base.revision === subject.baseRevision && integration.targetBranch === base.branch && integration.targetRevision === base.revision && integration.approvedBaseRevision === base.revision && integration.approvedBaseRevision === subject.baseRevision && integration.approvedHeadRevision === subject.headRevision && integration.builderAttemptId === approval.builderAttemptId && integration.reviewerAttemptId === approval.reviewerAttemptId && integration.builderManifestSha256 === subject.builderManifestSha256 && integration.reviewerManifestSha256 === approval.reviewerManifestSha256 && integration.action.argv[0] === "merge" && integration.action.argv[1] === "--ff-only" && integration.action.argv[2] === "--no-edit" && integration.action.argv[3] === integration.approvedHeadRevision && JSON.stringify(integration.approvedCommits) === JSON.stringify(subject.commits));
 	if (!integrationMatches) failures.push("the exact approved fast-forward integration identity is required");
 	const execution = journal.run.finalVerificationExecution;
-	if (!execution || execution.phase !== "passed" || journal.run.finalVerification.kind !== "command" || execution.command !== journal.run.finalVerification.command || execution.exitCode !== 0 || execution.killed || !execution.logSha256 || !execution.resultSha256) failures.push("one exact passing final-verification result is required");
+	const managedExecution = isRecoverableFinalVerificationExecution(execution) ? execution : undefined;
+	const terminalExecution = execution && !("attempts" in execution) && execution.phase === "passed" ? execution as LegacyPassedFinalVerification : undefined;
+	const completeObservation = managedCompleteObservation(managedExecution);
+	if (!execution || execution.phase !== "passed" || journal.run.finalVerification.kind !== "command" || execution.command !== journal.run.finalVerification.command || (managedExecution ? !completeObservation || completeObservation.exitCode !== 0 : !terminalExecution || terminalExecution.exitCode !== 0 || terminalExecution.killed || !terminalExecution.logSha256 || !terminalExecution.resultSha256)) failures.push("one exact passing final-verification result is required");
 	if (checkout.branch !== (base.kind === "git" ? base.branch : null) || checkout.head !== (integration?.phase === "integrated" ? integration.approvedHeadRevision : null) || checkout.dirtyPaths.length !== 0 || checkout.operationMarkers.length !== 0 || !checkout.rangeExact) failures.push("the fresh integration checkout must be exact, clean, and marker-free");
 	if (journal.run.status === "completed" || task?.attention !== "none" || approval?.phase !== "valid" || task?.attempts.some((attempt) => attempt.role === "reviewer" && (attempt.reportRepair?.phase === "blocked" || attempt.integrity?.kind === "violated"))) failures.push("no unresolved attention or invalidated evidence may remain");
 	if (failures.length > 0) return { passed: false, failures: failures.slice(0, 8) };
-	const passedExecution = execution as FinalVerificationExecution & { phase: "passed"; resultSha256: string; logSha256: string };
+	const passedExecution = completeObservation ?? terminalExecution;
 	const integrated = integration as Extract<TaskIntegration, { phase: "integrated" }>;
 	return {
 		passed: true,
 		facts: {
 			taskId: task!.contract.id,
 			integratedHead: integrated.approvedHeadRevision,
-			verificationResultSha256: passedExecution.resultSha256,
-			verificationLogSha256: passedExecution.logSha256,
+				verificationResultSha256: passedExecution!.resultSha256,
+				verificationLogSha256: passedExecution!.logSha256,
 			checkout: cloneIntegrationObservation(checkout),
 			predicates: [...COMPLETION_GATE_PREDICATES],
 		},
@@ -968,9 +1140,12 @@ function evaluateMultiCompletionGate(journal: RunJournal, checkout: IntegrationC
 	const failures: string[] = [];
 	const base = journal.run.integrationBase;
 	const execution = journal.run.finalVerificationExecution;
+	const managedExecution = isRecoverableFinalVerificationExecution(execution) ? execution : undefined;
+	const terminalExecution = execution && !("attempts" in execution) && execution.phase === "passed" ? execution as LegacyPassedFinalVerification : undefined;
 	if (base.kind !== "git") failures.push("multi-Task completion requires a git integration base");
 	if (journal.run.status === "completed") failures.push("the Run is already completed");
-	if (!execution || execution.phase !== "passed" || journal.run.finalVerification.kind !== "command" || execution.command !== journal.run.finalVerification.command || execution.exitCode !== 0 || execution.killed || !execution.logSha256 || !execution.resultSha256) failures.push("one exact passing final-verification result is required");
+	const completeObservation = managedCompleteObservation(managedExecution);
+	if (!execution || execution.phase !== "passed" || journal.run.finalVerification.kind !== "command" || execution.command !== journal.run.finalVerification.command || (managedExecution ? !completeObservation || completeObservation.exitCode !== 0 : !terminalExecution || terminalExecution.exitCode !== 0 || terminalExecution.killed || !terminalExecution.logSha256 || !terminalExecution.resultSha256)) failures.push("one exact passing final-verification result is required");
 	let integratedHead = base.kind === "git" ? base.revision : "";
 	const facts: MultiCompletionTaskFacts[] = [];
 	for (const task of journal.run.tasks) {
@@ -998,7 +1173,8 @@ function evaluateMultiCompletionGate(journal: RunJournal, checkout: IntegrationC
 	}
 	if (base.kind === "git" && (checkout.branch !== base.branch || checkout.head !== integratedHead || checkout.dirtyPaths.length !== 0 || checkout.operationMarkers.length !== 0 || !checkout.rangeExact)) failures.push("the fresh integration checkout must be exact, clean, and marker-free");
 	if (failures.length > 0 || !execution || execution.phase !== "passed" || base.kind !== "git") return { passed: false, failures: failures.slice(0, 8) };
-	return { passed: true, facts: { kind: "multi-task", tasks: facts, integratedHead, verificationResultSha256: execution.resultSha256, verificationLogSha256: execution.logSha256, checkout: cloneIntegrationObservation(checkout), predicates: [...MULTI_COMPLETION_GATE_PREDICATES] } };
+	if (!completeObservation && !terminalExecution) return { passed: false, failures: ["one exact passing final-verification result is required"] };
+	return { passed: true, facts: { kind: "multi-task", tasks: facts, integratedHead, verificationResultSha256: completeObservation?.resultSha256 ?? terminalExecution!.resultSha256, verificationLogSha256: completeObservation?.logSha256 ?? terminalExecution!.logSha256, checkout: cloneIntegrationObservation(checkout), predicates: [...MULTI_COMPLETION_GATE_PREDICATES] } };
 }
 
 export interface RunRecord {
@@ -1394,8 +1570,26 @@ function validateAttemptRecovery(value: unknown, path: string, dispatch: { agent
 	return { value: recovery, diagnostics: [] };
 }
 
+function validateFinalVerificationReworkFacts(value: unknown, path: string): { value?: FinalVerificationReworkFacts; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["failedCommand", "failedAttemptId", "failedLogPath", "failedResultPath", "failedLogSha256", "failedResultSha256", "priorIntegration", "priorBuilderAttemptId", "priorReviewerAttemptId"]) || !trimmedString(value.failedCommand) || !["verification-01", "verification-02"].includes(value.failedAttemptId as string) || !absolutePathValue(value.failedLogPath) || !absolutePathValue(value.failedResultPath) || typeof value.failedLogSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.failedLogSha256) || typeof value.failedResultSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.failedResultSha256) || !safeIdentifier(value.priorBuilderAttemptId) || !safeIdentifier(value.priorReviewerAttemptId)) return { diagnostics: [diagnostic("invalid-task", "Final-verification rework facts have invalid exact identity fields.", path)] };
+	const integration = validateTaskIntegration(value.priorIntegration, `${path}.priorIntegration`);
+	if (!integration.value || integration.diagnostics.length > 0 || integration.value.phase !== "integrated") return { diagnostics: [...integration.diagnostics, diagnostic("invalid-task", "Final-verification rework facts require the preserved integrated identity.", `${path}.priorIntegration`)] };
+	return { value: { failedCommand: value.failedCommand, failedAttemptId: value.failedAttemptId as FinalVerificationAttemptId, failedLogPath: value.failedLogPath, failedResultPath: value.failedResultPath, failedLogSha256: value.failedLogSha256, failedResultSha256: value.failedResultSha256, priorIntegration: integration.value, priorBuilderAttemptId: value.priorBuilderAttemptId, priorReviewerAttemptId: value.priorReviewerAttemptId }, diagnostics: [] };
+}
+
 function validateDispatch(value: unknown, path: string): { value?: BuilderDispatchRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Dispatch intent must be a recognized object.", path)] };
+	if ((value.phase === "assignment-intended" || value.phase === "prompt-intended" || value.phase === "prompted" || value.phase === "reconciled-active") && Object.prototype.hasOwnProperty.call(value, "verificationRework")) {
+		const required = ["phase", "branch", "agentName", "worktreePath", "workspaceId", "paneId", "terminalId", "cycle", "priorBuilderAttemptId", "priorReviewerAttemptId", "verificationRework", ...(value.phase === "assignment-intended" ? [] : ["assignmentSha256"]), ...(value.phase === "prompted" ? ["promptedAt"] : []), ...(value.phase === "reconciled-active" ? ["reconciledAt", "basis"] : [])];
+		if (!exactKeys(value, required) || !safeBranch(value.branch) || !herdrName(value.agentName) || !absolutePathValue(value.worktreePath) || !trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId) || !Number.isSafeInteger(value.cycle) || (value.cycle as number) < 1 || !safeIdentifier(value.priorBuilderAttemptId) || !safeIdentifier(value.priorReviewerAttemptId)) return { diagnostics: [diagnostic("invalid-task", "Final-verification rework dispatch has invalid exact identity fields.", path)] };
+		const facts = validateFinalVerificationReworkFacts(value.verificationRework, `${path}.verificationRework`);
+		const diagnostics = [...facts.diagnostics];
+		if (value.phase !== "assignment-intended" && (typeof value.assignmentSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.assignmentSha256))) diagnostics.push(diagnostic("invalid-task", "Final-verification rework prompt dispatch requires an Assignment hash.", `${path}.assignmentSha256`));
+		if (value.phase === "prompted" && !canonicalTimestamp(value.promptedAt)) diagnostics.push(diagnostic("invalid-task", "Final-verification rework prompted dispatch requires a canonical timestamp.", `${path}.promptedAt`));
+		if (value.phase === "reconciled-active" && (!canonicalTimestamp(value.reconciledAt) || !["valid-report", "matching-live-agent"].includes(value.basis as string))) diagnostics.push(diagnostic("invalid-task", "Final-verification rework reconciled dispatch requires a canonical timestamp and basis.", path));
+		if (diagnostics.length > 0 || !facts.value) return { diagnostics };
+		return { value: { phase: value.phase as FinalVerificationReworkDispatchRecord["phase"], branch: value.branch, agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, cycle: value.cycle as number, priorBuilderAttemptId: value.priorBuilderAttemptId, priorReviewerAttemptId: value.priorReviewerAttemptId, verificationRework: facts.value, ...(value.phase !== "assignment-intended" ? { assignmentSha256: value.assignmentSha256 as string } : {}), ...(value.phase === "prompted" ? { promptedAt: value.promptedAt as string } : {}), ...(value.phase === "reconciled-active" ? { reconciledAt: value.reconciledAt as string, basis: value.basis as "valid-report" | "matching-live-agent" } : {}) } as FinalVerificationReworkDispatchRecord, diagnostics: [] };
+	}
 	if ((value.phase === "assignment-intended" || value.phase === "prompt-intended" || value.phase === "prompted" || value.phase === "reconciled-active") && Object.prototype.hasOwnProperty.call(value, "integrationRecovery")) {
 		const required = ["phase", "branch", "agentName", "worktreePath", "workspaceId", "paneId", "terminalId", "cycle", "priorBuilderAttemptId", "priorReviewerAttemptId", "reviewedSubject", "reviewerManifestPath", "reviewerManifestSha256", "integrationRecovery", ...(value.phase === "assignment-intended" ? [] : ["assignmentSha256"]), ...(value.phase === "prompted" ? ["promptedAt"] : []), ...(value.phase === "reconciled-active" ? ["reconciledAt", "basis"] : [])];
 		if (!exactKeys(value, required) || !safeBranch(value.branch) || !herdrName(value.agentName) || !absolutePathValue(value.worktreePath) || !trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId) || !Number.isSafeInteger(value.cycle) || (value.cycle as number) < 1 || !safeIdentifier(value.priorBuilderAttemptId) || !safeIdentifier(value.priorReviewerAttemptId) || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256)) return { diagnostics: [diagnostic("invalid-task", "Integration rework dispatch has invalid exact identity fields.", path)] };
@@ -1737,6 +1931,10 @@ function cloneBuilderDispatch(dispatch: BuilderDispatchRecord): BuilderDispatchR
 		reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject),
 		integrationRecovery: cloneIntegrationReworkFacts(dispatch.integrationRecovery),
 	};
+	if ("verificationRework" in dispatch) return {
+		...dispatch,
+		verificationRework: cloneFinalVerificationReworkFacts(dispatch.verificationRework),
+	};
 	if (dispatch.phase === "assignment-intended" && "cycle" in dispatch) return { ...dispatch, reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject), findings: dispatch.findings.map((finding) => ({ ...finding })) };
 	if ((dispatch.phase === "prompt-intended" || dispatch.phase === "prompted" || dispatch.phase === "reconciled-active") && "cycle" in dispatch) return { ...dispatch, reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject), findings: dispatch.findings.map((finding) => ({ ...finding })) };
 	return cloneDispatch(dispatch as DispatchRecord);
@@ -1844,6 +2042,32 @@ function cloneIntegrationReworkRecord(record: IntegrationReworkRecord): Integrat
 	};
 }
 
+function cloneFinalVerificationReworkFacts(facts: FinalVerificationReworkFacts): FinalVerificationReworkFacts {
+	return {
+		failedCommand: facts.failedCommand,
+		failedAttemptId: facts.failedAttemptId,
+		failedLogPath: facts.failedLogPath,
+		failedResultPath: facts.failedResultPath,
+		failedLogSha256: facts.failedLogSha256,
+		failedResultSha256: facts.failedResultSha256,
+		priorIntegration: cloneIntegration(facts.priorIntegration) as Extract<TaskIntegration, { phase: "integrated" }>,
+		priorBuilderAttemptId: facts.priorBuilderAttemptId,
+		priorReviewerAttemptId: facts.priorReviewerAttemptId,
+	};
+}
+
+function cloneFinalVerificationReworkRecord(record: FinalVerificationReworkRecord): FinalVerificationReworkRecord {
+	return {
+		kind: "final-verification-failure",
+		failedExecution: { ...record.failedExecution },
+		priorIntegration: cloneIntegration(record.priorIntegration) as Extract<TaskIntegration, { phase: "integrated" }>,
+		priorBuilderAttemptId: record.priorBuilderAttemptId,
+		priorReviewerAttemptId: record.priorReviewerAttemptId,
+		replacementBuilderAttemptId: record.replacementBuilderAttemptId,
+		observedAt: record.observedAt,
+	};
+}
+
 function cloneApprovedIntegrationIdentity(identity: ApprovedIntegrationIdentity): ApprovedIntegrationIdentity {
 	const action = identity.action.kind === "fast-forward"
 		? { kind: "fast-forward" as const, argv: [...identity.action.argv] as ["merge", "--ff-only", "--no-edit", string] }
@@ -1872,9 +2096,14 @@ function cloneIntegration(integration: TaskIntegration): TaskIntegration {
 }
 
 function cloneVerificationExecution(execution: FinalVerificationExecution): FinalVerificationExecution {
+	if ("attempts" in execution) return { ...execution, attempts: execution.attempts.map((attempt) => ({ ...attempt, paths: { ...attempt.paths }, ...(attempt.process ? { process: { ...attempt.process } } : {}), ...(attempt.observation ? { observation: attempt.observation.kind === "complete" ? { ...attempt.observation, checkout: cloneIntegrationObservation(attempt.observation.checkout) } : { ...attempt.observation } } : {}) })) as RecoverableFinalVerificationExecution["attempts"] };
 	if (execution.phase === "intended") return { ...execution };
 	if (execution.phase === "ambiguous") return { ...execution, ...(execution.checkout ? { checkout: cloneIntegrationObservation(execution.checkout) } : {}) };
 	return { ...execution, checkout: cloneIntegrationObservation(execution.checkout) };
+}
+
+export function isRecoverableFinalVerificationExecution(execution: FinalVerificationExecution | undefined): execution is RecoverableFinalVerificationExecution {
+	return Boolean(execution && "attempts" in execution);
 }
 
 function cloneCompletionResource(resource: CompletionStopResource): CompletionStopResource {
@@ -2093,12 +2322,12 @@ function validateTaskApproval(value: unknown, path: string): { value?: TaskAppro
 		const snapshot = validateReviewSnapshot(value.worktreeSnapshot, `${path}.worktreeSnapshot`);
 		return subject.value && snapshot.value && subject.diagnostics.length === 0 && snapshot.diagnostics.length === 0 ? { value: { phase: "valid", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved" }, diagnostics: [] } : { diagnostics: [...subject.diagnostics, ...snapshot.diagnostics] };
 	}
-	if (value.phase !== "invalidated" || !exactKeys(value, [...baseKeys, "invalidatedAt", "reason", "diagnostic", ...(Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? ["observedSnapshot"] : [])]) || !canonicalTimestamp(value.approvedAt) || !canonicalTimestamp(value.invalidatedAt) || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || value.verdict !== "approved" || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !["head-changed", "dirty-state-changed", "subject-changed", "evidence-changed", "approval-invalid", "target-advanced"].includes(value.reason as string) || !boundedText(value.diagnostic, 2_000)) return { diagnostics: [diagnostic("invalid-task", "Invalidated approval has invalid exact fields.", path)] };
+	if (value.phase !== "invalidated" || !exactKeys(value, [...baseKeys, "invalidatedAt", "reason", "diagnostic", ...(Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? ["observedSnapshot"] : [])]) || !canonicalTimestamp(value.approvedAt) || !canonicalTimestamp(value.invalidatedAt) || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || value.verdict !== "approved" || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !["head-changed", "dirty-state-changed", "subject-changed", "evidence-changed", "approval-invalid", "target-advanced", "final-verification-failed"].includes(value.reason as string) || !boundedText(value.diagnostic, 2_000)) return { diagnostics: [diagnostic("invalid-task", "Invalidated approval has invalid exact fields.", path)] };
 	const subject = validateReviewSubject(value.subject, `${path}.subject`);
 	const snapshot = validateReviewSnapshot(value.worktreeSnapshot, `${path}.worktreeSnapshot`);
 	const observed = Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? validateReviewSnapshot(value.observedSnapshot, `${path}.observedSnapshot`) : { diagnostics: [] };
 	if (!subject.value || !snapshot.value || subject.diagnostics.length > 0 || snapshot.diagnostics.length > 0 || observed.diagnostics.length > 0) return { diagnostics: [...subject.diagnostics, ...snapshot.diagnostics, ...observed.diagnostics] };
-	return { value: { phase: "invalidated", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved", invalidatedAt: value.invalidatedAt, reason: value.reason as "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced", diagnostic: value.diagnostic, ...(observed.value ? { observedSnapshot: observed.value } : {}) }, diagnostics: [] };
+	return { value: { phase: "invalidated", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved", invalidatedAt: value.invalidatedAt, reason: value.reason as "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced" | "final-verification-failed", diagnostic: value.diagnostic, ...(observed.value ? { observedSnapshot: observed.value } : {}) }, diagnostics: [] };
 }
 
 function validateIntegrationObservation(value: unknown, path: string): { value?: IntegrationCheckoutObservation; diagnostics: RunDiagnostic[] } {
@@ -2171,6 +2400,15 @@ function validateIntegrationReworkRecord(value: unknown, path: string): { value?
 	return { value: { ...identity.value, kind: "advanced-target-conflict", ...(intendedAt ? { intendedAt } : {}), ...(retryIntendedAt ? { retryIntendedAt } : {}), observedAt: value.observedAt, observed: observed.value, difference: difference.value, conflictPaths: [...facts.value!.conflictPaths], replacementBuilderAttemptId: value.replacementBuilderAttemptId }, diagnostics: [] };
 }
 
+function validateFinalVerificationReworkRecord(value: unknown, path: string): { value?: FinalVerificationReworkRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["kind", "failedExecution", "priorIntegration", "priorBuilderAttemptId", "priorReviewerAttemptId", "replacementBuilderAttemptId", "observedAt"]) || value.kind !== "final-verification-failure" || !canonicalTimestamp(value.observedAt) || !safeIdentifier(value.priorBuilderAttemptId) || !safeIdentifier(value.priorReviewerAttemptId) || !safeIdentifier(value.replacementBuilderAttemptId)) return { diagnostics: [diagnostic("invalid-task", "Final-verification rework history has invalid exact identity fields.", path)] };
+	const failed = value.failedExecution;
+	if (!isRecord(failed) || !exactKeys(failed, ["command", "attemptId", "exitCode", "logPath", "resultPath", "logSha256", "resultSha256"]) || !trimmedString(failed.command) || !["verification-01", "verification-02"].includes(failed.attemptId as string) || typeof failed.exitCode !== "number" || !Number.isSafeInteger(failed.exitCode) || failed.exitCode === 0 || !absolutePathValue(failed.logPath) || !absolutePathValue(failed.resultPath) || typeof failed.logSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(failed.logSha256) || typeof failed.resultSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(failed.resultSha256)) return { diagnostics: [diagnostic("invalid-task", "Final-verification rework failed evidence is invalid.", `${path}.failedExecution`)] };
+	const integration = validateTaskIntegration(value.priorIntegration, `${path}.priorIntegration`);
+	if (!integration.value || integration.value.phase !== "integrated" || integration.diagnostics.length > 0) return { diagnostics: [...integration.diagnostics, diagnostic("invalid-task", "Final-verification rework must preserve an integrated prior identity.", `${path}.priorIntegration`)] };
+	return { value: { kind: "final-verification-failure", failedExecution: { command: failed.command, attemptId: failed.attemptId as FinalVerificationAttemptId, exitCode: failed.exitCode, logPath: failed.logPath, resultPath: failed.resultPath, logSha256: failed.logSha256, resultSha256: failed.resultSha256 }, priorIntegration: integration.value, priorBuilderAttemptId: value.priorBuilderAttemptId, priorReviewerAttemptId: value.priorReviewerAttemptId, replacementBuilderAttemptId: value.replacementBuilderAttemptId, observedAt: value.observedAt }, diagnostics: [] };
+}
+
 function validateTaskIntegration(value: unknown, path: string): { value?: TaskIntegration; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Task integration must be a recognized phase record.", path)] };
 	const identity = validateApprovedIntegrationIdentity(value, path);
@@ -2189,6 +2427,7 @@ function validateTaskIntegration(value: unknown, path: string): { value?: TaskIn
 
 function validateFinalVerificationExecution(value: unknown, path: string, finalVerification: Verification): { value?: FinalVerificationExecution; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-run", "Final verification execution must be a recognized phase record.", path)] };
+	if (Object.prototype.hasOwnProperty.call(value, "attempts")) return validateRecoverableFinalVerificationExecution(value, path, finalVerification);
 	const common = ["id", "command", "cwd", "logPath", "resultPath"];
 	const command = finalVerification.kind === "command" ? finalVerification.command : undefined;
 	const validCommon = value.id === "verification-01" && typeof value.command === "string" && value.command === command && absolutePathValue(value.cwd) && absolutePathValue(value.logPath) && absolutePathValue(value.resultPath) && value.logPath.endsWith("/completion/final-verification/verification-01/output.log") && value.resultPath.endsWith("/completion/final-verification/verification-01/result.json");
@@ -2208,6 +2447,68 @@ function validateFinalVerificationExecution(value: unknown, path: string, finalV
 		return { value: { phase: "ambiguous", id: "verification-01", ...commonValues, intendedAt: value.intendedAt, observedAt: value.observedAt, exitCode: value.exitCode, killed: value.killed, diagnostic: value.diagnostic, ...(typeof value.logSha256 === "string" ? { logSha256: value.logSha256 } : {}), ...(typeof value.resultSha256 === "string" ? { resultSha256: value.resultSha256 } : {}), ...(checkout.value ? { checkout: checkout.value } : {}) }, diagnostics: [] };
 	}
 	return { diagnostics: [diagnostic("invalid-run", "Final verification execution has invalid exact phase fields.", path)] };
+}
+
+function validateFinalVerificationAttemptPaths(value: unknown, path: string, id: FinalVerificationAttemptId): { value?: FinalVerificationAttemptPaths; diagnostics: RunDiagnostic[] } {
+	const keys = ["runtimeDirectory", "descriptorPath", "stdoutPath", "stderrPath", "candidateResultPath", "logPath", "resultPath"];
+	if (!isRecord(value) || !exactKeys(value, keys) || keys.some((key) => !absolutePathValue(value[key]))) return { diagnostics: [diagnostic("invalid-run", "Managed final-verification attempt paths must be absolute and exact.", path)] };
+	const root = `/completion/final-verification/${id}/`;
+	const names: Record<string, string> = {
+		runtimeDirectory: `${root}runtime`,
+		descriptorPath: `${root}runtime/descriptor.json`,
+		stdoutPath: `${root}runtime/stdout`,
+		stderrPath: `${root}runtime/stderr`,
+		candidateResultPath: `${root}runtime/candidate-result.json`,
+		logPath: `${root}output.log`,
+		resultPath: `${root}result.json`,
+	};
+	if (keys.some((key) => !(value[key] as string).endsWith(names[key]!))) return { diagnostics: [diagnostic("invalid-run", "Managed final-verification paths must remain in the deterministic attempt tree.", path)] };
+	const paths = keys.map((key) => value[key] as string);
+	if (new Set(paths).size !== paths.length || paths.some((item) => item.includes("/../") || item.endsWith("/.."))) return { diagnostics: [diagnostic("invalid-run", "Managed final-verification paths must be distinct and contained.", path)] };
+	return { value: { runtimeDirectory: value.runtimeDirectory as string, descriptorPath: value.descriptorPath as string, stdoutPath: value.stdoutPath as string, stderrPath: value.stderrPath as string, candidateResultPath: value.candidateResultPath as string, logPath: value.logPath as string, resultPath: value.resultPath as string }, diagnostics: [] };
+}
+
+function validateFinalVerificationAttempt(value: unknown, path: string, index: number, finalVerification: Verification): { value?: FinalVerificationAttempt; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.id !== "string" || !["verification-01", "verification-02"].includes(value.id) || (index === 0 && (value.id !== "verification-01" || value.kind !== "initial")) || (index === 1 && (value.id !== "verification-02" || value.kind !== "recovery-rerun")) || !exactKeys(value, ["id", "kind", "intendedAt", "paths", ...(Object.prototype.hasOwnProperty.call(value, "process") ? ["process"] : []), ...(Object.prototype.hasOwnProperty.call(value, "observation") ? ["observation"] : [])]) || !canonicalTimestamp(value.intendedAt)) return { diagnostics: [diagnostic("invalid-run", "Managed final-verification attempts have invalid ordered identity or timestamps.", path)] };
+	const id = value.id as FinalVerificationAttemptId;
+	const paths = validateFinalVerificationAttemptPaths(value.paths, `${path}.paths`, id);
+	const diagnostics = [...paths.diagnostics];
+	let processIdentity: FinalVerificationProcessIdentity | undefined;
+	if (Object.prototype.hasOwnProperty.call(value, "process")) {
+		const process = value.process;
+		if (!isRecord(process) || !exactKeys(process, ["pid", "startToken", "executionNonce", "commandSha256", "argvSha256", "launchedAt"]) || typeof process.pid !== "number" || !Number.isSafeInteger(process.pid) || process.pid <= 0 || !boundedText(process.startToken, 256) || !boundedText(process.executionNonce, 256) || typeof process.commandSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(process.commandSha256) || typeof process.argvSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(process.argvSha256) || !canonicalTimestamp(process.launchedAt) || process.launchedAt < value.intendedAt || (finalVerification.kind === "command" && process.commandSha256 !== `sha256:${createHash("sha256").update(finalVerification.command, "utf8").digest("hex")}`)) diagnostics.push(diagnostic("invalid-run", "Managed final-verification process identity is invalid or does not bind the frozen command.", `${path}.process`));
+		else processIdentity = { pid: process.pid, startToken: process.startToken, executionNonce: process.executionNonce, commandSha256: process.commandSha256, argvSha256: process.argvSha256, launchedAt: process.launchedAt };
+	}
+	let observation: FinalVerificationAttemptObservation | undefined;
+	if (Object.prototype.hasOwnProperty.call(value, "observation")) {
+		const raw = value.observation;
+		if (!isRecord(raw) || typeof raw.kind !== "string") diagnostics.push(diagnostic("invalid-run", "Managed final-verification observation is invalid.", `${path}.observation`));
+		else if (raw.kind === "live" && exactKeys(raw, ["kind", "observedAt"]) && canonicalTimestamp(raw.observedAt) && raw.observedAt >= value.intendedAt) observation = { kind: "live", observedAt: raw.observedAt };
+		else if (raw.kind === "inconclusive" && exactKeys(raw, ["kind", "observedAt", "diagnostic"]) && canonicalTimestamp(raw.observedAt) && raw.observedAt >= value.intendedAt && boundedText(raw.diagnostic, 2_000)) observation = { kind: "inconclusive", observedAt: raw.observedAt, diagnostic: raw.diagnostic };
+		else if (raw.kind === "ambiguous" && exactKeys(raw, ["kind", "observedAt", "diagnostic"]) && canonicalTimestamp(raw.observedAt) && raw.observedAt >= value.intendedAt && boundedText(raw.diagnostic, 2_000)) observation = { kind: "ambiguous", observedAt: raw.observedAt, diagnostic: raw.diagnostic };
+		else if (raw.kind === "complete" && exactKeys(raw, ["kind", "startedAt", "completedAt", "exitCode", "killed", "logSha256", "resultSha256", "checkout"]) && canonicalTimestamp(raw.startedAt) && canonicalTimestamp(raw.completedAt) && raw.startedAt >= value.intendedAt && raw.completedAt >= raw.startedAt && typeof raw.exitCode === "number" && Number.isSafeInteger(raw.exitCode) && raw.killed === false && typeof raw.logSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(raw.logSha256) && typeof raw.resultSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(raw.resultSha256)) {
+			const checkout = validateIntegrationObservation(raw.checkout, `${path}.observation.checkout`);
+			if (checkout.value && checkout.diagnostics.length === 0) observation = { kind: "complete", startedAt: raw.startedAt, completedAt: raw.completedAt, exitCode: raw.exitCode, killed: false, logSha256: raw.logSha256, resultSha256: raw.resultSha256, checkout: checkout.value };
+			else diagnostics.push(...checkout.diagnostics);
+		} else diagnostics.push(diagnostic("invalid-run", "Managed final-verification observation has invalid exact fields.", `${path}.observation`));
+	}
+	if (diagnostics.length > 0 || !paths.value) return { diagnostics };
+	return { value: { id, kind: value.kind as "initial" | "recovery-rerun", intendedAt: value.intendedAt, paths: paths.value, ...(processIdentity ? { process: processIdentity } : {}), ...(observation ? { observation } : {}) }, diagnostics: [] };
+}
+
+function validateRecoverableFinalVerificationExecution(value: Record<string, unknown>, path: string, finalVerification: Verification): { value?: RecoverableFinalVerificationExecution; diagnostics: RunDiagnostic[] } {
+	if (!["executing", "passed", "failed", "ambiguous"].includes(value.phase as string) || !exactKeys(value, ["phase", "command", "cwd", "attempts"]) || finalVerification.kind !== "command" || value.command !== finalVerification.command || !absolutePathValue(value.cwd) || !Array.isArray(value.attempts) || (value.attempts.length !== 1 && value.attempts.length !== 2)) return { diagnostics: [diagnostic("invalid-run", "Managed final-verification execution must bind the frozen command, cwd, and one or two ordered attempts.", path)] };
+	const attempts = value.attempts.map((attempt, index) => validateFinalVerificationAttempt(attempt, `${path}.attempts[${index}]`, index, finalVerification));
+	const diagnostics = attempts.flatMap((result) => result.diagnostics);
+	if (!attempts.every((result) => result.value) || diagnostics.length > 0) return { diagnostics };
+	const values = attempts.map((result) => result.value!) as [FinalVerificationAttempt] | [FinalVerificationAttempt, FinalVerificationAttempt];
+	if (new Set(values.flatMap((attempt) => Object.values(attempt.paths))).size !== values.length * 7) diagnostics.push(diagnostic("invalid-run", "Managed final-verification attempt paths must not alias.", path));
+	const last = values.at(-1)!;
+	if (value.phase === "passed" || value.phase === "failed") {
+		if (last.observation?.kind !== "complete" || (value.phase === "passed" && last.observation.exitCode !== 0) || (value.phase === "failed" && last.observation.exitCode === 0) || last.observation.checkout.dirtyPaths.length > 0 || last.observation.checkout.operationMarkers.length > 0 || !last.observation.checkout.rangeExact) diagnostics.push(diagnostic("invalid-run", "Managed terminal final-verification execution must bind a complete clean checkout result.", path));
+	} else if (value.phase === "ambiguous" && last.observation?.kind === "complete" && last.observation.checkout.dirtyPaths.length === 0 && last.observation.checkout.operationMarkers.length === 0 && last.observation.checkout.rangeExact) diagnostics.push(diagnostic("invalid-run", "Managed ambiguous final-verification execution cannot contain a conclusive clean result.", path));
+	if (diagnostics.length > 0) return { diagnostics };
+	return { value: { phase: value.phase as RecoverableFinalVerificationExecution["phase"], command: value.command, cwd: value.cwd, attempts: values }, diagnostics: [] };
 }
 
 function validateCompletionGate(value: unknown, path: string): { value?: AnyCompletionGateFacts; diagnostics: RunDiagnostic[] } {
@@ -2345,11 +2646,15 @@ function validateCompletion(value: unknown, path: string): { value?: CompletionR
 }
 
 function isReworkDispatch(value: BuilderDispatchRecord): value is ReworkDispatchRecord {
-	return "cycle" in value;
+	return "cycle" in value && "findings" in value;
 }
 
 function isIntegrationReworkDispatch(value: BuilderDispatchRecord): value is IntegrationReworkDispatchRecord {
 	return "integrationRecovery" in value;
+}
+
+function isFinalVerificationReworkDispatch(value: BuilderDispatchRecord): value is FinalVerificationReworkDispatchRecord {
+	return "verificationRework" in value;
 }
 
 function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<string, unknown>, contract: TaskContract | undefined, modelPlans: ProjectModelPlans | undefined, path: string, diagnostics: RunDiagnostic[]): void {
@@ -2437,7 +2742,7 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 					if (attemptFacts.worktreePath !== predecessorFacts.worktreePath || attemptFacts.branch !== predecessorFacts.branch || !sourcePaneMatches || !reviewerFactsMatch) diagnostics.push(diagnostic("invalid-task", "Replacement must retain the predecessor identity, subject, worktree, and branch facts.", `${path}.attempts[${index}]`));
 		}
 		if (index === 0 && attempt.role === "builder" && isReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "The first Builder Attempt must use the initial dispatch variant.", `${path}.attempts[${index}].dispatch`));
-		if (index > 0 && attempt.role === "builder" && !isReplacement && !isReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "Later non-replacement Builder Attempts must use the rework dispatch variant.", `${path}.attempts[${index}].dispatch`));
+		if (index > 0 && attempt.role === "builder" && !isReplacement && !isReworkDispatch(attempt.dispatch) && !isFinalVerificationReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "Later non-replacement Builder Attempts must use a recorded rework dispatch variant.", `${path}.attempts[${index}].dispatch`));
 		if (attempt.role === "reviewer" && index > 0 && !isReplacement) {
 			const preceding = attempts[index - 1];
 			if (preceding?.role !== "builder" || preceding.state === "prepared" || preceding.evidence?.phase !== "finalized" || !reviewSubjectBindsBuilder(attempt.subject, preceding)) diagnostics.push(diagnostic("invalid-task", "Each Reviewer must bind the immediately preceding finalized Builder subject.", `${path}.attempts[${index}]`));
@@ -2468,9 +2773,21 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 					: !integrationRework;
 				if (!priorBuilder || priorBuilder.role !== "builder" || !priorReviewer || priorReviewer.role !== "reviewer" || priorReviewer.state !== "reported" || (!priorReviewApproved && !priorReviewChangesRequired) || attempt.dispatch.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.priorReviewerAttemptId !== priorReviewer.id || attempt.dispatch.cycle !== expectedCycle || !reviewSubjectsEqual(attempt.dispatch.reviewedSubject, priorReviewer.subject) || !sameReviewEvidence || !sameBuilder || !baseMatchesRecovery || !recoveryBinding) diagnostics.push(diagnostic("invalid-task", integrationRework ? "Integration rework Builder backlinks, approved evidence, subject, same-Builder identity, advanced base, recovery record, and cycle must match the preceding approved Review." : "Rework Builder backlinks, protected evidence, subject, identity, and logical lineage cycle must match the preceding changes-required Review.", `${path}.attempts[${index}]`));
 			}
+		if (attempt.role === "builder" && index > 0 && isFinalVerificationReworkDispatch(attempt.dispatch)) {
+			const priorReviewer = attempts[index - 1];
+			let priorBuilder: BuilderAttemptRecord | undefined;
+			for (let priorIndex = index - 2; priorIndex >= 0; priorIndex -= 1) {
+				if (attempts[priorIndex]?.role === "builder") { priorBuilder = attempts[priorIndex] as BuilderAttemptRecord; break; }
+			}
+			const priorDispatch = priorBuilder?.dispatch;
+			const sameBuilder = priorDispatch && (priorDispatch.phase === "prompted" || priorDispatch.phase === "reconciled-active") && attempt.dispatch.branch === priorDispatch.branch && attempt.dispatch.agentName === priorDispatch.agentName && attempt.dispatch.worktreePath === priorDispatch.worktreePath && attempt.dispatch.workspaceId === priorDispatch.workspaceId && attempt.dispatch.paneId === priorDispatch.paneId && attempt.dispatch.terminalId === priorDispatch.terminalId;
+			const expectedCycle = attempts.slice(0, index).filter((candidate) => candidate.role === "builder" && candidate.replacement === undefined && (isReworkDispatch(candidate.dispatch) || isFinalVerificationReworkDispatch(candidate.dispatch))).length + 1;
+			if (!priorBuilder || priorReviewer?.role !== "reviewer" || priorReviewer.state !== "reported" || priorReviewer.evidence?.phase !== "finalized" || priorReviewer.evidence.verdict !== "approved" || attempt.dispatch.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.priorReviewerAttemptId !== priorReviewer.id || attempt.dispatch.cycle !== expectedCycle || attempt.dispatch.verificationRework.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.verificationRework.priorReviewerAttemptId !== priorReviewer.id || !sameBuilder || attempt.baseRevision !== attempt.dispatch.verificationRework.priorIntegration.observedHead) diagnostics.push(diagnostic("invalid-task", "Final-verification rework must preserve the exact approved lineage, same Builder identity, and prior integrated head.", `${path}.attempts[${index}].dispatch`));
 		}
+	}
 		const expectedRework = attempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && isReworkDispatch(attempt.dispatch)).length;
-	if ((rawTask.reworkCycles as unknown) !== expectedRework) diagnostics.push(diagnostic("invalid-task", "reworkCycles must equal the number of rework Builder Attempts.", `${path}.reworkCycles`));
+		const expectedFinalVerificationRework = attempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && isFinalVerificationReworkDispatch(attempt.dispatch)).length;
+	if ((rawTask.reworkCycles as unknown) !== expectedRework + expectedFinalVerificationRework) diagnostics.push(diagnostic("invalid-task", "reworkCycles must equal the number of rework Builder Attempts.", `${path}.reworkCycles`));
 	if (attempts.length > 20) diagnostics.push(diagnostic("invalid-task", "A Task allows a bounded alternating history plus silent replacements.", `${path}.attempts`));
 	const replacementOrdinals = attempts.flatMap((attempt) => attempt.replacement ? [attempt.replacement.retryOrdinal] : []);
 	if (new Set(replacementOrdinals).size !== replacementOrdinals.length || replacementOrdinals.some((ordinal, index) => ordinal !== index + 1)) diagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals must be unique and derive from the ordered Attempt links.", `${path}.attempts`));
@@ -2652,9 +2969,10 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		const hasApproval = Object.prototype.hasOwnProperty.call(task, "approval");
 		const hasIntegration = Object.prototype.hasOwnProperty.call(task, "integration");
 		const hasIntegrationRecoveries = Object.prototype.hasOwnProperty.call(task, "integrationRecoveries");
+		const hasFinalVerificationReworks = Object.prototype.hasOwnProperty.call(task, "finalVerificationReworks");
 		const hasAttentionDiagnostic = Object.prototype.hasOwnProperty.call(task, "attentionDiagnostic");
 		const hasAttentionReason = Object.prototype.hasOwnProperty.call(task, "attentionReason");
-		if (!exactKeys(task, ["specificationVersion", "specificationHash", "contract", "phase", "attention", ...(hasAttentionDiagnostic ? ["attentionDiagnostic"] : []), ...(hasAttentionReason ? ["attentionReason"] : []), "attempts", "reworkCycles", ...(hasApproval ? ["approval"] : []), ...(hasIntegration ? ["integration"] : []), ...(hasIntegrationRecoveries ? ["integrationRecoveries"] : [])])) {
+		if (!exactKeys(task, ["specificationVersion", "specificationHash", "contract", "phase", "attention", ...(hasAttentionDiagnostic ? ["attentionDiagnostic"] : []), ...(hasAttentionReason ? ["attentionReason"] : []), "attempts", "reworkCycles", ...(hasApproval ? ["approval"] : []), ...(hasIntegration ? ["integration"] : []), ...(hasIntegrationRecoveries ? ["integrationRecoveries"] : []), ...(hasFinalVerificationReworks ? ["finalVerificationReworks"] : [])])) {
 			diagnostics.push(diagnostic("invalid-task", "Task contains unknown or missing initialization keys.", taskPath));
 			continue;
 		}
@@ -2679,12 +2997,27 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 				: { diagnostics: [diagnostic("invalid-task", "integrationRecoveries must be an ordered array.", `${taskPath}.integrationRecoveries`)] }
 			: { diagnostics: [] };
 		taskDiagnostics.push(...integrationRecoveriesResult.diagnostics);
+		const finalVerificationReworksResult: { value?: FinalVerificationReworkRecord[]; diagnostics: RunDiagnostic[] } = hasFinalVerificationReworks
+			? Array.isArray(task.finalVerificationReworks)
+				? (() => {
+					const records: FinalVerificationReworkRecord[] = [];
+					const reworkDiagnostics: RunDiagnostic[] = [];
+					for (let reworkIndex = 0; reworkIndex < task.finalVerificationReworks.length; reworkIndex += 1) {
+						const result = validateFinalVerificationReworkRecord(task.finalVerificationReworks[reworkIndex], `${taskPath}.finalVerificationReworks[${reworkIndex}]`);
+						if (result.value) records.push(result.value);
+						reworkDiagnostics.push(...result.diagnostics);
+					}
+					return reworkDiagnostics.length > 0 ? { diagnostics: reworkDiagnostics } : { value: records, diagnostics: [] };
+				})()
+				: { diagnostics: [diagnostic("invalid-task", "finalVerificationReworks must be an ordered array.", `${taskPath}.finalVerificationReworks`)] }
+			: { diagnostics: [] };
+		taskDiagnostics.push(...finalVerificationReworksResult.diagnostics);
 		if (task.specificationVersion !== 1) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationVersion must be 1.", `${taskPath}.specificationVersion`));
 		if (typeof task.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(task.specificationHash) || (contractResult.value && specificationHash(contractResult.value) !== task.specificationHash)) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationHash does not match its exact contract.", `${taskPath}.specificationHash`));
 		const settingsLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.reworkCycleLimit) ? value.effectiveSettings.reworkCycleLimit as number : 5;
 		if (!["pending", "building", "reviewing", "reworking", "approved", "integrating", "completed"].includes(task.phase as string) || !["none", "blocked", "waiting-external", "suspected-stall", "recovering", "needs-user"].includes(task.attention as string) || !Array.isArray(task.attempts) || !Number.isSafeInteger(task.reworkCycles) || (task.reworkCycles as number) < 0 || (task.reworkCycles as number) > 5 || (task.reworkCycles as number) > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Task has an invalid phase, attention, Attempt sequence, or bounded rework counter.", taskPath));
 		if (hasAttentionDiagnostic && (!boundedText(task.attentionDiagnostic, 2_000) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionDiagnostic must be bounded and accompany durable attention.", `${taskPath}.attentionDiagnostic`));
-		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted", "review-approval-required", "integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed", "reconciliation-blocked-question", "reconciliation-report-missing", "reconciliation-live-unclear", "reconciliation-agent-missing", "silence-passive-inspection", "external-process-live", "external-process-grace", "silence-effect-ambiguous", "silence-recovery-exhausted", "transient-infrastructure-recovery", "transient-stop-ambiguous", "transient-fallback-unavailable", "transient-retries-exhausted"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
+		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted", "review-approval-required", "integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "final-verification-ownership-unclear", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed", "reconciliation-blocked-question", "reconciliation-report-missing", "reconciliation-live-unclear", "reconciliation-agent-missing", "silence-passive-inspection", "external-process-live", "external-process-grace", "silence-effect-ambiguous", "silence-recovery-exhausted", "transient-infrastructure-recovery", "transient-stop-ambiguous", "transient-fallback-unavailable", "transient-retries-exhausted"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
 		const attempts: AttemptRecord[] = [];
 		if (Array.isArray(task.attempts)) {
 			if (task.attempts.length > 20) taskDiagnostics.push(diagnostic("invalid-task", "A Task allows at most the initial pair plus five rework/review cycles and bounded silent replacements.", `${taskPath}.attempts`));
@@ -2709,6 +3042,15 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		}
 		const integrationReworkAttempts = attempts.filter((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder" && attempt.replacement === undefined && isIntegrationReworkDispatch(attempt.dispatch));
 		if (integrationReworkAttempts.length !== integrationRecoveries.length) taskDiagnostics.push(diagnostic("invalid-task", "Every integration-rework Builder Attempt must have exactly one retained IntegrationReworkRecord.", `${taskPath}.integrationRecoveries`));
+		const finalVerificationReworks = finalVerificationReworksResult.value ?? [];
+		if (finalVerificationReworks.length > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Final-verification rework history cannot exceed the frozen rework cycle limit.", `${taskPath}.finalVerificationReworks`));
+		if (new Set(finalVerificationReworks.map((record) => record.replacementBuilderAttemptId)).size !== finalVerificationReworks.length) taskDiagnostics.push(diagnostic("invalid-task", "Final-verification rework replacement Builder Attempt IDs must be unique.", `${taskPath}.finalVerificationReworks`));
+		for (const recovery of finalVerificationReworks) {
+			const replacement = attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === recovery.replacementBuilderAttemptId && attempt.role === "builder");
+			if (!replacement || !isFinalVerificationReworkDispatch(replacement.dispatch) || replacement.dispatch.verificationRework.failedResultSha256 !== recovery.failedExecution.resultSha256 || replacement.dispatch.verificationRework.priorBuilderAttemptId !== recovery.priorBuilderAttemptId || replacement.dispatch.verificationRework.priorReviewerAttemptId !== recovery.priorReviewerAttemptId) taskDiagnostics.push(diagnostic("invalid-task", "Final-verification rework must bind its appended same-Builder Attempt and preserved failed evidence exactly.", `${taskPath}.finalVerificationReworks`));
+		}
+		const finalVerificationReworkAttempts = attempts.filter((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder" && attempt.replacement === undefined && isFinalVerificationReworkDispatch(attempt.dispatch));
+		if (finalVerificationReworkAttempts.length !== finalVerificationReworks.length) taskDiagnostics.push(diagnostic("invalid-task", "Every final-verification rework Builder Attempt must have exactly one retained failure record.", `${taskPath}.finalVerificationReworks`));
 		const transientLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.transientRetryLimit) ? value.effectiveSettings.transientRetryLimit as number : 2;
 		if (attempts.some((attempt) => attempt.replacement !== undefined && attempt.replacement.retryOrdinal > transientLimit)) taskDiagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals cannot exceed the frozen transient retry limit.", `${taskPath}.attempts`));
 		const currentSilence = attempts.at(-1)?.recovery?.silence;
@@ -2719,7 +3061,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		const latestBuilder = latest?.role === "builder" ? latest : undefined;
 		if (task.phase === "pending" && attempts.length !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Pending Tasks must not have Attempts.", taskPath));
 		if (task.phase === "building" && (!latestBuilder || (latestBuilder.state === "superseded" || (latestBuilder.state === "ended-error" && task.attention !== "needs-user" && task.attention !== "recovering")))) taskDiagnostics.push(diagnostic("invalid-task", "Building Tasks require one current Builder Attempt.", taskPath));
-		if (task.phase === "reworking" && (attempts.length < 3 || !latestBuilder || (latestBuilder.replacement === undefined && latestBuilder.state !== "ended-error" && !isReworkDispatch(latestBuilder.dispatch)))) taskDiagnostics.push(diagnostic("invalid-task", "Reworking Tasks require a latest reserved rework or transient ended-error Builder Attempt.", taskPath));
+		if (task.phase === "reworking" && (attempts.length < 3 || !latestBuilder || (latestBuilder.replacement === undefined && latestBuilder.state !== "ended-error" && !isReworkDispatch(latestBuilder.dispatch) && !isFinalVerificationReworkDispatch(latestBuilder.dispatch)))) taskDiagnostics.push(diagnostic("invalid-task", "Reworking Tasks require a latest reserved rework or transient ended-error Builder Attempt.", taskPath));
 		if (task.phase === "reviewing" && !latestReviewer && !(attempts.length === 1 && attempts[0]?.role === "builder" && task.attention === "needs-user")) taskDiagnostics.push(diagnostic("invalid-task", "Reviewing Tasks require a latest Reviewer Attempt unless Review is durably paused before dispatch.", taskPath));
 		if (task.phase === "reviewing" && latestReviewer && latestReviewer.state === "reported" && task.attention === "needs-user" && latestReviewer.integrity?.kind !== "violated" && latestReviewer.evidence?.phase !== "finalized") taskDiagnostics.push(diagnostic("invalid-task", "A reported Reviewer with needs-user attention requires finalized evidence or a recorded integrity violation.", taskPath));
 		if (task.phase === "reviewing" && latestReviewer && task.attention === "needs-user" && latestReviewer.evidence?.phase === "finalized" && latestReviewer.evidence.verdict === "changes-required") {
@@ -2777,7 +3119,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
 		if (contractResult.value) taskIds.add(contractResult.value.id);
 		if (taskDiagnostics.length > 0 || !contractResult.value || typeof task.specificationHash !== "string") diagnostics.push(...taskDiagnostics);
-		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, ...(hasAttentionDiagnostic ? { attentionDiagnostic: task.attentionDiagnostic as string } : {}), ...(hasAttentionReason ? { attentionReason: task.attentionReason as TaskAttentionReason } : {}), attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}), ...(integration.value ? { integration: integration.value } : {}), ...(hasIntegrationRecoveries ? { integrationRecoveries } : {}) });
+		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, ...(hasAttentionDiagnostic ? { attentionDiagnostic: task.attentionDiagnostic as string } : {}), ...(hasAttentionReason ? { attentionReason: task.attentionReason as TaskAttentionReason } : {}), attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}), ...(integration.value ? { integration: integration.value } : {}), ...(hasIntegrationRecoveries ? { integrationRecoveries } : {}), ...(hasFinalVerificationReworks ? { finalVerificationReworks } : {}) });
 	}
 	if (!plans.value || plans.diagnostics.length > 0) diagnostics.push(...plans.diagnostics.map((item: ConfigDiagnostic) => diagnostic("invalid-config", item.message, item.path)));
 	const settings = validateRecoveryDefaults(value.effectiveSettings, `${path}.effectiveSettings`);
@@ -2809,7 +3151,8 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 				if ("paneId" in dispatch && typeof dispatch.paneId === "string") claim(dispatch.paneId, task.contract.id, "pane");
 				if ("terminalId" in dispatch && typeof dispatch.terminalId === "string") claim(dispatch.terminalId, task.contract.id, "terminal");
 				const integrationReworkBase = attempt.role === "builder" && isIntegrationReworkDispatch(attempt.dispatch) && attempt.dispatch.integrationRecovery.advancedTargetRevision === attempt.baseRevision;
-				if (attempt.role === "builder" && attempt.baseRevision !== base.value.revision && !integrationReworkBase && !integratedHeads.some((entry) => entry.index < taskIndex && entry.integratedAt <= attempt.preparedAt && entry.head === attempt.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Builder Attempt baseRevision must be the Run base, an ordered integrated head, or the exact advanced target recorded by integration rework.", `${path}.tasks.${task.contract.id}.attempts`));
+				const finalVerificationReworkBase = attempt.role === "builder" && isFinalVerificationReworkDispatch(attempt.dispatch) && attempt.dispatch.verificationRework.priorIntegration.observedHead === attempt.baseRevision;
+				if (attempt.role === "builder" && attempt.baseRevision !== base.value.revision && !integrationReworkBase && !finalVerificationReworkBase && !integratedHeads.some((entry) => entry.index < taskIndex && entry.integratedAt <= attempt.preparedAt && entry.head === attempt.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Builder Attempt baseRevision must be the Run base, an ordered integrated head, or the exact advanced target recorded by integration rework.", `${path}.tasks.${task.contract.id}.attempts`));
 			}
 			let taskExpectedTarget = expectedTarget;
 			for (const recovery of task.integrationRecoveries ?? []) {
@@ -2900,11 +3243,24 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	const allTasksReadyForFinalVerification = tasks.every((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? task.integration?.phase === "integrated" : task.phase === "completed");
 	const lastIntegratedTask = orderedCodeTasks.at(-1);
 	const finalIntegratedHead = lastIntegratedTask?.integration?.phase === "integrated" ? lastIntegratedTask.integration.observedHead : (base.value?.kind === "git" ? base.value.revision : null);
-	if (finalVerificationExecution.value && tasks.length > 1 && (!allTasksReadyForFinalVerification || !allCodeIntegrated || tasks.some((task) => task.attention !== "none" || ["building", "reviewing", "reworking"].includes(task.phase)))) diagnostics.push(diagnostic("invalid-run", "Multi-Task final verification requires the complete ordered integration prefix and no active or attention Task.", `${path}.finalVerificationExecution`));
+	const terminalMultiFinalVerificationAttention = tasks.length > 1
+		&& finalVerificationExecution.value !== undefined
+		&& isRecoverableFinalVerificationExecution(finalVerificationExecution.value)
+		&& (finalVerificationExecution.value.phase === "failed" || finalVerificationExecution.value.phase === "ambiguous")
+		&& tasks.every((task) => task.attention === "needs-user" && ["final-verification-ownership-unclear", "verification-dirtied-checkout", "final-verification-ambiguous"].includes(task.attentionReason ?? ""));
+	if (finalVerificationExecution.value && tasks.length > 1 && (!allTasksReadyForFinalVerification || !allCodeIntegrated || (!terminalMultiFinalVerificationAttention && tasks.some((task) => task.attention !== "none" || ["building", "reviewing", "reworking"].includes(task.phase))))) diagnostics.push(diagnostic("invalid-run", "Multi-Task final verification requires the complete ordered integration prefix and no active or attention Task.", `${path}.finalVerificationExecution`));
 	if (finalVerificationExecution.value && tasks.length === 1 && tasks[0] && (!tasks[0].integration || tasks[0].integration.phase !== "integrated")) diagnostics.push(diagnostic("invalid-run", "Final verification execution requires a completed exact integration.", `${path}.finalVerificationExecution`));
-	if (finalVerificationExecution.value && tasks[0] && (!finalVerificationExecution.value.logPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`) || !finalVerificationExecution.value.resultPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`))) diagnostics.push(diagnostic("invalid-run", "Final verification paths must be deterministic inside this Run's completion directory.", `${path}.finalVerificationExecution`));
+	if (finalVerificationExecution.value && tasks[0]) {
+		if (isRecoverableFinalVerificationExecution(finalVerificationExecution.value)) {
+			for (const attempt of finalVerificationExecution.value.attempts) if (![attempt.paths.runtimeDirectory, attempt.paths.descriptorPath, attempt.paths.stdoutPath, attempt.paths.stderrPath, attempt.paths.candidateResultPath, attempt.paths.logPath, attempt.paths.resultPath].every((candidate) => candidate.includes(`/runs/${value.id}/completion/final-verification/${attempt.id}/`))) diagnostics.push(diagnostic("invalid-run", "Managed final verification paths must be deterministic inside this Run's completion directory.", `${path}.finalVerificationExecution`));
+		} else if (!finalVerificationExecution.value.logPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`) || !finalVerificationExecution.value.resultPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`)) diagnostics.push(diagnostic("invalid-run", "Final verification paths must be deterministic inside this Run's completion directory.", `${path}.finalVerificationExecution`));
+	}
 	if (finalVerificationExecution.value?.phase === "intended" && tasks.length === 1 && tasks[0] && (tasks[0].phase !== "integrating" || tasks[0].attention !== "none")) diagnostics.push(diagnostic("invalid-run", "Final verification intent requires an attention-free integrating Task.", `${path}.finalVerificationExecution`));
-	if (finalVerificationExecution.value?.phase === "passed" && tasks[0] && (finalVerificationExecution.value.checkout.dirtyPaths.length > 0 || finalVerificationExecution.value.checkout.operationMarkers.length > 0 || !finalVerificationExecution.value.checkout.rangeExact || base.value?.kind !== "git" || !allCodeIntegrated || finalVerificationExecution.value.checkout.branch !== base.value.branch || finalVerificationExecution.value.checkout.head !== finalIntegratedHead)) diagnostics.push(diagnostic("invalid-run", "Passed final verification requires the exact clean integrated checkout.", `${path}.finalVerificationExecution`));
+	if (finalVerificationExecution.value?.phase === "passed" && tasks[0]) {
+		const managedCheckout = isRecoverableFinalVerificationExecution(finalVerificationExecution.value) ? managedCompleteObservation(finalVerificationExecution.value)?.checkout : undefined;
+		const checkout = managedCheckout ?? (!isRecoverableFinalVerificationExecution(finalVerificationExecution.value) ? finalVerificationExecution.value.checkout : undefined);
+		if (!checkout || checkout.dirtyPaths.length > 0 || checkout.operationMarkers.length > 0 || !checkout.rangeExact || base.value?.kind !== "git" || !allCodeIntegrated || checkout.branch !== base.value.branch || checkout.head !== finalIntegratedHead) diagnostics.push(diagnostic("invalid-run", "Passed final verification requires the exact clean integrated checkout.", `${path}.finalVerificationExecution`));
+	}
 	if (completion.value && tasks[0]) {
 		const gate = completion.value.gate;
 		if ("tasks" in gate) {
@@ -2923,8 +3279,12 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 				gateHead = integration.observedHead;
 				return true;
 			});
-			if (!gateEntriesMatch || gate.integratedHead !== gateHead || tasks.some((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") && task.integration?.phase !== "integrated") || finalVerificationExecution.value?.phase !== "passed" || gate.verificationLogSha256 !== finalVerificationExecution.value.logSha256 || gate.verificationResultSha256 !== finalVerificationExecution.value.resultSha256 || (finalVerificationExecution.value?.phase === "passed" && JSON.stringify(gate.checkout) !== JSON.stringify(finalVerificationExecution.value.checkout))) diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion Gate facts must remain bound to every ordered integrated Task and passing verification evidence.", `${path}.completion.gate`));
-		} else if (gate.taskId !== tasks[0].contract.id || tasks[0].integration?.phase !== "integrated" || gate.integratedHead !== tasks[0].integration.approvedHeadRevision || finalVerificationExecution.value?.phase !== "passed" || gate.verificationLogSha256 !== finalVerificationExecution.value.logSha256 || gate.verificationResultSha256 !== finalVerificationExecution.value.resultSha256) diagnostics.push(diagnostic("invalid-run", "Completion Gate facts must remain bound to the current integrated Task and passing verification evidence.", `${path}.completion.gate`));
+			const finalEvidence = finalVerificationExecution.value && finalVerificationExecution.value.phase === "passed" ? (isRecoverableFinalVerificationExecution(finalVerificationExecution.value) ? managedCompleteObservation(finalVerificationExecution.value) : finalVerificationExecution.value) : undefined;
+			if (!gateEntriesMatch || gate.integratedHead !== gateHead || tasks.some((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") && task.integration?.phase !== "integrated") || !finalEvidence || gate.verificationLogSha256 !== finalEvidence.logSha256 || gate.verificationResultSha256 !== finalEvidence.resultSha256 || (finalEvidence && JSON.stringify(gate.checkout) !== JSON.stringify(finalEvidence.checkout))) diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion Gate facts must remain bound to every ordered integrated Task and passing verification evidence.", `${path}.completion.gate`));
+		} else {
+			const finalEvidence = finalVerificationExecution.value && finalVerificationExecution.value.phase === "passed" ? (isRecoverableFinalVerificationExecution(finalVerificationExecution.value) ? managedCompleteObservation(finalVerificationExecution.value) : finalVerificationExecution.value) : undefined;
+			if (gate.taskId !== tasks[0].contract.id || tasks[0].integration?.phase !== "integrated" || gate.integratedHead !== tasks[0].integration.approvedHeadRevision || !finalEvidence || gate.verificationLogSha256 !== finalEvidence.logSha256 || gate.verificationResultSha256 !== finalEvidence.resultSha256) diagnostics.push(diagnostic("invalid-run", "Completion Gate facts must remain bound to the current integrated Task and passing verification evidence.", `${path}.completion.gate`));
+		}
 	}
 	if (value.status === "completed" && (!finalVerificationExecution.value || finalVerificationExecution.value.phase !== "passed")) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots require one passing final verification execution.", path));
 	if (finalVerificationExecution.value?.phase === "passed" && tasks[0]?.phase === "completed" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "A passed final verification cannot be detached from completion.", `${path}.finalVerificationExecution`));
@@ -2990,10 +3350,11 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 	}
 	const hasRework = Object.prototype.hasOwnProperty.call(assignment, "rework");
 	const hasIntegrationRework = Object.prototype.hasOwnProperty.call(assignment, "integrationRework");
+	const hasVerificationRework = Object.prototype.hasOwnProperty.call(assignment, "verificationRework");
 	const hasContinuation = Object.prototype.hasOwnProperty.call(assignment, "continuation");
-	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "allowedScope", "expectedArtifacts", "reportPath", "evidenceDirectory", "verification", "actualModel", "specificationHash", "baseRevision", "worktree", "herdr", ...(hasRework ? ["rework"] : []), ...(hasIntegrationRework ? ["integrationRework"] : []), ...(hasContinuation ? ["continuation"] : [])];
+	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "allowedScope", "expectedArtifacts", "reportPath", "evidenceDirectory", "verification", "actualModel", "specificationHash", "baseRevision", "worktree", "herdr", ...(hasRework ? ["rework"] : []), ...(hasIntegrationRework ? ["integrationRework"] : []), ...(hasVerificationRework ? ["verificationRework"] : []), ...(hasContinuation ? ["continuation"] : [])];
 	if (!exactKeys(assignment, keys)) return { diagnostics: [diagnostic("invalid-task", "Assignment contains unknown or missing keys.", path)] };
-	if (hasRework && hasIntegrationRework) return { diagnostics: [diagnostic("invalid-task", "Assignment cannot contain both Reviewer-findings rework and integration rework facts.", `${path}.assignment`)] };
+	if ([hasRework, hasIntegrationRework, hasVerificationRework].filter(Boolean).length > 1) return { diagnostics: [diagnostic("invalid-task", "Assignment cannot contain more than one rework provenance branch.", `${path}.assignment`)] };
 	const diagnostics: RunDiagnostic[] = [];
 	if (!safeIdentifier(assignment.runId) || !assignment.runId.startsWith("run-")) diagnostics.push(diagnostic("invalid-task", "Assignment runId is unsafe.", `${path}.assignment.runId`));
 	if (!safeIdentifier(assignment.taskId) || !safeIdentifier(assignment.attemptId) || assignment.role !== "builder") diagnostics.push(diagnostic("invalid-task", "Assignment identity or role is invalid.", `${path}.assignment`));
@@ -3013,6 +3374,7 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 	if (!isRecord(herdr) || !exactKeys(herdr, ["workspaceId", "paneId", "terminalId", "agentName"]) || !trimmedString(herdr.workspaceId) || !trimmedString(herdr.paneId) || !trimmedString(herdr.terminalId) || !herdrName(herdr.agentName)) diagnostics.push(diagnostic("invalid-task", "Assignment Herdr identities are invalid.", `${path}.assignment.herdr`));
 	let rework: ReworkAssignmentFacts | undefined;
 	let integrationRework: IntegrationReworkAssignmentFacts | undefined;
+	let verificationRework: FinalVerificationReworkFacts | undefined;
 	let continuation: AttemptContinuation | undefined;
 	if (hasContinuation) {
 		const raw = assignment.continuation;
@@ -3048,7 +3410,12 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 			diagnostics.push(...subject.diagnostics, ...recovery.diagnostics);
 		}
 	}
-	if (diagnostics.length > 0 || !artifacts.value || !verification.value || !model.value || typeof assignment.runId !== "string" || typeof assignment.taskId !== "string" || typeof assignment.attemptId !== "string" || typeof assignment.requiredOutcome !== "string" || !Array.isArray(assignment.allowedScope) || typeof assignment.reportPath !== "string" || typeof assignment.evidenceDirectory !== "string" || typeof assignment.specificationHash !== "string" || typeof assignment.baseRevision !== "string" || !isRecord(worktree) || typeof worktree.path !== "string" || typeof worktree.branch !== "string" || !isRecord(herdr) || typeof herdr.workspaceId !== "string" || typeof herdr.paneId !== "string" || typeof herdr.terminalId !== "string" || typeof herdr.agentName !== "string" || (hasContinuation && !continuation)) return { diagnostics };
+	if (hasVerificationRework) {
+		const result = validateFinalVerificationReworkFacts(assignment.verificationRework, `${path}.assignment.verificationRework`);
+		if (result.value) verificationRework = result.value;
+		diagnostics.push(...result.diagnostics);
+	}
+	if (diagnostics.length > 0 || !artifacts.value || !verification.value || !model.value || typeof assignment.runId !== "string" || typeof assignment.taskId !== "string" || typeof assignment.attemptId !== "string" || typeof assignment.requiredOutcome !== "string" || !Array.isArray(assignment.allowedScope) || typeof assignment.reportPath !== "string" || typeof assignment.evidenceDirectory !== "string" || typeof assignment.specificationHash !== "string" || typeof assignment.baseRevision !== "string" || !isRecord(worktree) || typeof worktree.path !== "string" || typeof worktree.branch !== "string" || !isRecord(herdr) || typeof herdr.workspaceId !== "string" || typeof herdr.paneId !== "string" || typeof herdr.terminalId !== "string" || typeof herdr.agentName !== "string" || (hasContinuation && !continuation) || (hasVerificationRework && !verificationRework)) return { diagnostics };
 	return {
 		value: {
 			schemaVersion: 1,
@@ -3070,6 +3437,7 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 				herdr: { workspaceId: herdr.workspaceId, paneId: herdr.paneId, terminalId: herdr.terminalId, agentName: herdr.agentName },
 					...(rework ? { rework } : {}),
 					...(integrationRework ? { integrationRework } : {}),
+					...(verificationRework ? { verificationRework } : {}),
 				...(continuation ? { continuation } : {}),
 			},
 		},
@@ -3135,7 +3503,7 @@ export function buildBuilderAssignment(input: {
 	if (input.attempt.replacement && !input.continuation) throw new Error("Replacement Builder Assignment requires its exact predecessor continuation.");
 	if (!input.attempt.replacement && input.continuation) throw new Error("A non-replacement Builder Assignment cannot carry a replacement continuation.");
 	const dispatch = input.attempt.dispatch;
-	const rework = "cycle" in dispatch && !isIntegrationReworkDispatch(dispatch) ? {
+	const rework = isReworkDispatch(dispatch) ? {
 		cycle: dispatch.cycle,
 		priorBuilderAttemptId: dispatch.priorBuilderAttemptId,
 		priorReviewerAttemptId: dispatch.priorReviewerAttemptId,
@@ -3151,6 +3519,7 @@ export function buildBuilderAssignment(input: {
 		reviewerEvidence: { manifestPath: dispatch.reviewerManifestPath, manifestSha256: dispatch.reviewerManifestSha256 },
 		integrationRecovery: cloneIntegrationReworkFacts(dispatch.integrationRecovery),
 	} : undefined;
+	const verificationRework = isFinalVerificationReworkDispatch(dispatch) ? cloneFinalVerificationReworkFacts(dispatch.verificationRework) : undefined;
 	const document: BuilderAssignmentDocument = {
 		schemaVersion: 1,
 		assignment: {
@@ -3171,6 +3540,7 @@ export function buildBuilderAssignment(input: {
 				herdr: { workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, agentName: input.agentName },
 				...(rework ? { rework } : {}),
 				...(integrationRework ? { integrationRework } : {}),
+				...(verificationRework ? { verificationRework } : {}),
 				...(input.continuation ? { continuation: { ...input.continuation, preservedWorktree: { ...input.continuation.preservedWorktree } } } : {}),
 		},
 	};
@@ -3191,6 +3561,7 @@ export function formatBuilderPrompt(document: BuilderAssignmentDocument): string
 			"Produce every expected Artifact, run the stated verification, and write the Attempt Report to the absolute reportPath.",
 			...(assignment.rework ? [`This is bounded rework cycle ${assignment.rework.cycle} for the same Builder. Address only the protected findings from Reviewer Attempt ${assignment.rework.priorReviewerAttemptId} and produce a complete Artifact from the frozen Run base to the new head.`] : []),
 			...(assignment.integrationRework ? [`This is bounded integration-rework cycle ${assignment.integrationRework.cycle} for the same Builder. The old approved Artifact and Review are historical; adapt the preserved clean worktree to advanced target ${assignment.integrationRework.integrationRecovery.advancedTargetRevision} from baseRevision, address only the recorded target conflict paths, and produce a fresh SHA, Attempt Report, finalized evidence, and fresh Review before integration.`] : []),
+			...(assignment.verificationRework ? [`This is bounded final-verification rework cycle for the same Builder. Produce a new revision that fixes the conclusive failure recorded at ${assignment.verificationRework.failedResultPath}; a fresh Review is mandatory. No Reviewer findings are implied.`] : []),
 		"Terminal or Herdr state is not completion; the Attempt Report is required.",
 		formatTaskFactInstruction(),
 		"Do not modify unrelated paths or dispatch another agent.",
@@ -3205,7 +3576,7 @@ export function cloneRunJournal(journal: RunJournal): RunJournal {
 			...journal.run,
 			...(journal.run.controllerLease ? { controllerLease: cloneControllerLease(journal.run.controllerLease) } : {}),
 			integrationBase: journal.run.integrationBase.kind === "git" ? { ...journal.run.integrationBase } : { kind: "none" },
-			tasks: journal.run.tasks.map((task) => ({ ...task, contract: cloneContract(task.contract), attempts: task.attempts.map(cloneAttempt), ...(task.approval ? { approval: cloneApproval(task.approval) } : {}), ...(task.integration ? { integration: cloneIntegration(task.integration) } : {}), ...(task.integrationRecoveries ? { integrationRecoveries: task.integrationRecoveries.map(cloneIntegrationReworkRecord) } : {}) })),
+			tasks: journal.run.tasks.map((task) => ({ ...task, contract: cloneContract(task.contract), attempts: task.attempts.map(cloneAttempt), ...(task.approval ? { approval: cloneApproval(task.approval) } : {}), ...(task.integration ? { integration: cloneIntegration(task.integration) } : {}), ...(task.integrationRecoveries ? { integrationRecoveries: task.integrationRecoveries.map(cloneIntegrationReworkRecord) } : {}), ...(task.finalVerificationReworks ? { finalVerificationReworks: task.finalVerificationReworks.map(cloneFinalVerificationReworkRecord) } : {}) })),
 			modelPlan: cloneModelPlans(journal.run.modelPlan),
 			effectiveSettings: cloneRecoveryDefaults(journal.run.effectiveSettings),
 			finalVerification: cloneVerification(journal.run.finalVerification),

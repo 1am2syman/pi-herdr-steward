@@ -32,6 +32,7 @@
     "test:integration-git": "vitest run test/integration-git.contract.test.ts",
     "test:completion-storage": "vitest run test/completion-storage.contract.test.ts",
     "test:process": "vitest run test/process-adapter.contract.test.ts test/process-observer.contract.test.ts",
+    "test:final-verification": "vitest run test/final-verification-recovery.functional.test.ts --maxWorkers=1",
     "test:recovery": "vitest run test/recovery.functional.test.ts test/process-observer.contract.test.ts test/herdr-recovery.contract.test.ts --maxWorkers=1",
     "test:evidence": "vitest run test/evidence.functional.test.ts",
     "test:review": "vitest run test/review.functional.test.ts",

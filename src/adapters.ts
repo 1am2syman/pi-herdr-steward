@@ -1,6 +1,7 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
-import { lstat, readFile, realpath } from "node:fs/promises";
+import { lstat, mkdir, open, readFile, realpath } from "node:fs/promises";
+import { spawn } from "node:child_process";
 import { isAbsolute, join, resolve } from "node:path";
 import { compact, type CompactionResult, type ExecResult, type ExtensionContext, type ExtensionUIContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 
@@ -33,6 +34,8 @@ import type {
 	StewardGitAdapter,
 	StewardHerdrAdapter,
 	StewardProcessAdapter,
+	ManagedVerificationInput,
+	ManagedVerificationLaunchResult,
 	StewardClockAdapter,
 	StewardModelAdapter,
 	StewardUiAdapter,
@@ -50,7 +53,6 @@ import type {
 } from "./steward.ts";
 import type { ReviewerChoiceInspection } from "./review.ts";
 import { parseTaskFactRequest, type TaskFactRequestResult } from "./reconciliation.ts";
-import { createHash } from "node:crypto";
 
 const STATUS_KEY = "pi-herdr-steward";
 
@@ -111,6 +113,7 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		finalizeReviewerEvidence: runStore.finalizeReviewerEvidence,
 		resolveCompletionPaths: runStore.resolveCompletionPaths,
 		finalizeVerificationResult: runStore.finalizeVerificationResult,
+		inspectFinalVerificationResult: runStore.inspectFinalVerificationResult,
 		archiveCompletedRun: runStore.archiveCompletedRun,
 		loadCompletionJournalPointers: runStore.loadCompletionJournalPointers,
 		loadRecoveryDefaults: () => configStore.loadRecoveryDefaults(),
@@ -763,9 +766,149 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 	};
 }
 
+const MANAGED_VERIFICATION_OUTPUT_LIMIT = 16 * 1024 * 1024;
+const MANAGED_RUNNER_SOURCE = String.raw`
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const crypto = require("node:crypto");
+const cp = require("node:child_process");
+const p = JSON.parse(Buffer.from(process.argv[1], "base64url").toString("utf8"));
+const limit = ${MANAGED_VERIFICATION_OUTPUT_LIMIT};
+const hash = (bytes) => "sha256:" + crypto.createHash("sha256").update(bytes).digest("hex");
+const syncFile = async (path) => { const handle = await fsp.open(path, "r"); try { await handle.sync(); } finally { await handle.close(); } };
+const syncDirectory = async (path) => { const handle = await fsp.open(path, "r"); try { await handle.sync(); } finally { await handle.close(); } };
+const writeOnce = async (path, bytes) => { const handle = await fsp.open(path, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o400); try { await handle.writeFile(bytes); await handle.sync(); } finally { await handle.close(); } };
+const outputLog = (stdout, stderr) => Buffer.concat([Buffer.from("steward-verification-output-v1\nstdout-bytes:" + stdout.length + "\nstderr-bytes:" + stderr.length + "\n\n"), stdout, stderr]);
+(async () => {
+  await fsp.mkdir(p.paths.runtimeDirectory, { recursive: true, mode: 0o700 });
+  const startedAt = new Date().toISOString();
+  await writeOnce(p.paths.descriptorPath, Buffer.from(JSON.stringify({ schemaVersion: 1, attemptId: p.attemptId, executionNonce: p.executionNonce, command: p.command, cwd: p.cwd, pid: process.pid, startedAt })));
+  await syncDirectory(p.paths.runtimeDirectory);
+  const stdoutHandle = await fsp.open(p.paths.stdoutPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o400);
+  const stderrHandle = await fsp.open(p.paths.stderrPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o400);
+  let stdout = Buffer.alloc(0); let stderr = Buffer.alloc(0); let overflow = false;
+  const collect = (which, chunk) => { const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk); const next = Buffer.concat([which === "stdout" ? stdout : stderr, bytes]); if (next.length > limit) overflow = true; else if (which === "stdout") stdout = next; else stderr = next; };
+  const child = cp.spawn("/bin/sh", ["-c", p.command], { cwd: p.cwd, stdio: ["ignore", "pipe", "pipe"] });
+  child.stdout.on("data", (chunk) => collect("stdout", chunk));
+  child.stderr.on("data", (chunk) => collect("stderr", chunk));
+  child.on("error", () => { overflow = true; });
+  child.on("close", async (code) => {
+    try {
+      await stdoutHandle.writeFile(stdout); await stdoutHandle.sync(); await stdoutHandle.close();
+      await stderrHandle.writeFile(stderr); await stderrHandle.sync(); await stderrHandle.close();
+      await syncDirectory(p.paths.runtimeDirectory);
+      if (overflow) return;
+      const completedAt = new Date().toISOString();
+      const log = outputLog(stdout, stderr);
+      const candidate = { schemaVersion: 1, attemptId: p.attemptId, executionNonce: p.executionNonce, command: p.command, cwd: p.cwd, startedAt, completedAt, exitCode: typeof code === "number" ? code : 1, killed: false, stdoutBytes: stdout.length, stderrBytes: stderr.length, stdoutSha256: hash(stdout), stderrSha256: hash(stderr), logSha256: hash(log), argvSha256: p.argvSha256 };
+      await writeOnce(p.paths.candidateResultPath, Buffer.from(JSON.stringify(candidate)));
+      await syncDirectory(p.paths.runtimeDirectory);
+    } catch {}
+  });
+})();`;
+
+function managedHash(value: string): string {
+	return `sha256:${createHash("sha256").update(value, "utf8").digest("hex")}`;
+}
+
+function managedCanonicalInput(input: ManagedVerificationInput): boolean {
+	const paths = Object.values(input.paths);
+	const contained = (path: string): boolean => isAbsolute(path) && path === resolve(path) && path.startsWith(`${input.repositoryRoot}/`) && !path.includes("/../") && !path.endsWith("/..");
+	return isAbsolute(input.repositoryRoot) && input.repositoryRoot === resolve(input.repositoryRoot) && isAbsolute(input.cwd) && input.cwd === resolve(input.cwd) && input.cwd === input.repositoryRoot && input.runId.startsWith("run-") && /^[A-Za-z0-9._-]+$/.test(input.runId) && input.command.length > 0 && input.command === input.command.trim() && /^[A-Za-z0-9._:-]+$/.test(input.executionNonce) && paths.every(contained) && input.paths.runtimeDirectory.endsWith(`/completion/final-verification/${input.attemptId}/runtime`) && input.paths.descriptorPath.endsWith("/runtime/descriptor.json") && input.paths.stdoutPath.endsWith("/runtime/stdout") && input.paths.stderrPath.endsWith("/runtime/stderr") && input.paths.candidateResultPath.endsWith("/runtime/candidate-result.json") && input.paths.logPath.endsWith("/output.log") && input.paths.resultPath.endsWith("/result.json");
+}
+
+function managedArgv(input: ManagedVerificationInput, encoded: string): string[] {
+	return [process.execPath, "-e", MANAGED_RUNNER_SOURCE, "--", encoded];
+}
+
+function managedArgvHash(argv: readonly string[]): string {
+	return managedHash(JSON.stringify([...argv.slice(0, 4), "<canonical-payload>"]));
+}
+
+function processStartToken(pid: number): string | undefined {
+	try {
+		const text = require("node:fs").readFileSync(`/proc/${pid}/stat`, "utf8") as string;
+		const end = text.lastIndexOf(")");
+		if (end < 0) return undefined;
+		const fields = text.slice(end + 2).trim().split(/\s+/);
+		return fields[19];
+	} catch {
+		return undefined;
+	}
+}
+
+async function readProcessIdentity(pid: number): Promise<{ startToken: string; argv: string[]; cwd: string } | undefined> {
+	try {
+		const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+		const end = stat.lastIndexOf(")");
+		const fields = end < 0 ? [] : stat.slice(end + 2).trim().split(/\s+/);
+		const startToken = fields[19];
+		const cmdline = await readFile(`/proc/${pid}/cmdline`);
+		const argv = cmdline.toString("utf8").split("\0").filter((item) => item.length > 0);
+		const cwd = await realpath(`/proc/${pid}/cwd`);
+		return startToken && argv.length > 0 ? { startToken, argv, cwd } : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function managedTimestamp(): string {
+	return new Date().toISOString();
+}
+
 /** Execute only the Controller-owned frozen verification envelope. */
 export function createProcessAdapter(exec: CommandRunner | undefined): StewardProcessAdapter {
 	return {
+		async launchApprovedVerification(input): Promise<ManagedVerificationLaunchResult> {
+			if (!managedCanonicalInput(input)) return { kind: "not-launched", diagnostic: "Managed verification input is not an exact repository, command, nonce, or path envelope." };
+			const finalArgvSha256 = managedArgvHash(managedArgv(input, ""));
+			const encoded = Buffer.from(JSON.stringify({ repositoryRoot: input.repositoryRoot, runId: input.runId, attemptId: input.attemptId, command: input.command, cwd: input.cwd, executionNonce: input.executionNonce, paths: input.paths, argvSha256: finalArgvSha256 }), "utf8").toString("base64url");
+			const launchArgv = managedArgv(input, encoded);
+			try {
+				const child = spawn(process.execPath, launchArgv.slice(1), { cwd: input.cwd, detached: true, stdio: "ignore" });
+				child.unref();
+				const pid = child.pid;
+				if (!pid || !Number.isSafeInteger(pid) || pid <= 0) return { kind: "unclear", diagnostic: "Managed runner returned no positive PID." };
+				const startToken = processStartToken(pid);
+				if (!startToken) return { kind: "unclear", pid, diagnostic: "Managed runner PID has no readable OS start token." };
+				return { kind: "launched", pid, startToken, argvSha256: finalArgvSha256, executionNonce: input.executionNonce, launchedAt: managedTimestamp() };
+			} catch (error: unknown) {
+				return { kind: "unclear", diagnostic: (error instanceof Error ? error.message : "Managed verification launch failed.").slice(0, 2_000) };
+			}
+		},
+		async inspectApprovedVerification(input) {
+			if (!managedCanonicalInput(input)) return "unclear";
+			const descriptor = await readFile(input.paths.descriptorPath, "utf8").catch(() => undefined);
+			const process = input.process;
+			if (!descriptor && !process) return "not-launched";
+			if (!descriptor && process) {
+				const identity = await readProcessIdentity(process.pid);
+				if (!identity) return "exited";
+				const encoded = Buffer.from(JSON.stringify({ repositoryRoot: input.repositoryRoot, runId: input.runId, attemptId: input.attemptId, command: input.command, cwd: input.cwd, executionNonce: input.executionNonce, paths: input.paths, argvSha256: process.argvSha256 }), "utf8").toString("base64url");
+				const expected = managedArgv(input, encoded);
+				return identity.startToken === process.startToken && identity.cwd === input.cwd && JSON.stringify(identity.argv) === JSON.stringify(expected) && managedArgvHash(identity.argv) === process.argvSha256 ? "live" : "unclear";
+			}
+			if (!descriptor) return "not-launched";
+			let descriptorValue: Record<string, unknown>;
+			try { const parsed = JSON.parse(descriptor) as unknown; if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unclear"; descriptorValue = parsed as Record<string, unknown>; } catch { return "unclear"; }
+			if (Object.keys(descriptorValue).sort().join("\0") !== ["schemaVersion", "attemptId", "executionNonce", "command", "cwd", "pid", "startedAt"].sort().join("\0") || descriptorValue.schemaVersion !== 1 || descriptorValue.attemptId !== input.attemptId || descriptorValue.executionNonce !== input.executionNonce || descriptorValue.command !== input.command || descriptorValue.cwd !== input.cwd || typeof descriptorValue.pid !== "number" || !Number.isSafeInteger(descriptorValue.pid) || descriptorValue.pid <= 0) return "unclear";
+			if (!process || process.pid !== descriptorValue.pid || process.executionNonce !== input.executionNonce || process.commandSha256 !== managedHash(input.command)) return "unclear";
+			const identity = await readProcessIdentity(process.pid);
+			if (!identity) return "exited";
+			const encoded = Buffer.from(JSON.stringify({ repositoryRoot: input.repositoryRoot, runId: input.runId, attemptId: input.attemptId, command: input.command, cwd: input.cwd, executionNonce: input.executionNonce, paths: input.paths, argvSha256: process.argvSha256 }), "utf8").toString("base64url");
+			const expected = managedArgv(input, encoded);
+			if (identity.startToken !== process.startToken || identity.cwd !== input.cwd || JSON.stringify(identity.argv) !== JSON.stringify(expected) || managedArgvHash(identity.argv) !== process.argvSha256) return "unclear";
+			return "live";
+		},
+		async waitApprovedVerification(input, signal) {
+			while (!signal.aborted) {
+				const state = await this.inspectApprovedVerification!(input);
+				if (state === "exited" || state === "not-launched") return "settled";
+				if (state === "unclear") return "unclear";
+				await new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 50));
+			}
+			return "cancelled";
+		},
 		async runApprovedVerification(input) {
 			if (!exec) return { kind: "thrown", message: "The Pi command runner is unavailable." };
 			if (input.command.length === 0 || input.command !== input.command.trim() || !isAbsolute(input.cwd) || input.cwd !== resolve(input.cwd)) return { kind: "thrown", message: "Verification command or cwd is not an exact safe value." };

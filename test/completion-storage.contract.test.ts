@@ -1,9 +1,10 @@
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { archiveCompletedRun, decodeVerificationOutput, finalizeVerificationResult } from "../src/completion-store.ts";
+import { archiveCompletedRun, COMPLETION_OUTPUT_VERSION, decodeVerificationOutput, finalizeVerificationResult, inspectFinalVerificationResult, resolveCompletionPaths } from "../src/completion-store.ts";
 import { advanceRunJournal, deserializeRunJournal } from "../src/run.ts";
 import { createRunJournalAdapter } from "../src/adapters.ts";
 import { resolveRunJournalPaths } from "../src/run-journal-store.ts";
@@ -11,6 +12,10 @@ import { captureArchiveFixture } from "./ticket08-archive-fixture.ts";
 
 const roots: string[] = [];
 vi.setConfig({ testTimeout: 60_000 });
+
+function hashBytes(value: Buffer): string {
+	return "sha256:" + createHash("sha256").update(value).digest("hex");
+}
 
 afterEach(async () => {
 	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
@@ -39,6 +44,46 @@ describe("ticket-08 completion evidence storage", () => {
 		roots.push(root);
 		const result = await finalizeVerificationResult({ repositoryRoot: root, runId: "run-20260918T000000000Z-limit", command: "true", cwd: root, startedAt: "2026-09-18T00:00:00.001Z", completedAt: "2026-09-18T00:00:00.002Z", exitCode: 0, killed: false, stdout: Buffer.alloc(16 * 1024 * 1024 + 1), stderr: "" });
 		expect(result.kind).toBe("storage-error");
+	});
+
+	it("inspects immutable candidate evidence, publishes it without clobbering, and isolates attempt paths", async () => {
+		const root = await mkdtemp(join(tmpdir(), "steward-t16-candidate-storage-"));
+		roots.push(root);
+		const runId = "run-20260920T000000000Z-candidate";
+		const command = "printf candidate";
+		const startedAt = "2026-09-20T00:00:00.001Z";
+		const completedAt = "2026-09-20T00:00:00.002Z";
+		const stdout = Buffer.from("candidate-out\n");
+		const stderr = Buffer.from("candidate-err\n");
+		const log = Buffer.concat([Buffer.from(COMPLETION_OUTPUT_VERSION + "\nstdout-bytes:" + stdout.length + "\nstderr-bytes:" + stderr.length + "\n\n"), stdout, stderr]);
+		const paths = resolveCompletionPaths(root, runId, "verification-01");
+		await mkdir(paths.runtimeDirectory, { recursive: true, mode: 0o700 });
+		await writeFile(paths.descriptorPath, JSON.stringify({ schemaVersion: 1, attemptId: "verification-01", executionNonce: "sha256:" + "d".repeat(64), command, cwd: root, pid: 1234, startedAt }));
+		await writeFile(paths.stdoutPath, stdout);
+		await writeFile(paths.stderrPath, stderr);
+		await writeFile(paths.candidateResultPath, JSON.stringify({ schemaVersion: 1, attemptId: "verification-01", executionNonce: "sha256:" + "d".repeat(64), command, cwd: root, startedAt, completedAt, exitCode: 7, killed: false, stdoutBytes: stdout.length, stderrBytes: stderr.length, stdoutSha256: hashBytes(stdout), stderrSha256: hashBytes(stderr), logSha256: hashBytes(log), argvSha256: "sha256:" + "e".repeat(64) }));
+		const candidate = await inspectFinalVerificationResult({ repositoryRoot: root, runId, command, cwd: root, attemptId: "verification-01", executionNonce: "sha256:" + "d".repeat(64), argvSha256: "sha256:" + "e".repeat(64) });
+		if (candidate.kind !== "complete") throw new Error(candidate.message);
+		expect(candidate.kind).toBe("complete");
+		if (candidate.kind !== "complete" || !candidate.evidence) return;
+		const published = await finalizeVerificationResult(candidate.evidence);
+		expect(published.kind).toBe("created");
+		const canonical = await inspectFinalVerificationResult({ repositoryRoot: root, runId, command, cwd: root, attemptId: "verification-01" });
+		expect(canonical.kind).toBe("complete");
+		if (canonical.kind === "complete") expect(canonical.source).toBe("canonical");
+		const partialPaths = resolveCompletionPaths(root, runId, "verification-02");
+		await mkdir(partialPaths.runtimeDirectory, { recursive: true, mode: 0o700 });
+		const partialBytes = Buffer.from("partial");
+		await writeFile(partialPaths.stdoutPath, partialBytes);
+		const partial = await inspectFinalVerificationResult({ repositoryRoot: root, runId, command, cwd: root, attemptId: "verification-02" });
+		expect(partial.kind).toBe("partial");
+		expect(await readFile(partialPaths.stdoutPath)).toEqual(partialBytes);
+		const second = await finalizeVerificationResult({ ...candidate.evidence, attemptId: "verification-02" });
+		expect(second.kind).toBe("created");
+		if (second.kind === "created") expect(second.paths.verificationDirectory).not.toBe(published.kind === "created" ? published.paths.verificationDirectory : "");
+		const secondCanonical = await inspectFinalVerificationResult({ repositoryRoot: root, runId, command, cwd: root, attemptId: "verification-02" });
+		expect(secondCanonical.kind).toBe("complete");
+		if (secondCanonical.kind === "complete") expect(secondCanonical.source).toBe("canonical");
 	});
 });
 

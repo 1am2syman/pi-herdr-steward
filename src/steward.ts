@@ -63,6 +63,16 @@ import {
 	type IntegrationCheckoutObservation,
 	type TaskIntegration,
 	type FinalVerificationExecution,
+	type RecoverableFinalVerificationExecution,
+	isRecoverableFinalVerificationExecution,
+	type FinalVerificationAttempt,
+	type FinalVerificationAttemptId,
+	type FinalVerificationAttemptObservation,
+	type FinalVerificationAttemptPaths,
+	type FinalVerificationProcessIdentity,
+	type FinalVerificationReworkFacts,
+	type FinalVerificationReworkRecord,
+	type FinalVerificationReworkDispatchRecord,
 	type CompletionAgentIdentity,
 	type CompletionStopResource,
 	type CompletionStopFailure,
@@ -137,6 +147,23 @@ type ProvenAttempt = AttemptRecord & { dispatch: ProvenDispatch };
 type AssignmentDispatch = Extract<AttemptRecord["dispatch"], { phase: "prompt-intended" | "prompted" | "reconciled-active" }>;
 type AssignmentAttempt = AttemptRecord & { dispatch: AssignmentDispatch };
 
+function finalVerificationEvidencePointers(execution: FinalVerificationExecution): { logPath: string; resultPath: string; logSha256: string; resultSha256: string } | undefined {
+	if (isRecoverableFinalVerificationExecution(execution)) {
+		const attempt = execution.attempts.at(-1);
+		const observation = attempt?.observation;
+		return attempt && observation?.kind === "complete" ? { logPath: attempt.paths.logPath, resultPath: attempt.paths.resultPath, logSha256: observation.logSha256, resultSha256: observation.resultSha256 } : undefined;
+	}
+	return execution.phase === "passed" || execution.phase === "failed" ? { logPath: execution.logPath, resultPath: execution.resultPath, logSha256: execution.logSha256, resultSha256: execution.resultSha256 } : undefined;
+}
+
+function finalVerificationStatusLines(execution: FinalVerificationExecution): string[] {
+	if (isRecoverableFinalVerificationExecution(execution)) {
+		const attempt = execution.attempts.at(-1);
+		return [`Final verification: ${execution.phase} · ${attempt?.id ?? "unknown"}/${attempt?.kind ?? "unknown"}`, ...(attempt?.process ? [`Verification process: pid=${attempt.process.pid} nonce=${attempt.process.executionNonce}`] : []), ...(attempt?.observation ? [`Verification observation: ${attempt.observation.kind}`] : []), ...(attempt ? [`Verification result: ${attempt.paths.resultPath}`, `Verification output: ${attempt.paths.logPath}`] : [])];
+	}
+	return [`Final verification: ${execution.phase}`, ...(finalVerificationEvidencePointers(execution) ? [`Verification result: ${finalVerificationEvidencePointers(execution)!.resultPath}`, `Verification output: ${finalVerificationEvidencePointers(execution)!.logPath}`] : [])];
+}
+
 function hasProvenAgentIdentity(attempt: AttemptRecord): attempt is ProvenAttempt {
 	return attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active";
 }
@@ -176,8 +203,9 @@ export interface RunJournalAdapter {
 	inspectReferencedReviewerEvidence?(input: import("./attempt-evidence-store.ts").ReferencedReviewerEvidenceRequest): Promise<import("./attempt-evidence-store.ts").ReferencedReviewerEvidenceResult>;
 	finalizeBuilderEvidence?(input: import("./attempt-evidence-store.ts").FinalizeBuilderEvidenceRequest): Promise<import("./attempt-evidence-store.ts").FinalizeBuilderEvidenceResult>;
 	finalizeReviewerEvidence?(input: import("./attempt-evidence-store.ts").FinalizeReviewerEvidenceRequest): Promise<import("./attempt-evidence-store.ts").FinalizeReviewerEvidenceResult>;
-	resolveCompletionPaths?(repositoryRoot: string, runId: string): CompletionPaths;
+	resolveCompletionPaths?(repositoryRoot: string, runId: string, configDirNameOrAttempt?: string, attemptId?: import("./run.ts").FinalVerificationAttemptId): CompletionPaths;
 	finalizeVerificationResult?(input: VerificationEvidenceInput): Promise<VerificationFinalizeResult>;
+	inspectFinalVerificationResult?(input: { repositoryRoot: string; runId: string; command: string; cwd: string; attemptId: import("./run.ts").FinalVerificationAttemptId; executionNonce?: string; argvSha256?: string }): Promise<import("./completion-store.ts").FinalVerificationResultInspection>;
 	archiveCompletedRun?(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult>;
 	loadCompletionJournalPointers?(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: import("./completion-store.ts").CompletionJournalPointers } | { kind: "unavailable"; message: string }>;
 	loadRecoveryDefaults(): Promise<ConfigLoadResult<RecoveryDefaults>>;
@@ -344,7 +372,30 @@ export type VerificationProcessOutcome =
 
 export interface StewardProcessAdapter {
 	runApprovedVerification?(input: { cwd: string; command: string }): Promise<VerificationProcessOutcome>;
+	launchApprovedVerification?(input: ManagedVerificationInput): Promise<ManagedVerificationLaunchResult>;
+	inspectApprovedVerification?(input: ManagedVerificationInput & { process?: import("./run.ts").FinalVerificationProcessIdentity }): Promise<"live" | "exited" | "not-launched" | "unclear">;
+	waitApprovedVerification?(input: ManagedVerificationInput & { process?: import("./run.ts").FinalVerificationProcessIdentity }, signal: AbortSignal): Promise<"settled" | "cancelled" | "unclear">;
 	inspectAttemptProcesses?(input: { repositoryRoot: string; identity: ManagedAgentIdentity }): Promise<SilenceProcessObservation>;
+}
+
+export interface ManagedVerificationInput {
+	repositoryRoot: string;
+	runId: string;
+	attemptId: import("./run.ts").FinalVerificationAttemptId;
+	command: string;
+	cwd: string;
+	executionNonce: string;
+	paths: import("./run.ts").FinalVerificationAttemptPaths;
+}
+
+export interface ManagedVerificationLaunchResult {
+	kind: "launched" | "not-launched" | "unclear";
+	pid?: number;
+	startToken?: string;
+	argvSha256?: string;
+	executionNonce?: string;
+	launchedAt?: string;
+	diagnostic?: string;
 }
 
 export type IntegrationBaseInspection =
@@ -607,7 +658,8 @@ function integrationStatusLines(task: TaskRecord): string[] {
 function presentCompletionStatus(journal: RunJournal, note?: string): ActiveStatusView {
 	const task = journal.run.tasks[0];
 	const completion = journal.run.completion;
-	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(task ? [`Task ${task.contract.id}: ${task.phase}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : []), ...integrationStatusLines(task)] : []), ...(journal.run.finalVerificationExecution ? [`Final verification: ${journal.run.finalVerificationExecution.phase}`, `Verification result: ${journal.run.finalVerificationExecution.resultPath}`] : []), ...(completion ? [`Completion: ${completion.phase}`] : []), ...(note ? [note] : [])];
+	const verification = journal.run.finalVerificationExecution ? finalVerificationEvidencePointers(journal.run.finalVerificationExecution) : undefined;
+	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(task ? [`Task ${task.contract.id}: ${task.phase}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : []), ...integrationStatusLines(task)] : []), ...(journal.run.finalVerificationExecution ? [`Final verification: ${journal.run.finalVerificationExecution.phase}`, ...(verification ? [`Verification result: ${verification.resultPath}`] : [])] : []), ...(completion ? [`Completion: ${completion.phase}`] : []), ...(note ? [note] : [])];
 	const attentionCount = task && task.attention !== "none" ? 1 : 0;
 	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · ${journal.run.status} · ${attentionCount} attention` } };
 }
@@ -702,7 +754,7 @@ function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatu
 	const attention = journal.run.tasks.filter((task) => task.attention !== "none").length;
 	const queue = selectIntegrationQueueHead(journal.run);
 	const nextIntegration = queue.kind === "ready" || queue.kind === "waiting" ? queue.taskId : "none";
-	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...journal.run.tasks.map((task, index) => {
+	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(journal.run.finalVerificationExecution ? finalVerificationStatusLines(journal.run.finalVerificationExecution) : []), ...journal.run.tasks.map((task, index) => {
 		const attempt = task.attempts.at(-1);
 		const integration = task.integration?.phase ?? (task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? "queued" : "n/a");
 		const reason = task.attention !== "none" ? `/${task.attention}${task.attentionReason ? `:${task.attentionReason}` : ""}` : "";
@@ -720,6 +772,8 @@ function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatu
 }
 
 function pendingControllerAction(journal: RunJournal): ControllerPendingAction {
+	const finalExecution = journal.run.finalVerificationExecution;
+	if (finalExecution && isRecoverableFinalVerificationExecution(finalExecution) && (finalExecution.phase === "executing" || finalExecution.phase === "failed")) return { kind: "final-verification" };
 	for (const task of journal.run.tasks) {
 		const attempt = task.attempts.at(-1);
 		if (attempt && ["prepared", "active", "awaiting-report"].includes(attempt.state) && (attempt.dispatch.phase === "prompt-intended" || attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active")) return { kind: "reconcile-attempt", taskId: task.contract.id, attemptId: attempt.id, role: attempt.role };
@@ -1710,7 +1764,7 @@ function emptyIntegrationObservation(): IntegrationCheckoutObservation {
 }
 
 function completionAttentionReason(reason: TaskAttentionReason): boolean {
-	return ["integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed"].includes(reason);
+	return ["integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "final-verification-ownership-unclear", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed"].includes(reason);
 }
 
 async function persistCompletionAttention(repositoryRoot: string, journal: RunJournal, taskId: string, reason: TaskAttentionReason, diagnostic: string, dependencies: StewardDependencies): Promise<ReviewDecision> {
@@ -1759,7 +1813,7 @@ async function loadCompletionEvidence(repositoryRoot: string, task: TaskRecord, 
 
 function completionIntegrationIdentity(journal: RunJournal, task: TaskRecord, evidence: { subject: ReviewSubject; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord }, targetRevision?: string): TaskIntegration | undefined {
 	if (journal.run.integrationBase.kind !== "git" || evidence.subject.kind !== "git" || evidence.builder.evidence?.phase !== "finalized" || evidence.reviewer.evidence?.phase !== "finalized") return undefined;
-	const target = targetRevision ?? task.integrationRecoveries?.at(-1)?.observed.head ?? journal.run.integrationBase.revision;
+	const target = targetRevision ?? task.integrationRecoveries?.at(-1)?.observed.head ?? task.finalVerificationReworks?.at(-1)?.priorIntegration.observedHead ?? journal.run.integrationBase.revision;
 	const action = target === evidence.subject.baseRevision ? { kind: "fast-forward" as const, argv: ["merge", "--ff-only", "--no-edit", evidence.subject.headRevision] as ["merge", "--ff-only", "--no-edit", string] } : { kind: "merge-commit" as const, argv: ["merge", "--no-ff", "--no-edit", evidence.subject.headRevision] as ["merge", "--no-ff", "--no-edit", string] };
 	return {
 		phase: "intended",
@@ -2060,6 +2114,286 @@ function completionGateFacts(journal: RunJournal, checkout: IntegrationCheckoutO
 	return { ...result.facts, evaluatedAt, predicates: [...COMPLETION_GATE_PREDICATES] };
 }
 
+function cloneIntegratedIdentity(integration: Extract<TaskIntegration, { phase: "integrated" }>): Extract<TaskIntegration, { phase: "integrated" }> {
+	return {
+		...integration,
+		approvedCommits: [...integration.approvedCommits],
+		action: integration.action.kind === "fast-forward"
+			? { kind: "fast-forward", argv: [...integration.action.argv] as ["merge", "--ff-only", "--no-edit", string] }
+			: { kind: "merge-commit", argv: [...integration.action.argv] as ["merge", "--no-ff", "--no-edit", string] },
+	};
+}
+
+function managedVerificationPaths(paths: CompletionPaths): FinalVerificationAttemptPaths {
+	return { runtimeDirectory: paths.runtimeDirectory, descriptorPath: paths.descriptorPath, stdoutPath: paths.stdoutPath, stderrPath: paths.stderrPath, candidateResultPath: paths.candidateResultPath, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath };
+}
+
+function managedVerificationNonce(runId: string, attemptId: FinalVerificationAttemptId, command: string, cwd: string): string {
+	return sha256Bytes(Buffer.from(`${runId}\n${attemptId}\n${command}\n${cwd}`, "utf8"));
+}
+
+function managedCompleteObservationFromResult(result: { startedAt: string; completedAt: string; exitCode: number; killed: false; logSha256: string; resultSha256: string }, checkout: IntegrationCheckoutObservation): Extract<FinalVerificationAttemptObservation, { kind: "complete" }> {
+	return { kind: "complete", startedAt: result.startedAt, completedAt: result.completedAt, exitCode: result.exitCode, killed: false, logSha256: result.logSha256, resultSha256: result.resultSha256, checkout: { ...checkout, dirtyPaths: [...checkout.dirtyPaths], operationMarkers: [...checkout.operationMarkers] } };
+}
+
+function managedFinalVerificationAvailable(dependencies: StewardDependencies): boolean {
+	return Boolean(dependencies.runJournal.resolveCompletionPaths && dependencies.runJournal.inspectFinalVerificationResult && dependencies.runJournal.finalizeVerificationResult && dependencies.process.launchApprovedVerification && dependencies.process.inspectApprovedVerification);
+}
+
+function managedExecutionLast(execution: RecoverableFinalVerificationExecution): FinalVerificationAttempt {
+	return execution.attempts[execution.attempts.length - 1]!;
+}
+
+function managedExecutionComplete(execution: RecoverableFinalVerificationExecution): Extract<FinalVerificationAttemptObservation, { kind: "complete" }> | undefined {
+	const observation = managedExecutionLast(execution).observation;
+	return observation?.kind === "complete" ? observation : undefined;
+}
+
+function isFinalVerificationReworkDispatchForSteward(dispatch: AttemptRecord["dispatch"]): dispatch is FinalVerificationReworkDispatchRecord {
+	return "verificationRework" in dispatch;
+}
+
+async function persistManagedFinalVerificationAmbiguous(repositoryRoot: string, journal: RunJournal, diagnostic: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	const current = journal.run.finalVerificationExecution;
+	if (!current || !isRecoverableFinalVerificationExecution(current)) return { journal, note: diagnostic };
+	if (current.phase === "ambiguous" && current.attempts.at(-1)?.observation?.kind === "ambiguous") return { journal, note: diagnostic };
+	const observedAt = transitionTimestamp(journal, dependencies.clock.now());
+	let candidate: RunJournal;
+	try {
+		candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const execution = next.run.finalVerificationExecution;
+			if (!execution || !isRecoverableFinalVerificationExecution(execution)) throw new Error("Managed final-verification execution disappeared before ambiguity classification.");
+			execution.phase = "ambiguous";
+			execution.attempts[execution.attempts.length - 1]!.observation = { kind: "ambiguous", observedAt, diagnostic: diagnostic.slice(0, 2_000) };
+			for (const task of next.run.tasks) { task.attention = "needs-user"; task.attentionReason = "final-verification-ambiguous"; task.attentionDiagnostic = diagnostic.slice(0, 2_000); }
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Final-verification ambiguity could not be retained; no rerun or interference was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+	return persisted ? { journal: persisted, note: diagnostic, action: "run-final-verification" } : { journal, note: "Final-verification ambiguity could not be persisted; no rerun or interference was attempted." };
+}
+
+async function persistManagedFinalVerificationOwnershipUnclear(repositoryRoot: string, journal: RunJournal, diagnostic: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	if (journal.run.tasks.length === 0 || journal.run.tasks.every((task) => task.attention === "needs-user" && task.attentionReason === "final-verification-ownership-unclear")) return { journal, note: diagnostic };
+	let candidate: RunJournal;
+	try {
+		candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			for (const task of next.run.tasks) {
+				task.attention = "needs-user";
+				task.attentionReason = "final-verification-ownership-unclear";
+				task.attentionDiagnostic = diagnostic.slice(0, 2_000);
+			}
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Final-verification ownership ambiguity could not be retained; no rework or interference was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+	return persisted ? { journal: persisted, note: diagnostic } : { journal, note: "Final-verification ownership ambiguity could not be persisted; no rework or interference was attempted." };
+}
+
+async function appendManagedRecoveryAttempt(repositoryRoot: string, journal: RunJournal, execution: RecoverableFinalVerificationExecution, diagnostic: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	if (execution.attempts.length !== 1) return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, "The recorded recovery attempt is non-live without a complete result; no third final-verification launch is permitted.", dependencies);
+	const first = execution.attempts[0]!;
+	const observedAt = transitionTimestamp(journal, dependencies.clock.now());
+	const paths = dependencies.runJournal.resolveCompletionPaths!(repositoryRoot, journal.run.id, undefined, "verification-02");
+	const second: FinalVerificationAttempt = { id: "verification-02", kind: "recovery-rerun", intendedAt: transitionTimestamp(journal, dependencies.clock.now()), paths: managedVerificationPaths(paths) };
+	let candidate: RunJournal;
+	try {
+		candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const current = next.run.finalVerificationExecution;
+			if (!current || !isRecoverableFinalVerificationExecution(current) || current.attempts.length !== 1 || current.attempts[0]!.id !== first.id) throw new Error("Final-verification recovery predecessor changed before reservation.");
+			current.attempts[0]!.observation = { kind: "inconclusive", observedAt, diagnostic: diagnostic.slice(0, 2_000) };
+			current.attempts.push({ ...second, paths: { ...second.paths } });
+			current.phase = "executing";
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Final-verification recovery reservation failed before the second launch. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+	return persisted ? { journal: persisted, note: "The first final-verification attempt is durably non-live; one deterministic recovery rerun is reserved for the next Controller pass.", action: "run-final-verification" } : { journal, note: "Final-verification recovery reservation could not be persisted; no second launch was attempted." };
+}
+
+async function launchManagedFinalVerification(repositoryRoot: string, journal: RunJournal, execution: RecoverableFinalVerificationExecution, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	const attempt = managedExecutionLast(execution);
+	const nonce = managedVerificationNonce(journal.run.id, attempt.id, execution.command, execution.cwd);
+	const input: ManagedVerificationInput = { repositoryRoot, runId: journal.run.id, attemptId: attempt.id, command: execution.command, cwd: execution.cwd, executionNonce: nonce, paths: attempt.paths };
+	let launched: ManagedVerificationLaunchResult;
+	try { launched = await dependencies.process.launchApprovedVerification!(input); }
+	catch (error: unknown) { launched = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Managed final-verification launch failed." }; }
+	if (launched.kind === "not-launched") {
+		if (attempt.id === "verification-01") return appendManagedRecoveryAttempt(repositoryRoot, journal, execution, launched.diagnostic ?? "The initial managed verification did not cross its publication boundary.", dependencies);
+		return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, launched.diagnostic ?? "The recovery managed verification did not cross its publication boundary; no third launch is permitted.", dependencies);
+	}
+	if (launched.kind !== "launched" || launched.executionNonce !== nonce || !launched.pid || !Number.isSafeInteger(launched.pid) || launched.pid <= 0 || !launched.startToken || !launched.argvSha256 || !/^sha256:[0-9a-f]{64}$/.test(launched.argvSha256) || !launched.launchedAt) return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, launched.diagnostic ?? "Managed final-verification launch identity was unclear; no rerun or signal was attempted.", dependencies);
+	const processIdentity: FinalVerificationProcessIdentity = { pid: launched.pid, startToken: launched.startToken, executionNonce: nonce, commandSha256: sha256Bytes(Buffer.from(execution.command, "utf8")), argvSha256: launched.argvSha256, launchedAt: launched.launchedAt };
+	let candidate: RunJournal;
+	try {
+		candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const current = next.run.finalVerificationExecution;
+			if (!current || !isRecoverableFinalVerificationExecution(current) || current.attempts.at(-1)?.id !== attempt.id || current.attempts.at(-1)?.process) throw new Error("Final-verification launch predecessor changed before process identity CAS.");
+			current.attempts[current.attempts.length - 1]!.process = { ...processIdentity };
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Managed final-verification launch was acknowledged but its process identity CAS lost; the next owner must inspect the exact descriptor. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+	return persisted ? { journal: persisted, note: `Managed final verification ${attempt.id} launched with the frozen command; the exact process identity is durable.`, action: "run-final-verification" } : { journal, note: "Managed final-verification launch identity could not be persisted; no second launch or signal was attempted." };
+}
+
+async function consumeManagedFinalVerificationResult(input: { repositoryRoot: string; journal: RunJournal; execution: RecoverableFinalVerificationExecution; checkoutInput: IntegrationCheckoutInput; inspectCheckout: () => Promise<import("./steward.ts").IntegrationCheckoutResult>; dependencies: StewardDependencies }): Promise<CompletionDecision | undefined> {
+	const { repositoryRoot, journal, execution, checkoutInput, inspectCheckout, dependencies } = input;
+	const lastAttempt = managedExecutionLast(execution);
+	const command = execution.command;
+	const inspected = await dependencies.runJournal.inspectFinalVerificationResult!({ repositoryRoot, runId: journal.run.id, command, cwd: execution.cwd, attemptId: lastAttempt.id, executionNonce: lastAttempt.process?.executionNonce, argvSha256: lastAttempt.process?.argvSha256 });
+	if (inspected.kind !== "complete") return undefined;
+	let completeResult = inspected;
+	if (inspected.source === "candidate") {
+		if (!inspected.evidence) return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, "A managed candidate was complete but could not be bound to canonical immutable evidence; no rerun was attempted.", dependencies);
+		let published: VerificationFinalizeResult;
+		try { published = await dependencies.runJournal.finalizeVerificationResult!({ ...inspected.evidence }); }
+		catch (error: unknown) { published = { kind: "storage-error", paths: inspected.paths, message: error instanceof Error ? error.message : "Canonical verification publication failed." }; }
+		if (published.kind !== "created" && published.kind !== "existing-match") return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, `Complete managed verification evidence could not be published without clobbering bytes: ${"message" in published ? published.message : "unknown storage failure"}`, dependencies);
+		completeResult = { ...inspected, source: "canonical", result: published.result, resultBytes: Buffer.from(JSON.stringify(published.result, null, 2) + "\n", "utf8"), logSha256: published.logSha256, resultSha256: published.resultSha256, paths: published.paths };
+	}
+	const post = await inspectCheckout();
+	if (post.kind !== "inspected") return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, `Complete final-verification evidence is durable, but the fresh checkout observation is unavailable: ${post.message}`, dependencies);
+	const checkout = post.observation;
+	const exact = integrationObservationExact(checkoutInput, post);
+	const dirtied = checkout.dirtyPaths.length > 0 || checkout.operationMarkers.length > 0;
+	const observation = managedCompleteObservationFromResult({ ...completeResult.result, resultSha256: completeResult.resultSha256 }, checkout);
+	const terminalPhase: RecoverableFinalVerificationExecution["phase"] = exact ? (completeResult.result.exitCode === 0 ? "passed" : "failed") : "ambiguous";
+	const reason: TaskAttentionReason | undefined = exact ? undefined : dirtied ? "verification-dirtied-checkout" : "final-verification-ambiguous";
+	let candidate: RunJournal;
+	try {
+		candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const current = next.run.finalVerificationExecution;
+			if (!current || !isRecoverableFinalVerificationExecution(current) || current.attempts.at(-1)?.id !== lastAttempt.id) throw new Error("Final-verification result predecessor changed before classification.");
+			current.phase = terminalPhase;
+			current.attempts[current.attempts.length - 1]!.observation = observation;
+			if (reason) for (const task of next.run.tasks) { task.attention = "needs-user"; task.attentionReason = reason; task.attentionDiagnostic = dirtied ? `Verification preserved checkout dirt: ${[...checkout.dirtyPaths].sort().join(", ") || "none"}${checkout.operationMarkers.length > 0 ? `; markers: ${[...checkout.operationMarkers].sort().join(", ")}` : ""}.` : "Final verification could not be classified against the exact fresh checkout."; }
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Complete final-verification evidence was preserved but classification CAS was lost; no rerun was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+	return persisted ? { journal: persisted, note: terminalPhase === "passed" ? "Complete managed final-verification evidence was consumed without a rerun." : reason === "verification-dirtied-checkout" ? "Verification-created checkout dirt was preserved and blocks completion." : terminalPhase === "failed" ? "Complete managed final-verification failure was durably classified; ownership routing is queued." : "Final-verification evidence is durable but the fresh checkout is ambiguous.", action: "run-final-verification" } : { journal, note: "Complete final-verification classification could not be persisted; no rerun or routing was attempted." };
+}
+
+async function dispatchFinalVerificationRework(repositoryRoot: string, journalInput: RunJournal, execution: RecoverableFinalVerificationExecution, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	const journal = journalInput;
+	if (journal.run.tasks.length !== 1) return persistManagedFinalVerificationOwnershipUnclear(repositoryRoot, journal, "Final-verification failure ownership is unclear because the Run contains multiple Tasks; integrations, Approval, evidence, and the failed result were preserved.", dependencies);
+	const task = journal.run.tasks[0];
+	const lastObservation = managedExecutionComplete(execution);
+	if (!task || !task.integration || task.integration.phase !== "integrated" || !task.approval || task.approval.phase !== "valid" || !lastObservation || lastObservation.exitCode === 0 || lastObservation.checkout.dirtyPaths.length > 0 || lastObservation.checkout.operationMarkers.length > 0 || !lastObservation.checkout.rangeExact) return persistCompletionAttention(repositoryRoot, journal, task?.contract.id ?? "final-verification", "final-verification-ownership-unclear", "Final-verification failure ownership could not be proved from one exact clean integrated Approval; no rework was reserved.", dependencies);
+	const builder = task.attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === task.approval?.builderAttemptId && attempt.role === "builder");
+	const reviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.id === task.approval?.reviewerAttemptId && attempt.role === "reviewer");
+	const dispatch = builder?.dispatch;
+	if (!builder || !reviewer || reviewer.state !== "reported" || reviewer.evidence?.phase !== "finalized" || reviewer.evidence.verdict !== "approved" || builder.evidence?.phase !== "finalized" || !dispatch || (dispatch.phase !== "prompted" && dispatch.phase !== "reconciled-active") || !dependencies.git.inspectBuilderWorktree || !dependencies.herdr.promptBuilder) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-ownership-unclear", "Final-verification failure ownership is unclear because the exact current Builder/Reviewer lineage is not uniquely provable; no rework was reserved.", dependencies);
+	if (task.reworkCycles >= journal.run.effectiveSettings.reworkCycleLimit) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-failed", "Final-verification failed with the frozen rework budget exhausted; the failed result and integrated revision were preserved.", dependencies);
+	let worktree: { kind: "ready"; head: string; clean: true } | { kind: "unavailable"; message: string };
+	try { worktree = await dependencies.git.inspectBuilderWorktree(dispatch.worktreePath, reviewer.subject.kind === "git" ? reviewer.subject.headRevision : ""); }
+	catch (error: unknown) { worktree = { kind: "unavailable", message: error instanceof Error ? error.message : "Builder worktree inspection failed." }; }
+	if (reviewer.subject.kind !== "git" || worktree.kind !== "ready" || worktree.head !== reviewer.subject.headRevision || !worktree.clean) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-failed", `Same-Builder final-verification rework preflight failed; the failed result and integrated revision were preserved. ${worktree.kind === "unavailable" ? worktree.message : "The recorded Builder worktree is not the exact clean reviewed revision."}`, dependencies);
+	const priorIntegration = cloneIntegratedIdentity(task.integration);
+	const priorBuilderAttemptId = builder.id;
+	const priorReviewerAttemptId = reviewer.id;
+	const replacementBuilderAttemptId = `attempt-${String(task.attempts.length + 1).padStart(2, "0")}`;
+	const failedExecution = { command: execution.command, attemptId: managedExecutionLast(execution).id, exitCode: lastObservation.exitCode, logPath: managedExecutionLast(execution).paths.logPath, resultPath: managedExecutionLast(execution).paths.resultPath, logSha256: lastObservation.logSha256, resultSha256: lastObservation.resultSha256 };
+	const facts: FinalVerificationReworkFacts = { failedCommand: execution.command, failedAttemptId: failedExecution.attemptId, failedLogPath: failedExecution.logPath, failedResultPath: failedExecution.resultPath, failedLogSha256: failedExecution.logSha256, failedResultSha256: failedExecution.resultSha256, priorIntegration, priorBuilderAttemptId, priorReviewerAttemptId };
+	const cycle = task.reworkCycles + 1;
+	const reworkDispatch: FinalVerificationReworkDispatchRecord = { phase: "assignment-intended", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, cycle, priorBuilderAttemptId, priorReviewerAttemptId, verificationRework: facts };
+	const assignmentPaths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, task.contract.id, replacementBuilderAttemptId);
+	const prepared: BuilderAttemptRecord = { id: replacementBuilderAttemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...builder.actualModel }, specificationHash: task.specificationHash, baseRevision: priorIntegration.observedHead, assignmentPath: assignmentPaths.assignmentPath, reportPath: assignmentPaths.reportPath, evidenceDirectory: assignmentPaths.evidenceDirectory, dispatch: reworkDispatch };
+	let reserved: RunJournal;
+	try {
+		reserved = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const current = next.run.tasks[0];
+			if (!current || current.attempts.length !== task.attempts.length || current.reworkCycles !== task.reworkCycles || current.integration?.phase !== "integrated" || current.approval?.phase !== "valid") throw new Error("Final-verification rework predecessor changed before reservation.");
+			current.finalVerificationReworks = [...(current.finalVerificationReworks ?? []), { kind: "final-verification-failure", failedExecution, priorIntegration: cloneIntegratedIdentity(priorIntegration), priorBuilderAttemptId, priorReviewerAttemptId, replacementBuilderAttemptId, observedAt: transitionTimestamp(journal, dependencies.clock.now()) } satisfies FinalVerificationReworkRecord];
+			current.approval = { ...current.approval, phase: "invalidated", invalidatedAt: transitionTimestamp(journal, dependencies.clock.now()), reason: "final-verification-failed", diagnostic: "Final verification returned a conclusive nonzero result; a fresh Builder revision and Review are required.", subject: { ...current.approval.subject, ...(current.approval.subject.kind === "git" ? { commits: [...current.approval.subject.commits] } : { artifacts: current.approval.subject.artifacts.map((artifact) => ({ ...artifact })) }) }, worktreeSnapshot: { ...current.approval.worktreeSnapshot, dirtyPaths: [...current.approval.worktreeSnapshot.dirtyPaths], operationMarkers: [...current.approval.worktreeSnapshot.operationMarkers] } };
+			delete current.integration;
+			delete next.run.finalVerificationExecution;
+			current.phase = "reworking";
+			current.attention = "none";
+			delete current.attentionReason;
+			delete current.attentionDiagnostic;
+			current.reworkCycles = cycle;
+			current.attempts.push({ ...prepared, dispatch: { ...reworkDispatch, verificationRework: { ...facts, priorIntegration: cloneIntegratedIdentity(priorIntegration) } } });
+			clearTaskMonitor(next.run, current.contract.id);
+		});
+	} catch (error: unknown) { return { journal, note: `Final-verification rework reservation failed before Assignment or prompt effects. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedReserved = await persistReviewJournal(repositoryRoot, reserved, dependencies);
+	if (!persistedReserved) return { journal, note: "Final-verification rework reservation could not be persisted; no Assignment or prompt effect was attempted." };
+	let currentJournal = persistedReserved;
+	const currentTask = currentJournal.run.tasks[0];
+	const currentAttempt = currentTask?.attempts.at(-1);
+	if (!currentTask || !currentAttempt || currentAttempt.role !== "builder") return { journal: currentJournal, note: "Reserved final-verification rework Attempt disappeared; no external effect was attempted." };
+	let assignment: BuilderAssignmentDocument;
+	try { assignment = buildBuilderAssignment({ run: currentJournal.run, task: currentTask, attempt: currentAttempt, worktreePath: dispatch.worktreePath, branch: dispatch.branch, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, agentName: dispatch.agentName }); }
+	catch (error: unknown) { return { journal: currentJournal, note: `Final-verification rework Assignment could not be built; the reserved Attempt is retained without a prompt. ${error instanceof Error ? error.message : "Assignment validation failed."}` }; }
+	let assignmentResult: AssignmentCreateResult;
+	try { assignmentResult = await dependencies.runJournal.createAssignment(repositoryRoot, assignment); }
+	catch (error: unknown) { return { journal: currentJournal, note: `Final-verification rework Assignment storage failed; the reserved Attempt is retained without a prompt. ${error instanceof Error ? error.message : "Storage failed."}` }; }
+	if (assignmentResult.kind !== "created" && assignmentResult.kind !== "existing-match") return { journal: currentJournal, note: "Final-verification rework Assignment conflicts with different bytes; the failed result and reserved Attempt are retained and no prompt was sent." };
+	const assignmentHash = builderAssignmentSha256(assignmentResult.bytes);
+	let promptIntent: RunJournal;
+	try { promptIntent = advanceRunJournal(currentJournal, dependencies.clock.now(), (next) => { const attempt = next.run.tasks[0]?.attempts.at(-1); if (!attempt || attempt.role !== "builder" || !isFinalVerificationReworkDispatchForSteward(attempt.dispatch)) throw new Error("Final-verification rework Attempt disappeared before prompt intent."); attempt.dispatch = { ...attempt.dispatch, phase: "prompt-intended", assignmentSha256: assignmentHash }; }); }
+	catch (error: unknown) { return { journal: currentJournal, note: `Final-verification rework prompt intent could not be persisted; no prompt was sent. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedIntent = await persistReviewJournal(repositoryRoot, promptIntent, dependencies);
+	if (!persistedIntent) return { journal: currentJournal, note: "Final-verification rework prompt intent could not be persisted; no prompt was sent." };
+	currentJournal = persistedIntent;
+	let prompted: HerdrPromptResult;
+	try { prompted = await dependencies.herdr.promptBuilder({ repositoryRoot, name: dispatch.agentName, assignmentPrompt: formatBuilderPrompt(assignment) }); }
+	catch (error: unknown) { return { journal: currentJournal, note: `Same Builder final-verification rework prompt failed; prompt-intended state is retained without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
+	if (prompted.kind !== "prompted" || prompted.name !== dispatch.agentName || prompted.workspaceId !== dispatch.workspaceId || prompted.paneId !== dispatch.paneId || prompted.terminalId !== dispatch.terminalId || !validIdentity(prompted.tabId)) return { journal: currentJournal, note: "Same Builder final-verification rework prompt acknowledgement was malformed; prompt-intended state is retained without a resend." };
+	let active: RunJournal;
+	try { active = advanceRunJournal(currentJournal, dependencies.clock.now(), (next) => { const attempt = next.run.tasks[0]?.attempts.at(-1); if (!attempt || attempt.role !== "builder" || attempt.dispatch.phase !== "prompt-intended" || !isFinalVerificationReworkDispatchForSteward(attempt.dispatch)) throw new Error("Final-verification rework prompt intent disappeared after prompt."); attempt.state = "active"; attempt.activatedAt = transitionTimestamp(currentJournal, dependencies.clock.now()); attempt.dispatch = { ...attempt.dispatch, phase: "prompted", promptedAt: attempt.activatedAt }; }); }
+	catch (error: unknown) { return { journal: currentJournal, note: `Same Builder final-verification rework prompt succeeded but activation could not be retained; no resend will be attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedActive = await persistReviewJournal(repositoryRoot, active, dependencies);
+	return persistedActive ? { journal: persistedActive, note: `Final-verification rework cycle ${cycle} reserved and prompted the existing Builder ${dispatch.agentName}; a fresh Review is mandatory.`, action: "dispatch-rework-builder" } : { journal: currentJournal, note: "Same Builder final-verification rework activation could not be persisted; no resend will be attempted." };
+}
+
+async function reconcileFinalVerification(input: { repositoryRoot: string; journal: RunJournal; checkoutInput: IntegrationCheckoutInput; inspectCheckout: () => Promise<import("./steward.ts").IntegrationCheckoutResult>; dependencies: StewardDependencies }): Promise<CompletionDecision | undefined> {
+	const { repositoryRoot, dependencies } = input;
+	if (!managedFinalVerificationAvailable(dependencies)) return undefined;
+	let journal = input.journal;
+	const command = journal.run.finalVerification.kind === "command" ? journal.run.finalVerification.command : undefined;
+	if (!command || !dependencies.runJournal.resolveCompletionPaths || !dependencies.runJournal.inspectFinalVerificationResult || !dependencies.runJournal.finalizeVerificationResult || !dependencies.process.inspectApprovedVerification || !dependencies.process.launchApprovedVerification) return undefined;
+	let execution = journal.run.finalVerificationExecution;
+	if (!execution) {
+		const preflight = await input.inspectCheckout();
+		if (preflight.kind !== "inspected" || !integrationObservationExact(input.checkoutInput, preflight)) return persistCompletionAttention(repositoryRoot, journal, journal.run.tasks.find((task) => task.attention !== "none")?.contract.id ?? journal.run.tasks[0]?.contract.id ?? "final-verification", "integration-preflight", preflight.kind === "inspected" ? "The final integration checkout is not the exact clean target; no managed verification intent or process was created." : `The final integration checkout could not be inspected: ${preflight.message}`, dependencies);
+		const paths = dependencies.runJournal.resolveCompletionPaths(repositoryRoot, journal.run.id, undefined, "verification-01");
+		const initial: FinalVerificationAttempt = { id: "verification-01", kind: "initial", intendedAt: transitionTimestamp(journal, dependencies.clock.now()), paths: managedVerificationPaths(paths) };
+		let candidate: RunJournal;
+		try { candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => { if (next.run.finalVerificationExecution) throw new Error("Final-verification execution appeared before intent CAS."); next.run.finalVerificationExecution = { phase: "executing", command, cwd: repositoryRoot, attempts: [initial] }; }); }
+		catch (error: unknown) { return { journal, note: `Managed final-verification intent could not be persisted; no process was launched. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+		return persisted ? { journal: persisted, note: "Managed final-verification intent is durable; launch is queued behind the Controller one-action boundary.", action: "run-final-verification" } : { journal, note: "Managed final-verification intent could not be persisted; no process was launched." };
+	}
+	if (!isRecoverableFinalVerificationExecution(execution)) return undefined;
+	if (execution.cwd !== repositoryRoot || execution.command !== command) return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, "Managed final-verification command or cwd no longer matches the frozen Run identity.", dependencies);
+	if (execution.phase === "ambiguous") return { journal, note: "Final verification is durably ambiguous; no rerun or interference was attempted." };
+	if (execution.phase === "passed") return { journal, note: "Managed final verification already passed; the Completion Gate remains the only next action." };
+	if (execution.phase === "failed") return dispatchFinalVerificationRework(repositoryRoot, journal, execution, dependencies);
+	const consumed = await consumeManagedFinalVerificationResult({ ...input, execution });
+	if (consumed) return consumed;
+	const last = managedExecutionLast(execution);
+	const processInput: ManagedVerificationInput & { process?: FinalVerificationProcessIdentity } = { repositoryRoot, runId: journal.run.id, attemptId: last.id, command, cwd: repositoryRoot, executionNonce: last.process?.executionNonce ?? managedVerificationNonce(journal.run.id, last.id, command, repositoryRoot), paths: last.paths, ...(last.process ? { process: last.process } : {}) };
+	let liveness: "live" | "exited" | "not-launched" | "unclear";
+	try { liveness = await dependencies.process.inspectApprovedVerification(processInput); }
+	catch { liveness = "unclear"; }
+	if (liveness === "live") return { journal, note: `Managed final verification ${last.id} is still live; the exact process remains untouched and the existing monitor wait owns observation.` };
+	if (liveness === "unclear") return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, "Managed final-verification process identity or liveness could not be proved; no rerun was attempted.", dependencies);
+	if (last.process && (liveness === "exited" || liveness === "not-launched")) return appendManagedRecoveryAttempt(repositoryRoot, journal, execution, "The recorded final-verification process is conclusively non-live without a complete durable result.", dependencies);
+	if (last.observation?.kind === "inconclusive") {
+		if (last.id === "verification-01") return appendManagedRecoveryAttempt(repositoryRoot, journal, execution, last.observation.diagnostic, dependencies);
+		return persistManagedFinalVerificationAmbiguous(repositoryRoot, journal, "The recovery attempt is inconclusive without a complete result; no third launch is permitted.", dependencies);
+	}
+	return launchManagedFinalVerification(repositoryRoot, journal, execution, dependencies);
+}
+
 async function collectCompletionReports(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<import("./completion-store.ts").CompletionReportSource[] | { message: string }> {
 	if (!dependencies.runJournal.loadFinalizedEvidenceManifest) return { message: "Protected finalized-manifest loading is unavailable for archive publication." };
 	const reports: import("./completion-store.ts").CompletionReportSource[] = [];
@@ -2174,7 +2508,14 @@ async function advanceMultiTaskFinalization(repositoryRoot: string, journalInput
 	const finalInput: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: lastIntegration.observedHead, approvedBaseRevision: lastIntegration.approvedBaseRevision, approvedHeadRevision: lastIntegration.approvedHeadRevision, approvedCommits: [...lastIntegration.approvedCommits] };
 	const inspectFinal = async (): Promise<import("./steward.ts").IntegrationCheckoutResult> => inspectCompletionCheckout(finalInput, dependencies);
 	const exactFinal = (result: import("./steward.ts").IntegrationCheckoutResult): result is Extract<import("./steward.ts").IntegrationCheckoutResult, { kind: "inspected" }> => result.kind === "inspected" && result.observation.branch === finalInput.targetBranch && result.observation.head === finalInput.targetRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0 && result.observation.rangeExact;
-	const currentExecution = journal.run.finalVerificationExecution;
+	let currentExecution = journal.run.finalVerificationExecution;
+	const managedDecision = await reconcileFinalVerification({ repositoryRoot, journal, checkoutInput: finalInput, inspectCheckout: inspectFinal, dependencies });
+	if (managedDecision) {
+		const managedExecution = managedDecision.journal.run.finalVerificationExecution;
+		if (!managedExecution || !isRecoverableFinalVerificationExecution(managedExecution) || managedExecution.phase !== "passed" || !managedExecutionComplete(managedExecution)) return managedDecision;
+		journal = managedDecision.journal;
+		currentExecution = managedExecution;
+	}
 	if (!currentExecution) {
 		const fresh = await inspectFinal();
 		if (!exactFinal(fresh) || !dependencies.process.runApprovedVerification || !dependencies.runJournal.resolveCompletionPaths || !dependencies.runJournal.finalizeVerificationResult) return { journal, note: exactFinal(fresh) ? "Final-verification process/storage adapters are unavailable; no process was launched." : "The fresh final integration checkout is not exact, clean, and marker-free; no verification effect was attempted." };
@@ -2264,7 +2605,7 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 		const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
 		if ("message" in evidence) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", evidence.message, dependencies);
 		if (evidence.subject.kind !== "git" || journal.run.integrationBase.kind !== "git") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved completion requires a Git Builder subject and Git integration base; no Git effect was attempted.", dependencies);
-		const targetRevision = task.integrationRecoveries?.at(-1)?.observed.head ?? journal.run.integrationBase.revision;
+		const targetRevision = task.integrationRecoveries?.at(-1)?.observed.head ?? task.finalVerificationReworks?.at(-1)?.priorIntegration.observedHead ?? journal.run.integrationBase.revision;
 		const input: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] };
 		const preflight = await inspectCompletionCheckout(input, dependencies);
 		if (integrationFactsAvailable(preflight)) {
@@ -2307,6 +2648,13 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 	if (!task.integration || task.integration.phase === "intended") return { journal, note: task.integration ? "Integration intent is durably retained; ticket-08 will not retry or infer its post-state." : "" };
 	if (task.integration.phase !== "integrated") return { journal, note: task.attentionDiagnostic ?? "Integration is paused for user attention; no retry or recovery was attempted." };
 	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? "Integrated Task remains paused for user attention." };
+	const managedInput = completionIntegrationInput(repositoryRoot, task.integration);
+	const managedDecision = await reconcileFinalVerification({ repositoryRoot, journal, checkoutInput: managedInput, inspectCheckout: () => inspectCompletionCheckout(managedInput, dependencies), dependencies });
+	if (managedDecision) {
+		const managedExecution = managedDecision.journal.run.finalVerificationExecution;
+		if (!managedExecution || !isRecoverableFinalVerificationExecution(managedExecution) || managedExecution.phase !== "passed" || !managedExecutionComplete(managedExecution)) return managedDecision;
+		journal = managedDecision.journal;
+	}
 	if (!journal.run.finalVerificationExecution) {
 		const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
 		if ("message" in evidence) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", `Completion evidence revalidation failed before verification intent: ${evidence.message}`, dependencies);
@@ -2449,7 +2797,9 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 		const paths = dependencies.runJournal.resolveCompletionPaths(repositoryRoot, journal.run.id);
 		const pointers = await dependencies.runJournal.loadCompletionJournalPointers(repositoryRoot);
 		if (pointers.kind !== "loaded") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", pointers.message, dependencies);
-		const archive: CompletionArchiveIntent = { intendedAt: transitionTimestamp(journal, dependencies.clock.now()), archiveDirectory: paths.archiveDirectory, runPath: paths.archiveRunPath, previousRunPath: paths.archivePreviousRunPath, manifestPath: paths.archiveManifestPath, activeJournalSha256: sha256Bytes(pointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(pointers.pointers.previousBytes), verification: { logPath: execution.logPath, resultPath: execution.resultPath, logSha256: execution.logSha256, resultSha256: execution.resultSha256 }, reports };
+			const verification = finalVerificationEvidencePointers(execution);
+			if (!verification) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", "The passing final-verification evidence pointers are unavailable; archive was not attempted.", dependencies);
+			const archive: CompletionArchiveIntent = { intendedAt: transitionTimestamp(journal, dependencies.clock.now()), archiveDirectory: paths.archiveDirectory, runPath: paths.archiveRunPath, previousRunPath: paths.archivePreviousRunPath, manifestPath: paths.archiveManifestPath, activeJournalSha256: sha256Bytes(pointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(pointers.pointers.previousBytes), verification, reports };
 		let archiveIntentJournal: RunJournal;
 		try { archiveIntentJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const current = next.run.completion; if (!current || current.phase !== "stops-complete") throw new Error("Graceful-stop completion disappeared before archive intent."); next.run.completion = { phase: "archive-intended", gate: current.gate, resources: current.resources.map((resource) => ({ ...resource, acknowledgement: { ...resource.acknowledgement } })), archive }; }); }
 		catch (error: unknown) { return { journal, note: `Archive intent could not be persisted; active evidence was preserved. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
@@ -2462,7 +2812,7 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 		const published = await dependencies.runJournal.archiveCompletedRun({ repositoryRoot, runId: journal.run.id, run: finalJournal, archivedAt: finalJournal.run.completion?.phase === "archived" ? finalJournal.run.completion.archivedAt : dependencies.clock.now().toISOString(), verification: archive.verification, reports });
 		if (published.kind !== "published" && published.kind !== "existing-match") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", `Completion archive was not published: ${"message" in published ? published.message : "unknown archive failure"}`, dependencies);
 		await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: finalJournal.run.updatedAt, runId: finalJournal.run.id, event: "run-completed", message: `Run ${finalJournal.run.id} was archived at ${paths.archiveDirectory}.` }).catch(() => undefined);
-		try { dependencies.ui.notifyCompletion?.({ runId: journal.run.id, targetBranch: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.branch : "unknown", integratedHead: completion.gate.integratedHead, verificationResultPath: execution.resultPath, verificationLogPath: execution.logPath, archivePath: paths.archiveDirectory }); } catch { /* The archive remains authoritative if UI delivery fails. */ }
+			try { dependencies.ui.notifyCompletion?.({ runId: journal.run.id, targetBranch: journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.branch : "unknown", integratedHead: completion.gate.integratedHead, verificationResultPath: verification.resultPath, verificationLogPath: verification.logPath, archivePath: paths.archiveDirectory }); } catch { /* The archive remains authoritative if UI delivery fails. */ }
 		return { journal: finalJournal, note: `Run ${journal.run.id} archived and completion notification was attempted.`, action: "publish-completion-archive", completed: true };
 	}
 	return { journal, note: "" };
@@ -4652,6 +5002,17 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 	async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active Controller-owned Run is available for a lifecycle wait." };
+		const finalExecution = loaded.journal.run.finalVerificationExecution;
+		if (finalExecution && isRecoverableFinalVerificationExecution(finalExecution) && finalExecution.phase === "executing" && finalExecution.attempts.at(-1)?.process && process.waitApprovedVerification) {
+			const attempt = finalExecution.attempts.at(-1)!;
+			const managedInput: ManagedVerificationInput & { process?: FinalVerificationProcessIdentity } = { repositoryRoot, runId: loaded.journal.run.id, attemptId: attempt.id, command: finalExecution.command, cwd: finalExecution.cwd, executionNonce: attempt.process!.executionNonce, paths: attempt.paths, process: attempt.process };
+			let waited: "settled" | "cancelled" | "unclear";
+			try { waited = await process.waitApprovedVerification(managedInput, signal); }
+			catch (error: unknown) { return { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Managed final-verification wait failed." }; }
+			if (waited === "cancelled") return { kind: "cancelled" };
+			if (waited === "unclear") return { kind: "unavailable", diagnostic: "Managed final-verification liveness became unclear; no workflow action was attempted." };
+			return { kind: "settled", lifecycle: "done", identity: { name: "final-verification", workspaceId: loaded.journal.run.id, paneId: attempt.id, terminalId: "managed-runner" }, stateChangeSequence: null };
+		}
 		if (loaded.journal.run.tasks.length > 1) {
 			const selected = currentMonitorAttempts(loaded.journal);
 			if (selected.length === 0 || !herdr.inspectManagedAgent || !herdr.waitForManagedAgent) return { kind: "unavailable", diagnostic: "No current prompted multi-Task Attempt or Herdr lifecycle wait is available." };

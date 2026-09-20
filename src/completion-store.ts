@@ -13,7 +13,7 @@ import {
 	syncDirectory,
 	syncFile,
 } from "./project-state.ts";
-import { deserializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type CompletionAgentRole, type RunJournal } from "./run.ts";
+import { deserializeRunJournal, serializeRunJournalAtPath, validateRunJournal, type CompletionAgentRole, type FinalVerificationAttemptId, type RunJournal } from "./run.ts";
 
 export const MAX_VERIFICATION_OUTPUT_BYTES = 16 * 1024 * 1024;
 export const COMPLETION_OUTPUT_VERSION = "steward-verification-output-v1" as const;
@@ -23,6 +23,11 @@ export interface CompletionPaths {
 	verificationDirectory: string;
 	verificationLogPath: string;
 	verificationResultPath: string;
+	runtimeDirectory: string;
+	descriptorPath: string;
+	stdoutPath: string;
+	stderrPath: string;
+	candidateResultPath: string;
 	archiveDirectory: string;
 	archiveRunPath: string;
 	archivePreviousRunPath: string;
@@ -49,6 +54,7 @@ export interface VerificationEvidenceInput {
 	stdout: string | Buffer;
 	stderr: string | Buffer;
 	configDirName?: string;
+	attemptId?: FinalVerificationAttemptId;
 }
 
 export interface FinalizedVerificationResult {
@@ -70,6 +76,10 @@ export interface FinalizedVerificationResult {
 export type VerificationFinalizeResult =
 	| { kind: "created" | "existing-match"; paths: CompletionPaths; logSha256: string; resultSha256: string; result: FinalizedVerificationResult }
 	| { kind: "conflict" | "storage-error"; paths: CompletionPaths; message: string };
+
+export type FinalVerificationResultInspection =
+	| { kind: "complete"; source: "canonical" | "candidate"; paths: CompletionPaths; result: FinalizedVerificationResult; resultBytes: Buffer; logSha256: string; resultSha256: string; evidence?: VerificationEvidenceInput }
+	| { kind: "partial" | "missing" | "invalid" | "unavailable"; paths: CompletionPaths; message: string };
 
 export interface CompletionReportSource {
 	taskId: string;
@@ -174,17 +184,26 @@ export function decodeVerificationOutput(bytes: Buffer): { stdout: Buffer; stder
 	return { stdout: Buffer.from(content.subarray(0, stdoutBytes)), stderr: Buffer.from(content.subarray(stdoutBytes)) };
 }
 
-export function resolveCompletionPaths(repositoryRoot: string, runId: string, configDirName = CONFIG_DIR_NAME): CompletionPaths {
+export function resolveCompletionPaths(repositoryRoot: string, runId: string, configDirNameOrAttempt = CONFIG_DIR_NAME, requestedAttemptId: FinalVerificationAttemptId = "verification-01"): CompletionPaths {
 	if (!safeAbsolute(repositoryRoot) || !safeIdentifier(runId) || !runId.startsWith("run-")) throw new Error("Completion paths require an absolute repository root and safe Run id.");
+	const isAttempt = configDirNameOrAttempt === "verification-01" || configDirNameOrAttempt === "verification-02";
+	const configDirName = isAttempt ? CONFIG_DIR_NAME : configDirNameOrAttempt;
+	const attemptId = isAttempt ? configDirNameOrAttempt as FinalVerificationAttemptId : requestedAttemptId;
 	const state = resolveProjectStatePaths(repositoryRoot, configDirName);
 	const runDirectory = join(state.stewardDirectory, "runs", runId);
-	const verificationDirectory = join(runDirectory, "completion", "final-verification", "verification-01");
+	const verificationDirectory = join(runDirectory, "completion", "final-verification", attemptId);
+	const runtimeDirectory = join(verificationDirectory, "runtime");
 	const archiveDirectory = join(state.stewardDirectory, "archives", runId);
 	return {
 		runDirectory,
 		verificationDirectory,
 		verificationLogPath: join(verificationDirectory, "output.log"),
 		verificationResultPath: join(verificationDirectory, "result.json"),
+		runtimeDirectory,
+		descriptorPath: join(runtimeDirectory, "descriptor.json"),
+		stdoutPath: join(runtimeDirectory, "stdout"),
+		stderrPath: join(runtimeDirectory, "stderr"),
+		candidateResultPath: join(runtimeDirectory, "candidate-result.json"),
 		archiveDirectory,
 		archiveRunPath: join(archiveDirectory, "run.json"),
 		archivePreviousRunPath: join(archiveDirectory, "previous-run.json"),
@@ -214,7 +233,7 @@ async function stableFile(path: string, maximum: number): Promise<{ bytes: Buffe
 	if (!before.isFile() || before.isSymbolicLink() || before.size > maximum) throw new Error(`Completion source is not a bounded regular file: ${path}`);
 	const bytes = await readFile(path);
 	const after = await lstat(path);
-	if (!after.isFile() || after.isSymbolicLink() || after.size !== before.size || bytes.length !== before.size) throw new Error(`Completion source changed while being read: ${path}`);
+	if (!after.isFile() || after.isSymbolicLink() || after.dev !== before.dev || after.ino !== before.ino || after.mtimeMs !== before.mtimeMs || after.size !== before.size || bytes.length !== before.size) throw new Error(`Completion source changed while being read: ${path}`);
 	return { bytes, size: bytes.length, sha256: hash(bytes) };
 }
 
@@ -273,7 +292,7 @@ function canonicalResult(input: VerificationEvidenceInput, paths: CompletionPath
 }
 
 export async function finalizeVerificationResult(input: VerificationEvidenceInput): Promise<VerificationFinalizeResult> {
-	const paths = resolveCompletionPaths(input.repositoryRoot, input.runId, input.configDirName);
+	const paths = resolveCompletionPaths(input.repositoryRoot, input.runId, input.configDirName, input.attemptId);
 	try {
 		if (!contained(paths.runDirectory, paths.verificationDirectory) || !contained(paths.runDirectory, paths.verificationLogPath) || !contained(paths.runDirectory, paths.verificationResultPath)) return { kind: "storage-error", paths, message: "Verification paths escaped the Run directory." };
 		const log = outputLog(buffer(input.stdout), buffer(input.stderr));
@@ -281,9 +300,25 @@ export async function finalizeVerificationResult(input: VerificationEvidenceInpu
 		const existingDirectory = await lstat(paths.verificationDirectory).catch((error: unknown) => (missing(error) ? undefined : Promise.reject(error)));
 		if (existingDirectory) {
 			if (!existingDirectory.isDirectory() || existingDirectory.isSymbolicLink()) return { kind: "conflict", paths, message: "Verification directory is not a regular immutable directory." };
-			const files = await listFiles(paths.verificationDirectory);
-			if (files.length !== 2 || files[0] !== "output.log" || files[1] !== "result.json" || !(await compareFile(paths.verificationLogPath, log)) || !(await compareFile(paths.verificationResultPath, canonical.resultBytes))) return { kind: "conflict", paths, message: "Existing verification evidence differs; no bytes were overwritten." };
-			return { kind: "existing-match", paths, logSha256: canonical.logSha256, resultSha256: hash(canonical.resultBytes), result: canonical.result };
+			const existingLog = await stableFile(paths.verificationLogPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+			const existingResult = await stableFile(paths.verificationResultPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+			if (existingLog || existingResult) {
+				if (!existingLog || !existingResult || existingLog.sha256 !== canonical.logSha256 || !existingLog.bytes.equals(log) || existingResult.sha256 !== hash(canonical.resultBytes) || !existingResult.bytes.equals(canonical.resultBytes)) return { kind: "conflict", paths, message: "Existing verification evidence differs; no bytes were overwritten." };
+				return { kind: "existing-match", paths, logSha256: canonical.logSha256, resultSha256: hash(canonical.resultBytes), result: canonical.result };
+			}
+			try {
+				await writeImmutableFile(paths.verificationLogPath, log);
+				await writeImmutableFile(paths.verificationResultPath, canonical.resultBytes);
+				await syncDirectory(paths.verificationDirectory);
+				return { kind: "created", paths, logSha256: canonical.logSha256, resultSha256: hash(canonical.resultBytes), result: canonical.result };
+			} catch (error: unknown) {
+				if (exists(error)) {
+					const racedLog = await stableFile(paths.verificationLogPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+					const racedResult = await stableFile(paths.verificationResultPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+					if (racedLog && racedResult && racedLog.sha256 === canonical.logSha256 && racedLog.bytes.equals(log) && racedResult.sha256 === hash(canonical.resultBytes) && racedResult.bytes.equals(canonical.resultBytes)) return { kind: "existing-match", paths, logSha256: canonical.logSha256, resultSha256: hash(canonical.resultBytes), result: canonical.result };
+				}
+				return { kind: "conflict", paths, message: "Existing verification evidence differs; no bytes were overwritten." };
+			}
 		}
 		const state = await ensureProjectStateDirectory(input.repositoryRoot, input.configDirName);
 		await ensureOwnedDirectory(join(state.stewardDirectory, "runs"));
@@ -311,6 +346,57 @@ export async function finalizeVerificationResult(input: VerificationEvidenceInpu
 		}
 	} catch (error: unknown) {
 		return { kind: "storage-error", paths, message: errorText(error).slice(0, 2_000) };
+	}
+}
+
+function exactResult(value: unknown, paths: CompletionPaths, command: string, cwd: string, log: { bytes: Buffer; sha256: string }, result: { bytes: Buffer; sha256: string }): FinalizedVerificationResult | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const raw = value as Record<string, unknown>;
+	const keys = ["schemaVersion", "command", "cwd", "startedAt", "completedAt", "exitCode", "killed", "stdoutBytes", "stderrBytes", "stdoutSha256", "stderrSha256", "logSha256", "logPath"];
+	if (Object.keys(raw).sort().join("\0") !== keys.sort().join("\0") || raw.schemaVersion !== 1 || raw.command !== command || raw.cwd !== cwd || typeof raw.startedAt !== "string" || !canonicalTimestamp(raw.startedAt) || typeof raw.completedAt !== "string" || !canonicalTimestamp(raw.completedAt) || raw.completedAt < raw.startedAt || typeof raw.exitCode !== "number" || !Number.isSafeInteger(raw.exitCode) || raw.killed !== false || typeof raw.stdoutBytes !== "number" || !Number.isSafeInteger(raw.stdoutBytes) || typeof raw.stderrBytes !== "number" || !Number.isSafeInteger(raw.stderrBytes) || typeof raw.stdoutSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(raw.stdoutSha256) || typeof raw.stderrSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(raw.stderrSha256) || raw.logSha256 !== log.sha256 || raw.logPath !== paths.verificationLogPath || raw.stdoutBytes < 0 || raw.stderrBytes < 0 || raw.stdoutBytes > MAX_VERIFICATION_OUTPUT_BYTES || raw.stderrBytes > MAX_VERIFICATION_OUTPUT_BYTES) return undefined;
+	return { schemaVersion: 1, command, cwd, startedAt: raw.startedAt, completedAt: raw.completedAt, exitCode: raw.exitCode, killed: false, stdoutBytes: raw.stdoutBytes, stderrBytes: raw.stderrBytes, stdoutSha256: raw.stdoutSha256, stderrSha256: raw.stderrSha256, logSha256: log.sha256, logPath: paths.verificationLogPath };
+}
+
+export async function inspectFinalVerificationResult(input: { repositoryRoot: string; runId: string; command: string; cwd: string; attemptId: FinalVerificationAttemptId; executionNonce?: string; argvSha256?: string; configDirName?: string }): Promise<FinalVerificationResultInspection> {
+	const paths = resolveCompletionPaths(input.repositoryRoot, input.runId, input.configDirName, input.attemptId);
+	try {
+		if (!contained(paths.runDirectory, paths.verificationDirectory) || !contained(paths.runDirectory, paths.runtimeDirectory) || !contained(paths.runDirectory, paths.verificationLogPath) || !contained(paths.runDirectory, paths.verificationResultPath) || !contained(paths.runDirectory, paths.candidateResultPath)) return { kind: "invalid", paths, message: "Verification inspection paths escaped the Run directory." };
+		const canonicalLog = await stableFile(paths.verificationLogPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+		const canonicalResultBytes = await stableFile(paths.verificationResultPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+		if (canonicalLog && canonicalResultBytes) {
+			const decoded = decodeVerificationOutput(canonicalLog.bytes);
+			if (!decoded) return { kind: "invalid", paths, message: "Canonical verification log has invalid channel framing." };
+			const parsed = (() => { try { return JSON.parse(canonicalResultBytes.bytes.toString("utf8")) as unknown; } catch { return undefined; } })();
+			const result = exactResult(parsed, paths, input.command, input.cwd, canonicalLog, canonicalResultBytes);
+			if (!result || result.stdoutBytes !== decoded.stdout.length || result.stderrBytes !== decoded.stderr.length || result.stdoutSha256 !== hash(decoded.stdout) || result.stderrSha256 !== hash(decoded.stderr)) return { kind: "invalid", paths, message: "Canonical verification result has invalid exact fields or channel hashes." };
+			return { kind: "complete", source: "canonical", paths, result, resultBytes: canonicalResultBytes.bytes, logSha256: canonicalLog.sha256, resultSha256: canonicalResultBytes.sha256 };
+		}
+		const candidateBytes = await stableFile(paths.candidateResultPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+		const stdout = await stableFile(paths.stdoutPath, MAX_VERIFICATION_OUTPUT_BYTES);
+		const stderr = await stableFile(paths.stderrPath, MAX_VERIFICATION_OUTPUT_BYTES);
+		const descriptor = await stableFile(paths.descriptorPath, 64 * 1024);
+		const anyCanonical = Boolean(canonicalLog || canonicalResultBytes);
+		if (!candidateBytes && !stdout && !stderr && !descriptor) return { kind: anyCanonical ? "partial" : "missing", paths, message: anyCanonical ? "Canonical verification evidence is partial." : "No complete verification evidence exists." };
+		if (!candidateBytes || !stdout || !stderr || !descriptor) return { kind: "partial", paths, message: "Managed verification candidate is incomplete." };
+		let candidate: Record<string, unknown>;
+		let descriptorValue: Record<string, unknown>;
+		try {
+			const parsed = JSON.parse(candidateBytes.bytes.toString("utf8")) as unknown;
+			const parsedDescriptor = JSON.parse(descriptor.bytes.toString("utf8")) as unknown;
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || !parsedDescriptor || typeof parsedDescriptor !== "object" || Array.isArray(parsedDescriptor)) return { kind: "invalid", paths, message: "Managed verification candidate JSON is not an object." };
+			candidate = parsed as Record<string, unknown>;
+			descriptorValue = parsedDescriptor as Record<string, unknown>;
+		} catch {
+			return { kind: "invalid", paths, message: "Managed verification candidate JSON is malformed." };
+		}
+		const candidateKeys = ["schemaVersion", "attemptId", "executionNonce", "command", "cwd", "startedAt", "completedAt", "exitCode", "killed", "stdoutBytes", "stderrBytes", "stdoutSha256", "stderrSha256", "logSha256", "argvSha256"];
+		if (Object.keys(candidate).sort().join("\0") !== candidateKeys.sort().join("\0") || candidate.schemaVersion !== 1 || candidate.attemptId !== input.attemptId || (input.executionNonce !== undefined && candidate.executionNonce !== input.executionNonce) || candidate.command !== input.command || candidate.cwd !== input.cwd || typeof candidate.startedAt !== "string" || !canonicalTimestamp(candidate.startedAt) || typeof candidate.completedAt !== "string" || !canonicalTimestamp(candidate.completedAt) || candidate.completedAt < candidate.startedAt || typeof candidate.exitCode !== "number" || !Number.isSafeInteger(candidate.exitCode) || candidate.killed !== false || candidate.stdoutBytes !== stdout.size || candidate.stderrBytes !== stderr.size || candidate.stdoutBytes > MAX_VERIFICATION_OUTPUT_BYTES || candidate.stderrBytes > MAX_VERIFICATION_OUTPUT_BYTES || candidate.stdoutSha256 !== stdout.sha256 || candidate.stderrSha256 !== stderr.sha256 || candidate.logSha256 !== hash(outputLog(stdout.bytes, stderr.bytes)) || typeof candidate.argvSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(candidate.argvSha256) || (input.argvSha256 !== undefined && candidate.argvSha256 !== input.argvSha256) || Object.keys(descriptorValue).sort().join("\0") !== ["schemaVersion", "attemptId", "executionNonce", "command", "cwd", "pid", "startedAt"].sort().join("\0") || descriptorValue.schemaVersion !== 1 || descriptorValue.attemptId !== input.attemptId || descriptorValue.executionNonce !== candidate.executionNonce || descriptorValue.command !== input.command || descriptorValue.cwd !== input.cwd || typeof descriptorValue.pid !== "number" || !Number.isSafeInteger(descriptorValue.pid) || descriptorValue.pid <= 0 || descriptorValue.startedAt !== candidate.startedAt) return { kind: "invalid", paths, message: "Managed verification candidate identity or hashes are invalid." };
+		const evidence: VerificationEvidenceInput = { repositoryRoot: input.repositoryRoot, runId: input.runId, command: input.command, cwd: input.cwd, startedAt: candidate.startedAt, completedAt: candidate.completedAt, exitCode: candidate.exitCode, killed: false, stdout: stdout.bytes, stderr: stderr.bytes, configDirName: input.configDirName, attemptId: input.attemptId };
+		const log = outputLog(stdout.bytes, stderr.bytes);
+		const canonical = canonicalResult(evidence, paths, log);
+		return { kind: "complete", source: "candidate", paths, result: canonical.result, resultBytes: canonical.resultBytes, logSha256: canonical.logSha256, resultSha256: hash(canonical.resultBytes), evidence };
+	} catch (error: unknown) {
+		return { kind: "unavailable", paths, message: errorText(error).slice(0, 2_000) };
 	}
 }
 
