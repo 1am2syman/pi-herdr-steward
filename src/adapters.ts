@@ -955,10 +955,12 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 			if (!/^[0-9a-f]{40}$/.test(input.targetRevision) || !/^[0-9a-f]{40}$/.test(input.approvedBaseRevision) || !/^[0-9a-f]{40}$/.test(input.approvedHeadRevision) || input.approvedCommits.length === 0 || input.approvedCommits.some((commit) => !/^[0-9a-f]{40}$/.test(commit))) return unavailable("Integration checkout inspection requires full immutable revisions.");
 			try {
 				const inside = await run(input.repositoryRoot, ["rev-parse", "--is-inside-work-tree"]);
-				if (inside.code !== 0 || inside.killed || inside.stderr.length > 0 || inside.stdout.trim() !== "true") return unavailable("Integration checkout is not a Git worktree.");
+				if (inside.code !== 0 || inside.killed || inside.stderr.length > 0 || inside.stdout !== "true\n") return unavailable("Integration checkout is not a Git worktree.");
 				const branch = await run(input.repositoryRoot, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
+				const attachedBranch = branch.code === 0 && !branch.killed && branch.stderr.length === 0 && /^[A-Za-z0-9._/-]+\n$/.test(branch.stdout) ? branch.stdout.trim() : branch.code === 1 && !branch.killed && branch.stderr.length === 0 && branch.stdout === "" ? null : undefined;
+				if (attachedBranch === undefined) return unavailable("Integration checkout branch output was not a strict attached or detached result.");
 				const head = await run(input.repositoryRoot, ["rev-parse", "--verify", "HEAD"]);
-				if (branch.code !== 0 || branch.killed || branch.stderr.length > 0 || head.code !== 0 || head.killed || head.stderr.length > 0 || !/^[0-9A-Za-z._/-]+\n?$/.test(branch.stdout) || !/^[0-9a-f]{40}\n?$/.test(head.stdout)) return unavailable("Integration checkout branch or HEAD is not a strict attached full revision.");
+				if (head.code !== 0 || head.killed || head.stderr.length > 0 || !/^[0-9a-f]{40}\n$/.test(head.stdout)) return unavailable("Integration checkout HEAD is not a strict full revision.");
 				const status = await run(input.repositoryRoot, ["status", "--porcelain=v1", "--untracked-files=all", "-z"]);
 				const dirtyPaths = parsePorcelainPaths(status.stdout, status.code, status.killed, status.stderr);
 				if (!dirtyPaths) return unavailable("Integration checkout dirty-state output was malformed.");
@@ -970,17 +972,51 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 				operationMarkers.sort();
 				const resolvedBase = await run(input.repositoryRoot, ["rev-parse", "--verify", `${input.approvedBaseRevision}^{commit}`]);
 				const resolvedHead = await run(input.repositoryRoot, ["rev-parse", "--verify", `${input.approvedHeadRevision}^{commit}`]);
-				if (resolvedBase.code !== 0 || resolvedBase.killed || resolvedBase.stderr.length > 0 || resolvedHead.code !== 0 || resolvedHead.killed || resolvedHead.stderr.length > 0 || !/^[0-9a-f]{40}\n?$/.test(resolvedBase.stdout) || !/^[0-9a-f]{40}\n?$/.test(resolvedHead.stdout)) return unavailable("Approved integration revisions could not be resolved exactly.");
+				if (resolvedBase.code !== 0 || resolvedBase.killed || resolvedBase.stderr.length > 0 || resolvedHead.code !== 0 || resolvedHead.killed || resolvedHead.stderr.length > 0 || !/^[0-9a-f]{40}\n$/.test(resolvedBase.stdout) || !/^[0-9a-f]{40}\n$/.test(resolvedHead.stdout)) return unavailable("Approved integration revisions could not be resolved exactly.");
 				const ancestor = await run(input.repositoryRoot, ["merge-base", "--is-ancestor", input.approvedBaseRevision, input.approvedHeadRevision]);
+				if (!strictAncestorResult(ancestor)) return unavailable("Approved Git range ancestry could not be classified exactly.");
 				const range = await run(input.repositoryRoot, ["rev-list", "--reverse", `${input.approvedBaseRevision}..${input.approvedHeadRevision}`]);
-				if (range.code !== 0 || range.killed || range.stderr.length > 0 || (range.stdout.length > 0 && !range.stdout.endsWith("\n"))) return unavailable("Approved Git range output was malformed.");
-				const commits = range.stdout.length === 0 ? [] : range.stdout.trimEnd().split("\n");
+				const commits = parseShaLines(range);
+				if (!commits) return unavailable("Approved Git range output was malformed.");
 				if (commits.some((commit) => !/^[0-9a-f]{40}$/.test(commit)) || new Set(commits).size !== commits.length) return unavailable("Approved Git range contained malformed or duplicate revisions.");
 				const targetHead = head.stdout.trim();
-				const sourceAncestor = targetHead === input.targetRevision ? undefined : await run(input.repositoryRoot, ["merge-base", "--is-ancestor", input.approvedHeadRevision, targetHead]);
-				const sourceIntegrated = targetHead === input.targetRevision || Boolean(sourceAncestor && sourceAncestor.code === 0 && !sourceAncestor.killed && sourceAncestor.stderr.length === 0);
-				const observation = { branch: branch.stdout.trim(), head: targetHead, dirtyPaths, operationMarkers, rangeExact: resolvedBase.stdout.trim() === input.approvedBaseRevision && resolvedHead.stdout.trim() === input.approvedHeadRevision && ancestor.code === 0 && !ancestor.killed && ancestor.stderr.length === 0 && sourceIntegrated && JSON.stringify(commits) === JSON.stringify(input.approvedCommits) };
-				return { kind: "inspected", observation, resolvedBaseRevision: resolvedBase.stdout.trim(), resolvedHeadRevision: resolvedHead.stdout.trim(), commits };
+				const sourceAncestor = await run(input.repositoryRoot, ["merge-base", "--is-ancestor", input.approvedHeadRevision, targetHead]);
+				if (!strictAncestorResult(sourceAncestor)) return unavailable("Approved source ancestry in the current checkout could not be classified exactly.");
+				const targetAncestor = await run(input.repositoryRoot, ["merge-base", "--is-ancestor", input.targetRevision, targetHead]);
+				if (!strictAncestorResult(targetAncestor)) return unavailable("Recorded target ancestry in the current checkout could not be classified exactly.");
+				const rangeProof = resolvedBase.stdout.trim() === input.approvedBaseRevision && resolvedHead.stdout.trim() === input.approvedHeadRevision && ancestor.code === 0 && JSON.stringify(commits) === JSON.stringify(input.approvedCommits);
+				const firstParent = await run(input.repositoryRoot, ["rev-list", "--first-parent", "--reverse", `${input.targetRevision}..${targetHead}`]);
+				const firstParentCommits = parseShaLines(firstParent);
+				if (!firstParentCommits) return unavailable("First-parent integration history was malformed.");
+				const fastForwardApplied = rangeProof && input.targetRevision === input.approvedBaseRevision && firstParentCommits.length >= input.approvedCommits.length && JSON.stringify(firstParentCommits.slice(0, input.approvedCommits.length)) === JSON.stringify(input.approvedCommits);
+				let application: { kind: "absent" } | { kind: "exact"; integrationHead: string; proof: "fast-forward-head" | "exact-merge-parents" } = { kind: "absent" };
+				if (fastForwardApplied) application = { kind: "exact", integrationHead: input.approvedHeadRevision, proof: "fast-forward-head" };
+				if (rangeProof && input.targetRevision !== input.approvedBaseRevision && firstParentCommits.length > 0) {
+					const mergeParents = await run(input.repositoryRoot, ["rev-list", "--parents", "-n", "1", firstParentCommits[0]!]);
+					const parents = parseParentLine(mergeParents);
+					if (!parents) return unavailable("First-parent integration parent output was malformed.");
+					if (parents.length === 3 && parents[1] === input.targetRevision && parents[2] === input.approvedHeadRevision) application = { kind: "exact", integrationHead: firstParentCommits[0]!, proof: "exact-merge-parents" };
+				}
+				const relation = attachedBranch === null || attachedBranch !== input.targetBranch
+					? "branch-changed" as const
+					: targetHead === input.targetRevision
+						? "recorded" as const
+						: targetAncestor.code === 0
+							? "advanced" as const
+							: "diverged" as const;
+				const differenceRelation = relation === "advanced" || relation === "diverged"
+					? relation
+					: targetAncestor.code === 0 ? "advanced" as const : "diverged" as const;
+				const difference = relation === "recorded" ? undefined : await inspectTargetDifference(input.repositoryRoot, input.targetRevision, targetHead, differenceRelation, run);
+				if (difference === null) return unavailable("Target movement difference could not be parsed within the fixed bounds.");
+				let mergeability: { kind: "clean" } | { kind: "conflicted"; paths: string[] } | { kind: "unavailable"; diagnostic: string } | undefined;
+				if (relation === "advanced" && application.kind === "absent" && dirtyPaths.length === 0 && operationMarkers.length === 0) {
+					const tree = await run(input.repositoryRoot, ["merge-tree", "--write-tree", "--name-only", "-z", "--no-messages", "HEAD", input.approvedHeadRevision]);
+					const mergeTree = parseMergeTree(tree);
+					mergeability = mergeTree === undefined ? { kind: "unavailable", diagnostic: "Merge-tree output was malformed or unavailable." } : mergeTree.kind === "clean" ? { kind: "clean" } : { kind: "conflicted", paths: mergeTree.paths };
+				}
+				const observation = { branch: attachedBranch, head: targetHead, dirtyPaths, operationMarkers, rangeExact: rangeProof && (targetHead === input.targetRevision || sourceAncestor.code === 0) };
+				return { kind: "inspected", observation, resolvedBaseRevision: resolvedBase.stdout.trim(), resolvedHeadRevision: resolvedHead.stdout.trim(), commits, target: { relation, expectedBranch: input.targetBranch, expectedHead: input.targetRevision, observedBranch: attachedBranch, observedHead: targetHead }, application, ...(difference ? { difference } : {}), ...(mergeability ? { mergeability } : {}) };
 			} catch (error: unknown) {
 				return unavailable(error instanceof Error ? error.message : "Integration checkout inspection failed.");
 			}
@@ -1045,6 +1081,60 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 	}
 }
 
+function strictAncestorResult(result: ExecResult): boolean {
+	return !result.killed && result.stderr.length === 0 && result.stdout.length === 0 && (result.code === 0 || result.code === 1);
+}
+
+function parseShaLines(result: ExecResult): string[] | undefined {
+	if (result.code !== 0 || result.killed || result.stderr.length > 0 || result.stdout.length > 16 * 1024 * 1024 || (result.stdout.length > 0 && !result.stdout.endsWith("\n"))) return undefined;
+	if (result.stdout.length === 0) return [];
+	const lines = result.stdout.slice(0, -1).split("\n");
+	return lines.every((line) => /^[0-9a-f]{40}$/.test(line)) && new Set(lines).size === lines.length ? lines : undefined;
+}
+
+function parseParentLine(result: ExecResult): string[] | undefined {
+	if (result.code !== 0 || result.killed || result.stderr.length > 0 || !/^[0-9a-f]{40}(?: [0-9a-f]{40})+\n$/.test(result.stdout)) return undefined;
+	return result.stdout.trim().split(" ");
+}
+
+function parseMergeTree(result: ExecResult): { kind: "clean" } | { kind: "conflicted"; paths: string[] } | undefined {
+	if ((result.code !== 0 && result.code !== 1) || result.killed || result.stderr.length > 0 || result.stdout.length > 16 * 1024 * 1024 || !result.stdout.endsWith("\u0000")) return undefined;
+	const values = result.stdout.slice(0, -1).split("\u0000");
+	if (values.length === 0 || !/^[0-9a-f]{40}$/.test(values[0]!)) return undefined;
+	const paths = values.slice(1);
+	if (paths.length > 100 || paths.some((path) => !validGitPath(path)) || new Set(paths).size !== paths.length) return undefined;
+	if (result.code === 0 && paths.length !== 0) return undefined;
+	return result.code === 0 ? { kind: "clean" } : { kind: "conflicted", paths: [...paths].sort() };
+}
+
+async function inspectTargetDifference(
+	repositoryRoot: string,
+	targetRevision: string,
+	observedHead: string,
+	relation: "advanced" | "diverged",
+	run: (repositoryRoot: string, args: string[]) => Promise<ExecResult>,
+): Promise<{ commits: string[]; changedPaths: Array<{ status: string; paths: string[] }>; truncated: boolean } | null> {
+	const range = relation === "advanced"
+		? await run(repositoryRoot, ["rev-list", "--reverse", `${targetRevision}..${observedHead}`])
+		: await run(repositoryRoot, ["rev-list", "--left-right", "--reverse", `${targetRevision}...${observedHead}`]);
+	if (range.code !== 0 || range.killed || range.stderr.length > 0 || range.stdout.length > 16 * 1024 * 1024 || (range.stdout.length > 0 && !range.stdout.endsWith("\n"))) return null;
+	const rawCommits = range.stdout.length === 0 ? [] : range.stdout.slice(0, -1).split("\n");
+	const commits: string[] = [];
+	let truncated = false;
+	for (const raw of rawCommits) {
+		const commit = relation === "diverged" ? raw.slice(0, 1) === "<" || raw.slice(0, 1) === ">" ? raw.slice(1).trim() : "" : raw;
+		if (!/^[0-9a-f]{40}$/.test(commit)) return null;
+		if (commits.length < 100) commits.push(commit);
+		else truncated = true;
+	}
+	if (new Set(commits).size !== commits.length) return null;
+	const changes = await run(repositoryRoot, ["diff", "--name-status", "-z", "--find-renames", "--find-copies", targetRevision, observedHead]);
+	const parsed = parseNameStatus(changes.stdout, changes.code, changes.killed, changes.stderr);
+	if (!parsed) return null;
+	if (parsed.length > 100) truncated = true;
+	return { commits, changedPaths: parsed.slice(0, 100), truncated };
+}
+
 function validGitPath(path: string): boolean {
 	if (path.length === 0 || path.includes("\\") || path.startsWith("/") || path.includes("\u0000")) return false;
 	const parts = path.split("/");
@@ -1052,7 +1142,7 @@ function validGitPath(path: string): boolean {
 }
 
 function parseNameStatus(stdout: string, code: number, killed: boolean, stderr: string): Array<{ status: string; paths: string[] }> | undefined {
-	if (code !== 0 || killed || stderr.length > 0 || (stdout.length > 0 && !stdout.endsWith("\u0000"))) return undefined;
+	if (code !== 0 || killed || stderr.length > 0 || stdout.length > 16 * 1024 * 1024 || (stdout.length > 0 && !stdout.endsWith("\u0000"))) return undefined;
 	if (stdout.length === 0) return [];
 	const values = stdout.slice(0, -1).split("\u0000");
 	const changes: Array<{ status: string; paths: string[] }> = [];
@@ -1069,7 +1159,7 @@ function parseNameStatus(stdout: string, code: number, killed: boolean, stderr: 
 }
 
 function parsePorcelainPaths(stdout: string, code: number, killed: boolean, stderr: string): string[] | undefined {
-	if (code !== 0 || killed || stderr.length > 0 || (stdout.length > 0 && !stdout.endsWith("\u0000"))) return undefined;
+	if (code !== 0 || killed || stderr.length > 0 || stdout.length > 16 * 1024 * 1024 || (stdout.length > 0 && !stdout.endsWith("\u0000"))) return undefined;
 	if (stdout.length === 0) return [];
 	const values = stdout.slice(0, -1).split("\u0000");
 	const paths: string[] = [];

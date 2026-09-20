@@ -187,7 +187,93 @@ export type ReworkDispatchRecord =
 			basis: "valid-report" | "matching-live-agent";
 		};
 
-export type BuilderDispatchRecord = DispatchRecord | ReworkDispatchRecord;
+export interface IntegrationTargetDifference {
+	commits: string[];
+	changedPaths: Array<{ status: string; paths: string[] }>;
+	truncated: boolean;
+}
+
+export interface IntegrationReworkFacts {
+	targetBranch: string;
+	recordedTargetRevision: string;
+	advancedTargetRevision: string;
+	difference: IntegrationTargetDifference;
+	conflictPaths: string[];
+}
+
+export type IntegrationReworkDispatchRecord =
+	| {
+			phase: "assignment-intended";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			reviewedSubject: ReviewSubject;
+			reviewerManifestPath: string;
+			reviewerManifestSha256: string;
+			integrationRecovery: IntegrationReworkFacts;
+	  }
+	| {
+			phase: "prompt-intended";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			reviewedSubject: ReviewSubject;
+			reviewerManifestPath: string;
+			reviewerManifestSha256: string;
+			integrationRecovery: IntegrationReworkFacts;
+			assignmentSha256: string;
+	  }
+	| {
+			phase: "prompted";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			reviewedSubject: ReviewSubject;
+			reviewerManifestPath: string;
+			reviewerManifestSha256: string;
+			integrationRecovery: IntegrationReworkFacts;
+			assignmentSha256: string;
+			promptedAt: string;
+	  }
+	| {
+			phase: "reconciled-active";
+			branch: string;
+			agentName: string;
+			worktreePath: string;
+			workspaceId: string;
+			paneId: string;
+			terminalId: string;
+			cycle: number;
+			priorBuilderAttemptId: string;
+			priorReviewerAttemptId: string;
+			reviewedSubject: ReviewSubject;
+			reviewerManifestPath: string;
+			reviewerManifestSha256: string;
+			integrationRecovery: IntegrationReworkFacts;
+			assignmentSha256: string;
+			reconciledAt: string;
+			basis: "valid-report" | "matching-live-agent";
+	  };
+
+export type BuilderDispatchRecord = DispatchRecord | ReworkDispatchRecord | IntegrationReworkDispatchRecord;
 
 export type ReviewerDispatchRecord =
 	| { phase: "pane-intended"; sourcePaneId: string; worktreePath: string; agentName: string; branch: string; workspaceId?: string; paneId?: string; terminalId?: string }
@@ -486,6 +572,7 @@ export interface BuilderAssignmentDocument {
 		worktree: { path: string; branch: string };
 			herdr: { workspaceId: string; paneId: string; terminalId: string; agentName: string };
 			rework?: ReworkAssignmentFacts;
+			integrationRework?: IntegrationReworkAssignmentFacts;
 			continuation?: AttemptContinuation;
 	};
 }
@@ -510,6 +597,15 @@ export interface ReworkAssignmentFacts {
 	findings: ReviewerFinding[];
 }
 
+export interface IntegrationReworkAssignmentFacts {
+	cycle: number;
+	priorBuilderAttemptId: string;
+	priorReviewerAttemptId: string;
+	reviewedSubject: ReviewSubject;
+	reviewerEvidence: { manifestPath: string; manifestSha256: string };
+	integrationRecovery: IntegrationReworkFacts;
+}
+
 export interface TaskRecord {
 	specificationVersion: 1;
 	specificationHash: string;
@@ -522,6 +618,7 @@ export interface TaskRecord {
 	reworkCycles: number;
 	approval?: TaskApproval;
 	integration?: TaskIntegration;
+	integrationRecoveries?: IntegrationReworkRecord[];
 }
 
 export type TaskApproval =
@@ -547,7 +644,7 @@ export type TaskApproval =
 			worktreeSnapshot: ReviewWorktreeSnapshot;
 			verdict: "approved";
 			invalidatedAt: string;
-			reason: "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid";
+			reason: "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced";
 			diagnostic: string;
 			observedSnapshot?: ReviewWorktreeSnapshot;
 	  };
@@ -562,6 +659,25 @@ export interface IntegrationCheckoutObservation {
 	dirtyPaths: string[];
 	operationMarkers: string[];
 	rangeExact: boolean;
+}
+
+export type IntegrationTargetRelation = "recorded" | "advanced" | "diverged" | "branch-changed";
+
+export type IntegrationApplication =
+	| { kind: "absent" }
+	| { kind: "exact"; integrationHead: string; proof: "fast-forward-head" | "exact-merge-parents" };
+
+export type IntegrationMergeability =
+	| { kind: "clean" }
+	| { kind: "conflicted"; paths: string[] }
+	| { kind: "unavailable"; diagnostic: string };
+
+export interface IntegrationTargetFacts {
+	relation: IntegrationTargetRelation;
+	expectedBranch: string;
+	expectedHead: string;
+	observedBranch: string | null;
+	observedHead: string | null;
 }
 
 export interface ApprovedIntegrationIdentity {
@@ -579,11 +695,23 @@ export interface ApprovedIntegrationIdentity {
 		| { kind: "merge-commit"; argv: ["merge", "--no-ff", "--no-edit", string] };
 }
 
+export interface IntegrationReworkRecord extends ApprovedIntegrationIdentity {
+	kind: "advanced-target-conflict";
+	intendedAt?: string;
+	retryIntendedAt?: string;
+	observedAt: string;
+	observed: IntegrationCheckoutObservation;
+	difference: IntegrationTargetDifference;
+	conflictPaths: string[];
+	replacementBuilderAttemptId: string;
+}
+
 export type TaskIntegration =
 	| (ApprovedIntegrationIdentity & { phase: "intended"; intendedAt: string })
+	| (ApprovedIntegrationIdentity & { phase: "retry-intended"; intendedAt: string; retryIntendedAt: string })
 	| (ApprovedIntegrationIdentity & { phase: "integrated"; intendedAt: string; integratedAt: string; observedHead: string })
 	| (ApprovedIntegrationIdentity & { phase: "failed"; intendedAt: string; observedAt: string; exitCode: number | null; diagnostic: string })
-	| (ApprovedIntegrationIdentity & { phase: "ambiguous"; intendedAt: string; observedAt: string; exitCode: number | null; diagnostic: string; observed: IntegrationCheckoutObservation });
+	| (ApprovedIntegrationIdentity & { phase: "ambiguous"; intendedAt: string; observedAt: string; exitCode: number | null; diagnostic: string; observed: IntegrationCheckoutObservation; difference?: IntegrationTargetDifference });
 
 export type FinalVerificationExecution =
 	| {
@@ -1268,6 +1396,18 @@ function validateAttemptRecovery(value: unknown, path: string, dispatch: { agent
 
 function validateDispatch(value: unknown, path: string): { value?: BuilderDispatchRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Dispatch intent must be a recognized object.", path)] };
+	if ((value.phase === "assignment-intended" || value.phase === "prompt-intended" || value.phase === "prompted" || value.phase === "reconciled-active") && Object.prototype.hasOwnProperty.call(value, "integrationRecovery")) {
+		const required = ["phase", "branch", "agentName", "worktreePath", "workspaceId", "paneId", "terminalId", "cycle", "priorBuilderAttemptId", "priorReviewerAttemptId", "reviewedSubject", "reviewerManifestPath", "reviewerManifestSha256", "integrationRecovery", ...(value.phase === "assignment-intended" ? [] : ["assignmentSha256"]), ...(value.phase === "prompted" ? ["promptedAt"] : []), ...(value.phase === "reconciled-active" ? ["reconciledAt", "basis"] : [])];
+		if (!exactKeys(value, required) || !safeBranch(value.branch) || !herdrName(value.agentName) || !absolutePathValue(value.worktreePath) || !trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId) || !Number.isSafeInteger(value.cycle) || (value.cycle as number) < 1 || !safeIdentifier(value.priorBuilderAttemptId) || !safeIdentifier(value.priorReviewerAttemptId) || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256)) return { diagnostics: [diagnostic("invalid-task", "Integration rework dispatch has invalid exact identity fields.", path)] };
+		const subject = validateReviewSubject(value.reviewedSubject, `${path}.reviewedSubject`);
+		const recovery = validateIntegrationReworkFacts(value.integrationRecovery, `${path}.integrationRecovery`);
+		const extraDiagnostics = [...subject.diagnostics, ...recovery.diagnostics];
+		if (value.phase !== "assignment-intended" && (typeof value.assignmentSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.assignmentSha256))) extraDiagnostics.push(diagnostic("invalid-task", "Integration rework prompt dispatch requires an Assignment hash.", `${path}.assignmentSha256`));
+		if (value.phase === "prompted" && !canonicalTimestamp(value.promptedAt)) extraDiagnostics.push(diagnostic("invalid-task", "Integration rework prompted dispatch requires a canonical timestamp.", `${path}.promptedAt`));
+		if (value.phase === "reconciled-active" && (!canonicalTimestamp(value.reconciledAt) || !["valid-report", "matching-live-agent"].includes(value.basis as string))) extraDiagnostics.push(diagnostic("invalid-task", "Integration rework reconciled dispatch requires a canonical timestamp and basis.", path));
+		if (extraDiagnostics.length > 0 || !subject.value || !recovery.value) return { diagnostics: extraDiagnostics };
+		return { value: { phase: value.phase as IntegrationReworkDispatchRecord["phase"], branch: value.branch, agentName: value.agentName, worktreePath: value.worktreePath, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, cycle: value.cycle as number, priorBuilderAttemptId: value.priorBuilderAttemptId, priorReviewerAttemptId: value.priorReviewerAttemptId, reviewedSubject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, integrationRecovery: recovery.value, ...(value.phase !== "assignment-intended" ? { assignmentSha256: value.assignmentSha256 as string } : {}), ...(value.phase === "prompted" ? { promptedAt: value.promptedAt as string } : {}), ...(value.phase === "reconciled-active" ? { reconciledAt: value.reconciledAt as string, basis: value.basis as "valid-report" | "matching-live-agent" } : {}) } as IntegrationReworkDispatchRecord, diagnostics: [] };
+	}
 	if (value.phase === "assignment-intended" || ((value.phase === "prompt-intended" || value.phase === "prompted" || value.phase === "reconciled-active") && Object.prototype.hasOwnProperty.call(value, "cycle"))) {
 		const required = ["phase", "branch", "agentName", "worktreePath", "workspaceId", "paneId", "terminalId", "cycle", "priorBuilderAttemptId", "priorReviewerAttemptId", "reviewedSubject", "reviewerManifestPath", "reviewerManifestSha256", "findings", ...(value.phase === "assignment-intended" ? [] : ["assignmentSha256"]), ...(value.phase === "prompted" ? ["promptedAt"] : []), ...(value.phase === "reconciled-active" ? ["reconciledAt", "basis"] : [])];
 		if (!exactKeys(value, required) || !safeBranch(value.branch) || !herdrName(value.agentName) || !absolutePathValue(value.worktreePath) || !trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId) || !Number.isSafeInteger(value.cycle) || (value.cycle as number) < 1 || !safeIdentifier(value.priorBuilderAttemptId) || !safeIdentifier(value.priorReviewerAttemptId) || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !Array.isArray(value.findings) || value.findings.length === 0 || value.findings.length > 100) return { diagnostics: [diagnostic("invalid-task", "Rework dispatch has invalid exact identity, cycle, evidence, or findings fields.", path)] };
@@ -1592,6 +1732,11 @@ function cloneDispatch(dispatch: DispatchRecord): DispatchRecord {
 }
 
 function cloneBuilderDispatch(dispatch: BuilderDispatchRecord): BuilderDispatchRecord {
+	if ("integrationRecovery" in dispatch) return {
+		...dispatch,
+		reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject),
+		integrationRecovery: cloneIntegrationReworkFacts(dispatch.integrationRecovery),
+	};
 	if (dispatch.phase === "assignment-intended" && "cycle" in dispatch) return { ...dispatch, reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject), findings: dispatch.findings.map((finding) => ({ ...finding })) };
 	if ((dispatch.phase === "prompt-intended" || dispatch.phase === "prompted" || dispatch.phase === "reconciled-active") && "cycle" in dispatch) return { ...dispatch, reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject), findings: dispatch.findings.map((finding) => ({ ...finding })) };
 	return cloneDispatch(dispatch as DispatchRecord);
@@ -1677,6 +1822,28 @@ function cloneIntegrationObservation(observation: IntegrationCheckoutObservation
 	};
 }
 
+function cloneIntegrationTargetDifference(difference: IntegrationTargetDifference): IntegrationTargetDifference {
+	return { commits: [...difference.commits], changedPaths: difference.changedPaths.map((change) => ({ status: change.status, paths: [...change.paths] })), truncated: difference.truncated };
+}
+
+function cloneIntegrationReworkFacts(facts: IntegrationReworkFacts): IntegrationReworkFacts {
+	return { targetBranch: facts.targetBranch, recordedTargetRevision: facts.recordedTargetRevision, advancedTargetRevision: facts.advancedTargetRevision, difference: cloneIntegrationTargetDifference(facts.difference), conflictPaths: [...facts.conflictPaths] };
+}
+
+function cloneIntegrationReworkRecord(record: IntegrationReworkRecord): IntegrationReworkRecord {
+	return {
+		...cloneApprovedIntegrationIdentity(record),
+		kind: "advanced-target-conflict",
+		...(record.intendedAt ? { intendedAt: record.intendedAt } : {}),
+		...(record.retryIntendedAt ? { retryIntendedAt: record.retryIntendedAt } : {}),
+		observedAt: record.observedAt,
+		observed: cloneIntegrationObservation(record.observed),
+		difference: cloneIntegrationTargetDifference(record.difference),
+		conflictPaths: [...record.conflictPaths],
+		replacementBuilderAttemptId: record.replacementBuilderAttemptId,
+	};
+}
+
 function cloneApprovedIntegrationIdentity(identity: ApprovedIntegrationIdentity): ApprovedIntegrationIdentity {
 	const action = identity.action.kind === "fast-forward"
 		? { kind: "fast-forward" as const, argv: [...identity.action.argv] as ["merge", "--ff-only", "--no-edit", string] }
@@ -1698,9 +1865,10 @@ function cloneApprovedIntegrationIdentity(identity: ApprovedIntegrationIdentity)
 function cloneIntegration(integration: TaskIntegration): TaskIntegration {
 	const identity = cloneApprovedIntegrationIdentity(integration);
 	if (integration.phase === "intended") return { ...identity, phase: "intended", intendedAt: integration.intendedAt };
+	if (integration.phase === "retry-intended") return { ...identity, phase: "retry-intended", intendedAt: integration.intendedAt, retryIntendedAt: integration.retryIntendedAt };
 	if (integration.phase === "integrated") return { ...identity, phase: "integrated", intendedAt: integration.intendedAt, integratedAt: integration.integratedAt, observedHead: integration.observedHead };
 	if (integration.phase === "failed") return { ...identity, phase: "failed", intendedAt: integration.intendedAt, observedAt: integration.observedAt, exitCode: integration.exitCode, diagnostic: integration.diagnostic };
-	return { ...identity, phase: "ambiguous", intendedAt: integration.intendedAt, observedAt: integration.observedAt, exitCode: integration.exitCode, diagnostic: integration.diagnostic, observed: cloneIntegrationObservation(integration.observed) };
+	return { ...identity, phase: "ambiguous", intendedAt: integration.intendedAt, observedAt: integration.observedAt, exitCode: integration.exitCode, diagnostic: integration.diagnostic, observed: cloneIntegrationObservation(integration.observed), ...(integration.difference ? { difference: cloneIntegrationTargetDifference(integration.difference) } : {}) };
 }
 
 function cloneVerificationExecution(execution: FinalVerificationExecution): FinalVerificationExecution {
@@ -1925,17 +2093,38 @@ function validateTaskApproval(value: unknown, path: string): { value?: TaskAppro
 		const snapshot = validateReviewSnapshot(value.worktreeSnapshot, `${path}.worktreeSnapshot`);
 		return subject.value && snapshot.value && subject.diagnostics.length === 0 && snapshot.diagnostics.length === 0 ? { value: { phase: "valid", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved" }, diagnostics: [] } : { diagnostics: [...subject.diagnostics, ...snapshot.diagnostics] };
 	}
-	if (value.phase !== "invalidated" || !exactKeys(value, [...baseKeys, "invalidatedAt", "reason", "diagnostic", ...(Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? ["observedSnapshot"] : [])]) || !canonicalTimestamp(value.approvedAt) || !canonicalTimestamp(value.invalidatedAt) || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || value.verdict !== "approved" || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !["head-changed", "dirty-state-changed", "subject-changed", "evidence-changed", "approval-invalid"].includes(value.reason as string) || !boundedText(value.diagnostic, 2_000)) return { diagnostics: [diagnostic("invalid-task", "Invalidated approval has invalid exact fields.", path)] };
+	if (value.phase !== "invalidated" || !exactKeys(value, [...baseKeys, "invalidatedAt", "reason", "diagnostic", ...(Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? ["observedSnapshot"] : [])]) || !canonicalTimestamp(value.approvedAt) || !canonicalTimestamp(value.invalidatedAt) || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || value.verdict !== "approved" || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !["head-changed", "dirty-state-changed", "subject-changed", "evidence-changed", "approval-invalid", "target-advanced"].includes(value.reason as string) || !boundedText(value.diagnostic, 2_000)) return { diagnostics: [diagnostic("invalid-task", "Invalidated approval has invalid exact fields.", path)] };
 	const subject = validateReviewSubject(value.subject, `${path}.subject`);
 	const snapshot = validateReviewSnapshot(value.worktreeSnapshot, `${path}.worktreeSnapshot`);
 	const observed = Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? validateReviewSnapshot(value.observedSnapshot, `${path}.observedSnapshot`) : { diagnostics: [] };
 	if (!subject.value || !snapshot.value || subject.diagnostics.length > 0 || snapshot.diagnostics.length > 0 || observed.diagnostics.length > 0) return { diagnostics: [...subject.diagnostics, ...snapshot.diagnostics, ...observed.diagnostics] };
-	return { value: { phase: "invalidated", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved", invalidatedAt: value.invalidatedAt, reason: value.reason as "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid", diagnostic: value.diagnostic, ...(observed.value ? { observedSnapshot: observed.value } : {}) }, diagnostics: [] };
+	return { value: { phase: "invalidated", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved", invalidatedAt: value.invalidatedAt, reason: value.reason as "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced", diagnostic: value.diagnostic, ...(observed.value ? { observedSnapshot: observed.value } : {}) }, diagnostics: [] };
 }
 
 function validateIntegrationObservation(value: unknown, path: string): { value?: IntegrationCheckoutObservation; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || !exactKeys(value, ["branch", "head", "dirtyPaths", "operationMarkers", "rangeExact"]) || (value.branch !== null && !safeBranch(value.branch)) || (value.head !== null && (typeof value.head !== "string" || !/^[0-9a-f]{40}$/.test(value.head))) || !Array.isArray(value.dirtyPaths) || value.dirtyPaths.length > 100 || value.dirtyPaths.some((item) => !pathValue(item)) || !Array.isArray(value.operationMarkers) || value.operationMarkers.length > 10 || value.operationMarkers.some((item) => !safeIdentifier(item)) || new Set(value.operationMarkers).size !== value.operationMarkers.length || JSON.stringify([...value.operationMarkers].sort()) !== JSON.stringify(value.operationMarkers) || typeof value.rangeExact !== "boolean") return { diagnostics: [diagnostic("invalid-run", "Integration checkout observation has invalid exact bounded fields.", path)] };
 	return { value: { branch: value.branch as string | null, head: value.head as string | null, dirtyPaths: [...value.dirtyPaths] as string[], operationMarkers: [...value.operationMarkers] as string[], rangeExact: value.rangeExact }, diagnostics: [] };
+}
+
+function validateIntegrationTargetDifference(value: unknown, path: string): { value?: IntegrationTargetDifference; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["commits", "changedPaths", "truncated"]) || !Array.isArray(value.commits) || value.commits.length > 100 || value.commits.some((commit) => typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) || new Set(value.commits).size !== value.commits.length || !Array.isArray(value.changedPaths) || value.changedPaths.length > 100 || typeof value.truncated !== "boolean") return { diagnostics: [diagnostic("invalid-task", "Integration target difference has invalid bounded fields.", path)] };
+	const changedPaths: Array<{ status: string; paths: string[] }> = [];
+	const changedPathKeys = new Set<string>();
+	for (let index = 0; index < value.changedPaths.length; index += 1) {
+		const item = value.changedPaths[index];
+		if (!isRecord(item) || !exactKeys(item, ["status", "paths"]) || typeof item.status !== "string" || !/^[A-Z][0-9]{0,3}$/.test(item.status) || !Array.isArray(item.paths) || (item.status.startsWith("R") || item.status.startsWith("C") ? item.paths.length !== 2 : item.paths.length !== 1) || item.paths.some((itemPath) => !pathValue(itemPath)) || new Set(item.paths).size !== item.paths.length) return { diagnostics: [diagnostic("invalid-task", "Integration target difference contains an invalid changed-path record.", `${path}.changedPaths[${index}]`)] };
+		const key = `${item.status}\u0000${(item.paths as string[]).join("\u0000")}`;
+		if (changedPathKeys.has(key)) return { diagnostics: [diagnostic("invalid-task", "Integration target difference contains duplicate changed-path records.", `${path}.changedPaths[${index}]`)] };
+		changedPathKeys.add(key);
+		changedPaths.push({ status: item.status, paths: [...item.paths] as string[] });
+	}
+	return { value: { commits: [...value.commits] as string[], changedPaths, truncated: value.truncated }, diagnostics: [] };
+}
+
+function validateIntegrationReworkFacts(value: unknown, path: string): { value?: IntegrationReworkFacts; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["targetBranch", "recordedTargetRevision", "advancedTargetRevision", "difference", "conflictPaths"]) || !safeBranch(value.targetBranch) || typeof value.recordedTargetRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.recordedTargetRevision) || typeof value.advancedTargetRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.advancedTargetRevision) || value.recordedTargetRevision === value.advancedTargetRevision || !Array.isArray(value.conflictPaths) || value.conflictPaths.length === 0 || value.conflictPaths.length > 100 || value.conflictPaths.some((item) => !pathValue(item)) || new Set(value.conflictPaths).size !== value.conflictPaths.length || JSON.stringify([...value.conflictPaths].sort()) !== JSON.stringify(value.conflictPaths)) return { diagnostics: [diagnostic("invalid-task", "Integration rework facts have invalid target or bounded conflict paths.", path)] };
+	const difference = validateIntegrationTargetDifference(value.difference, `${path}.difference`);
+	return difference.value && difference.diagnostics.length === 0 && difference.value.commits.length > 0 ? { value: { targetBranch: value.targetBranch, recordedTargetRevision: value.recordedTargetRevision, advancedTargetRevision: value.advancedTargetRevision, difference: difference.value, conflictPaths: [...value.conflictPaths] as string[] }, diagnostics: [] } : { diagnostics: difference.diagnostics.length > 0 ? difference.diagnostics : [diagnostic("invalid-task", "Integration rework difference must retain at least one advanced commit.", `${path}.difference`)] };
 }
 
 function validateApprovedIntegrationIdentity(value: Record<string, unknown>, path: string): { value?: ApprovedIntegrationIdentity; diagnostics: RunDiagnostic[] } {
@@ -1963,16 +2152,37 @@ function validateApprovedIntegrationIdentity(value: Record<string, unknown>, pat
 	};
 }
 
+function validateIntegrationReworkRecord(value: unknown, path: string): { value?: IntegrationReworkRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.kind !== "string") return { diagnostics: [diagnostic("invalid-task", "Integration recovery must be a recognized record.", path)] };
+	const identity = validateApprovedIntegrationIdentity({ ...value, phase: "intended" }, path);
+	const hasIntendedAt = Object.prototype.hasOwnProperty.call(value, "intendedAt");
+	const hasRetryIntendedAt = Object.prototype.hasOwnProperty.call(value, "retryIntendedAt");
+	const required = ["kind", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "observedAt", "observed", "difference", "conflictPaths", "replacementBuilderAttemptId", ...(hasIntendedAt ? ["intendedAt"] : []), ...(hasRetryIntendedAt ? ["retryIntendedAt"] : [])];
+	const intendedAt = hasIntendedAt && canonicalTimestamp(value.intendedAt) ? value.intendedAt : undefined;
+	const retryIntendedAt = hasRetryIntendedAt && canonicalTimestamp(value.retryIntendedAt) ? value.retryIntendedAt : undefined;
+	if (value.kind !== "advanced-target-conflict" || !exactKeys(value, required) || !canonicalTimestamp(value.observedAt) || (hasIntendedAt && !intendedAt) || (hasRetryIntendedAt && !retryIntendedAt) || (retryIntendedAt !== undefined && (intendedAt === undefined || retryIntendedAt < intendedAt)) || !safeIdentifier(value.replacementBuilderAttemptId)) return { diagnostics: [diagnostic("invalid-task", "Integration recovery identity or timestamps are invalid.", path)] };
+	if (!identity.value || identity.diagnostics.length > 0) return { diagnostics: identity.diagnostics };
+	const observedRaw = value.observed;
+	const observed = validateIntegrationObservation(observedRaw, `${path}.observed`);
+	const difference = validateIntegrationTargetDifference(value.difference, `${path}.difference`);
+	const advancedTargetRevision = observed.value?.head;
+	const facts = validateIntegrationReworkFacts({ targetBranch: value.targetBranch, recordedTargetRevision: value.targetRevision, advancedTargetRevision, difference: value.difference, conflictPaths: value.conflictPaths }, `${path}.facts`);
+	if (!observed.value || !difference.value || observed.diagnostics.length > 0 || difference.diagnostics.length > 0 || facts.diagnostics.length > 0 || advancedTargetRevision === null || advancedTargetRevision === undefined || facts.value?.advancedTargetRevision !== advancedTargetRevision || observed.value.branch !== value.targetBranch || observed.value.dirtyPaths.length !== 0 || observed.value.operationMarkers.length !== 0) return { diagnostics: [...observed.diagnostics, ...difference.diagnostics, ...facts.diagnostics, diagnostic("invalid-task", "Integration recovery must bind its observed clean advanced target and conflict facts.", path)] };
+	return { value: { ...identity.value, kind: "advanced-target-conflict", ...(intendedAt ? { intendedAt } : {}), ...(retryIntendedAt ? { retryIntendedAt } : {}), observedAt: value.observedAt, observed: observed.value, difference: difference.value, conflictPaths: [...facts.value!.conflictPaths], replacementBuilderAttemptId: value.replacementBuilderAttemptId }, diagnostics: [] };
+}
+
 function validateTaskIntegration(value: unknown, path: string): { value?: TaskIntegration; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || typeof value.phase !== "string") return { diagnostics: [diagnostic("invalid-task", "Task integration must be a recognized phase record.", path)] };
 	const identity = validateApprovedIntegrationIdentity(value, path);
 	if (!identity.value || identity.diagnostics.length > 0) return { diagnostics: identity.diagnostics };
 	if (value.phase === "intended" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt"]) && canonicalTimestamp(value.intendedAt)) return { value: { ...identity.value, phase: "intended", intendedAt: value.intendedAt }, diagnostics: [] };
+	if (value.phase === "retry-intended" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "retryIntendedAt"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.retryIntendedAt) && value.retryIntendedAt >= value.intendedAt) return { value: { ...identity.value, phase: "retry-intended", intendedAt: value.intendedAt, retryIntendedAt: value.retryIntendedAt }, diagnostics: [] };
 	if (value.phase === "integrated" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "integratedAt", "observedHead"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.integratedAt) && value.integratedAt >= value.intendedAt && typeof value.observedHead === "string" && /^[0-9a-f]{40}$/.test(value.observedHead) && ((identity.value.action.kind === "fast-forward" && value.observedHead === value.approvedHeadRevision) || (identity.value.action.kind === "merge-commit" && value.observedHead !== value.targetRevision))) return { value: { ...identity.value, phase: "integrated", intendedAt: value.intendedAt, integratedAt: value.integratedAt, observedHead: value.observedHead }, diagnostics: [] };
 	if (value.phase === "failed" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "observedAt", "exitCode", "diagnostic"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.observedAt) && value.observedAt >= value.intendedAt && (value.exitCode === null || (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode))) && boundedText(value.diagnostic, 2_000)) return { value: { ...identity.value, phase: "failed", intendedAt: value.intendedAt, observedAt: value.observedAt, exitCode: value.exitCode, diagnostic: value.diagnostic }, diagnostics: [] };
-	if (value.phase === "ambiguous" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "observedAt", "exitCode", "diagnostic", "observed"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.observedAt) && value.observedAt >= value.intendedAt && (value.exitCode === null || (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode))) && boundedText(value.diagnostic, 2_000)) {
+	if (value.phase === "ambiguous" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "observedAt", "exitCode", "diagnostic", "observed", ...(Object.prototype.hasOwnProperty.call(value, "difference") ? ["difference"] : [])]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.observedAt) && value.observedAt >= value.intendedAt && (value.exitCode === null || (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode))) && boundedText(value.diagnostic, 2_000)) {
 		const observed = validateIntegrationObservation(value.observed, `${path}.observed`);
-		return observed.value && observed.diagnostics.length === 0 ? { value: { ...identity.value, phase: "ambiguous", intendedAt: value.intendedAt, observedAt: value.observedAt, exitCode: value.exitCode, diagnostic: value.diagnostic, observed: observed.value }, diagnostics: [] } : { diagnostics: observed.diagnostics };
+		const difference = Object.prototype.hasOwnProperty.call(value, "difference") ? validateIntegrationTargetDifference(value.difference, `${path}.difference`) : { diagnostics: [] };
+		return observed.value && observed.diagnostics.length === 0 && difference.diagnostics.length === 0 ? { value: { ...identity.value, phase: "ambiguous", intendedAt: value.intendedAt, observedAt: value.observedAt, exitCode: value.exitCode, diagnostic: value.diagnostic, observed: observed.value, ...(difference.value ? { difference: difference.value } : {}) }, diagnostics: [] } : { diagnostics: [...observed.diagnostics, ...difference.diagnostics] };
 	}
 	return { diagnostics: [diagnostic("invalid-task", "Task integration has invalid exact phase fields.", path)] };
 }
@@ -2138,6 +2348,10 @@ function isReworkDispatch(value: BuilderDispatchRecord): value is ReworkDispatch
 	return "cycle" in value;
 }
 
+function isIntegrationReworkDispatch(value: BuilderDispatchRecord): value is IntegrationReworkDispatchRecord {
+	return "integrationRecovery" in value;
+}
+
 function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<string, unknown>, contract: TaskContract | undefined, modelPlans: ProjectModelPlans | undefined, path: string, diagnostics: RunDiagnostic[]): void {
 	if (!contract) return;
 	for (let index = 0; index < attempts.length; index += 1) {
@@ -2240,11 +2454,22 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 			const priorDispatch = priorBuilder?.role === "builder" ? priorBuilder.dispatch : undefined;
 			const sameBuilder = (priorDispatch?.phase === "prompted" || priorDispatch?.phase === "reconciled-active") && (attempt.dispatch.phase === "assignment-intended" || attempt.dispatch.phase === "prompt-intended" || attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active") && attempt.dispatch.branch === priorDispatch.branch && attempt.dispatch.agentName === priorDispatch.agentName && attempt.dispatch.worktreePath === priorDispatch.worktreePath && attempt.dispatch.workspaceId === priorDispatch.workspaceId && attempt.dispatch.paneId === priorDispatch.paneId && attempt.dispatch.terminalId === priorDispatch.terminalId;
 			const sameReviewEvidence = priorReviewer?.role === "reviewer" && priorReviewer.evidence?.phase === "finalized" && attempt.dispatch.reviewerManifestPath === priorReviewer.evidence.manifestPath && attempt.dispatch.reviewerManifestSha256 === priorReviewer.evidence.manifestSha256;
-			const expectedCycle = attempts.slice(0, index).filter((candidate) => candidate.role === "builder" && candidate.replacement === undefined && isReworkDispatch(candidate.dispatch)).length + 1;
-			if (!priorBuilder || priorBuilder.role !== "builder" || !priorReviewer || priorReviewer.role !== "reviewer" || priorReviewer.state !== "reported" || priorReviewer.evidence?.phase !== "finalized" || priorReviewer.evidence.verdict !== "changes-required" || attempt.dispatch.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.priorReviewerAttemptId !== priorReviewer.id || attempt.dispatch.cycle !== expectedCycle || !reviewSubjectsEqual(attempt.dispatch.reviewedSubject, priorReviewer.subject) || !sameReviewEvidence || !sameBuilder) diagnostics.push(diagnostic("invalid-task", "Rework Builder backlinks, protected evidence, subject, identity, and logical lineage cycle must match the preceding changes-required Review.", `${path}.attempts[${index}]`));
+				const expectedCycle = attempts.slice(0, index).filter((candidate) => candidate.role === "builder" && candidate.replacement === undefined && isReworkDispatch(candidate.dispatch)).length + 1;
+				const integrationRework = isIntegrationReworkDispatch(attempt.dispatch);
+				const priorReviewApproved = integrationRework && priorReviewer?.role === "reviewer" && priorReviewer.evidence?.phase === "finalized" && priorReviewer.evidence.verdict === "approved";
+				const priorReviewChangesRequired = !integrationRework && priorReviewer?.role === "reviewer" && priorReviewer.evidence?.phase === "finalized" && priorReviewer.evidence.verdict === "changes-required";
+				const integrationDispatch = isIntegrationReworkDispatch(attempt.dispatch) ? attempt.dispatch : undefined;
+				const baseMatchesRecovery = integrationDispatch ? attempt.baseRevision === integrationDispatch.integrationRecovery.advancedTargetRevision : true;
+				const recoveryRecord = integrationRework && Array.isArray(rawTask.integrationRecoveries)
+					? rawTask.integrationRecoveries.find((candidate): candidate is Record<string, unknown> => isRecord(candidate) && candidate.replacementBuilderAttemptId === attempt.id)
+					: undefined;
+				const recoveryBinding = integrationRework && recoveryRecord
+					? integrationDispatch && recoveryRecord.observed && isRecord(recoveryRecord.observed) && recoveryRecord.observed.head === attempt.baseRevision && recoveryRecord.targetRevision === integrationDispatch.integrationRecovery.recordedTargetRevision && recoveryRecord.difference && JSON.stringify(recoveryRecord.difference) === JSON.stringify(integrationDispatch.integrationRecovery.difference)
+					: !integrationRework;
+				if (!priorBuilder || priorBuilder.role !== "builder" || !priorReviewer || priorReviewer.role !== "reviewer" || priorReviewer.state !== "reported" || (!priorReviewApproved && !priorReviewChangesRequired) || attempt.dispatch.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.priorReviewerAttemptId !== priorReviewer.id || attempt.dispatch.cycle !== expectedCycle || !reviewSubjectsEqual(attempt.dispatch.reviewedSubject, priorReviewer.subject) || !sameReviewEvidence || !sameBuilder || !baseMatchesRecovery || !recoveryBinding) diagnostics.push(diagnostic("invalid-task", integrationRework ? "Integration rework Builder backlinks, approved evidence, subject, same-Builder identity, advanced base, recovery record, and cycle must match the preceding approved Review." : "Rework Builder backlinks, protected evidence, subject, identity, and logical lineage cycle must match the preceding changes-required Review.", `${path}.attempts[${index}]`));
+			}
 		}
-	}
-	const expectedRework = attempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && isReworkDispatch(attempt.dispatch)).length;
+		const expectedRework = attempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && isReworkDispatch(attempt.dispatch)).length;
 	if ((rawTask.reworkCycles as unknown) !== expectedRework) diagnostics.push(diagnostic("invalid-task", "reworkCycles must equal the number of rework Builder Attempts.", `${path}.reworkCycles`));
 	if (attempts.length > 20) diagnostics.push(diagnostic("invalid-task", "A Task allows a bounded alternating history plus silent replacements.", `${path}.attempts`));
 	const replacementOrdinals = attempts.flatMap((attempt) => attempt.replacement ? [attempt.replacement.retryOrdinal] : []);
@@ -2426,9 +2651,10 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		}
 		const hasApproval = Object.prototype.hasOwnProperty.call(task, "approval");
 		const hasIntegration = Object.prototype.hasOwnProperty.call(task, "integration");
+		const hasIntegrationRecoveries = Object.prototype.hasOwnProperty.call(task, "integrationRecoveries");
 		const hasAttentionDiagnostic = Object.prototype.hasOwnProperty.call(task, "attentionDiagnostic");
 		const hasAttentionReason = Object.prototype.hasOwnProperty.call(task, "attentionReason");
-		if (!exactKeys(task, ["specificationVersion", "specificationHash", "contract", "phase", "attention", ...(hasAttentionDiagnostic ? ["attentionDiagnostic"] : []), ...(hasAttentionReason ? ["attentionReason"] : []), "attempts", "reworkCycles", ...(hasApproval ? ["approval"] : []), ...(hasIntegration ? ["integration"] : [])])) {
+		if (!exactKeys(task, ["specificationVersion", "specificationHash", "contract", "phase", "attention", ...(hasAttentionDiagnostic ? ["attentionDiagnostic"] : []), ...(hasAttentionReason ? ["attentionReason"] : []), "attempts", "reworkCycles", ...(hasApproval ? ["approval"] : []), ...(hasIntegration ? ["integration"] : []), ...(hasIntegrationRecoveries ? ["integrationRecoveries"] : [])])) {
 			diagnostics.push(diagnostic("invalid-task", "Task contains unknown or missing initialization keys.", taskPath));
 			continue;
 		}
@@ -2438,6 +2664,21 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		taskDiagnostics.push(...approval.diagnostics);
 		const integration = hasIntegration ? validateTaskIntegration(task.integration, `${taskPath}.integration`) : { diagnostics: [] };
 		taskDiagnostics.push(...integration.diagnostics);
+		const integrationRecoveriesResult: { value?: IntegrationReworkRecord[]; diagnostics: RunDiagnostic[] } = hasIntegrationRecoveries
+			? Array.isArray(task.integrationRecoveries)
+				? (() => {
+					const records: IntegrationReworkRecord[] = [];
+					const recoveryDiagnostics: RunDiagnostic[] = [];
+					for (let recoveryIndex = 0; recoveryIndex < task.integrationRecoveries.length; recoveryIndex += 1) {
+						const result = validateIntegrationReworkRecord(task.integrationRecoveries[recoveryIndex], `${taskPath}.integrationRecoveries[${recoveryIndex}]`);
+						if (result.value) records.push(result.value);
+						recoveryDiagnostics.push(...result.diagnostics);
+					}
+					return recoveryDiagnostics.length > 0 ? { diagnostics: recoveryDiagnostics } : { value: records, diagnostics: [] };
+				})()
+				: { diagnostics: [diagnostic("invalid-task", "integrationRecoveries must be an ordered array.", `${taskPath}.integrationRecoveries`)] }
+			: { diagnostics: [] };
+		taskDiagnostics.push(...integrationRecoveriesResult.diagnostics);
 		if (task.specificationVersion !== 1) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationVersion must be 1.", `${taskPath}.specificationVersion`));
 		if (typeof task.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(task.specificationHash) || (contractResult.value && specificationHash(contractResult.value) !== task.specificationHash)) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationHash does not match its exact contract.", `${taskPath}.specificationHash`));
 		const settingsLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.reworkCycleLimit) ? value.effectiveSettings.reworkCycleLimit as number : 5;
@@ -2459,6 +2700,15 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			}
 		}
 		validateAttemptSequence(attempts, task as Record<string, unknown>, contractResult.value, plans.value, taskPath, taskDiagnostics);
+		const integrationRecoveries = integrationRecoveriesResult.value ?? [];
+		if (integrationRecoveries.length > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Integration recovery history cannot exceed the frozen rework cycle limit.", `${taskPath}.integrationRecoveries`));
+		if (new Set(integrationRecoveries.map((record) => record.replacementBuilderAttemptId)).size !== integrationRecoveries.length) taskDiagnostics.push(diagnostic("invalid-task", "Integration recovery replacement Builder Attempt IDs must be unique.", `${taskPath}.integrationRecoveries`));
+		for (const recovery of integrationRecoveries) {
+			const replacement = attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === recovery.replacementBuilderAttemptId && attempt.role === "builder");
+			if (!replacement || !isIntegrationReworkDispatch(replacement.dispatch) || replacement.baseRevision !== recovery.observed.head || replacement.dispatch.integrationRecovery.advancedTargetRevision !== recovery.observed.head || replacement.dispatch.integrationRecovery.recordedTargetRevision !== recovery.targetRevision || replacement.dispatch.integrationRecovery.targetBranch !== recovery.targetBranch) taskDiagnostics.push(diagnostic("invalid-task", "Integration recovery must bind its appended same-Builder Attempt and advanced base exactly.", `${taskPath}.integrationRecoveries`));
+		}
+		const integrationReworkAttempts = attempts.filter((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder" && attempt.replacement === undefined && isIntegrationReworkDispatch(attempt.dispatch));
+		if (integrationReworkAttempts.length !== integrationRecoveries.length) taskDiagnostics.push(diagnostic("invalid-task", "Every integration-rework Builder Attempt must have exactly one retained IntegrationReworkRecord.", `${taskPath}.integrationRecoveries`));
 		const transientLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.transientRetryLimit) ? value.effectiveSettings.transientRetryLimit as number : 2;
 		if (attempts.some((attempt) => attempt.replacement !== undefined && attempt.replacement.retryOrdinal > transientLimit)) taskDiagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals cannot exceed the frozen transient retry limit.", `${taskPath}.attempts`));
 		const currentSilence = attempts.at(-1)?.recovery?.silence;
@@ -2480,7 +2730,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		if (task.phase === "approved" && (!approval.value || approval.value.phase !== "valid" || (task.attention !== "none" && !["integration-preflight", "final-verification-unexecutable"].includes(task.attentionReason as string)) || !latestReviewer || latestReviewer.state !== "reported" || latestReviewer.evidence?.phase !== "finalized" || latestReviewer.evidence.verdict !== "approved")) taskDiagnostics.push(diagnostic("invalid-task", "Approved Tasks require a valid Approval bound to a finalized approved Reviewer.", taskPath));
 		if ((task.phase === "integrating" || task.phase === "completed") && (!approval.value || approval.value.phase !== "valid" || !integration.value)) taskDiagnostics.push(diagnostic("invalid-task", "Integrating and completed Tasks require a current Approval and integration record.", taskPath));
 		if (task.phase === "completed" && (task.attention !== "none" || integration.value?.phase !== "integrated")) taskDiagnostics.push(diagnostic("invalid-task", "Completed Tasks require an integrated identity and no attention.", taskPath));
-		if (integration.value?.phase === "intended" && (task.phase !== "integrating" || task.attention !== "none")) taskDiagnostics.push(diagnostic("invalid-task", "An intended integration requires an integrating Task with no attention.", `${taskPath}.integration`));
+		if ((integration.value?.phase === "intended" || integration.value?.phase === "retry-intended") && (task.phase !== "integrating" || task.attention !== "none")) taskDiagnostics.push(diagnostic("invalid-task", "An integration intent requires an integrating Task with no attention.", `${taskPath}.integration`));
 		if (integration.value?.phase === "integrated" && task.phase !== "integrating" && task.phase !== "completed") taskDiagnostics.push(diagnostic("invalid-task", "An integrated record requires an integrating or completed Task.", `${taskPath}.integration`));
 		if ((integration.value?.phase === "failed" || integration.value?.phase === "ambiguous") && (task.phase !== "integrating" || task.attention !== "needs-user" || (integration.value.phase === "failed" ? task.attentionReason !== "integration-failed" : task.attentionReason !== "integration-ambiguous"))) taskDiagnostics.push(diagnostic("invalid-task", "Failed or ambiguous integration requires structured needs-user attention.", `${taskPath}.integration`));
 		if (!hasIntegration && ["integrating", "completed"].includes(task.phase as string)) taskDiagnostics.push(diagnostic("invalid-task", "Integrating and completed Tasks cannot omit integration facts.", taskPath));
@@ -2498,7 +2748,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		if (approval.value) {
 			const approvedBuilder = attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === approval.value!.builderAttemptId && attempt.role === "builder");
 			const approvedReviewer = attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.id === approval.value!.reviewerAttemptId && attempt.role === "reviewer");
-			if (!approvedBuilder || !approvedReviewer || attempts[attempts.length - 2]?.id !== approval.value.builderAttemptId || attempts[attempts.length - 1]?.id !== approval.value.reviewerAttemptId || approvedBuilder.evidence?.phase !== "finalized" || approvedBuilder.evidence.status !== "completed" || approvedReviewer.evidence?.phase !== "finalized" || approvedReviewer.evidence.verdict !== "approved" || approvedReviewer.evidence.manifestPath !== approval.value.reviewerManifestPath || approvedReviewer.evidence.manifestSha256 !== approval.value.reviewerManifestSha256 || approvedReviewer.integrity?.kind !== "preserved" || !reviewSubjectBindsBuilder(approval.value.subject, approvedBuilder) || !reviewSubjectsEqual(approval.value.subject, approvedReviewer.subject) || !snapshotsEqual(approval.value.worktreeSnapshot, approvedReviewer.integrity.after) || approval.value.worktreeSnapshot.dirtyPaths.length !== 0 || approval.value.worktreeSnapshot.operationMarkers.length !== 0 || (approval.value.subject.kind === "git" && approval.value.worktreeSnapshot.head !== approval.value.subject.headRevision)) taskDiagnostics.push(diagnostic("invalid-task", "Approval must bind the exact final completed Builder and Reviewer Attempts, subject, protected evidence, and clean snapshot.", `${taskPath}.approval`));
+			if (!approvedBuilder || !approvedReviewer || (approval.value.phase === "valid" && (attempts[attempts.length - 2]?.id !== approval.value.builderAttemptId || attempts[attempts.length - 1]?.id !== approval.value.reviewerAttemptId)) || approvedBuilder.evidence?.phase !== "finalized" || approvedBuilder.evidence.status !== "completed" || approvedReviewer.evidence?.phase !== "finalized" || approvedReviewer.evidence.verdict !== "approved" || approvedReviewer.evidence.manifestPath !== approval.value.reviewerManifestPath || approvedReviewer.evidence.manifestSha256 !== approval.value.reviewerManifestSha256 || approvedReviewer.integrity?.kind !== "preserved" || !reviewSubjectBindsBuilder(approval.value.subject, approvedBuilder) || !reviewSubjectsEqual(approval.value.subject, approvedReviewer.subject) || !snapshotsEqual(approval.value.worktreeSnapshot, approvedReviewer.integrity.after) || approval.value.worktreeSnapshot.dirtyPaths.length !== 0 || approval.value.worktreeSnapshot.operationMarkers.length !== 0 || (approval.value.subject.kind === "git" && approval.value.worktreeSnapshot.head !== approval.value.subject.headRevision)) taskDiagnostics.push(diagnostic("invalid-task", "Approval must bind the exact final completed Builder and Reviewer Attempts, subject, protected evidence, and clean snapshot.", `${taskPath}.approval`));
 		}
 		if (integration.value && approval.value?.phase === "valid" && base.value?.kind === "git") {
 			const subject = approval.value.subject;
@@ -2509,13 +2759,25 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			const expectedBase = subject.kind === "git" ? subject.baseRevision : "";
 			const actionMatches = integration.value.action.argv[0] === "merge" && integration.value.action.argv[2] === "--no-edit" && integration.value.action.argv[3] === expectedHead && ((integration.value.action.kind === "fast-forward" && integration.value.action.argv[1] === "--ff-only") || (integration.value.action.kind === "merge-commit" && integration.value.action.argv[1] === "--no-ff"));
 			const legacySingle = (rawTasks?.length ?? 0) === 1;
-			const identityMatches = subject.kind === "git" && expectedCommits.at(-1) === expectedHead && (!legacySingle || expectedBase === base.value.revision) && integration.value.targetBranch === base.value.branch && (!legacySingle || integration.value.targetRevision === base.value.revision) && integration.value.approvedBaseRevision === expectedBase && integration.value.approvedHeadRevision === expectedHead && JSON.stringify(integration.value.approvedCommits) === JSON.stringify(expectedCommits) && integration.value.builderAttemptId === approval.value.builderAttemptId && integration.value.reviewerAttemptId === approval.value.reviewerAttemptId && integration.value.builderManifestSha256 === subject.builderManifestSha256 && integration.value.reviewerManifestSha256 === approval.value.reviewerManifestSha256 && actionMatches && (!legacySingle || integration.value.action.kind === "fast-forward");
+			const expectedSingleTarget = integrationRecoveriesResult.value?.at(-1)?.observed.head ?? base.value.revision;
+			const identityMatches = subject.kind === "git"
+				&& expectedCommits.at(-1) === expectedHead
+				&& (!legacySingle || (expectedBase === expectedSingleTarget && integration.value.targetRevision === expectedSingleTarget && integration.value.action.kind === "fast-forward"))
+				&& integration.value.targetBranch === base.value.branch
+				&& integration.value.approvedBaseRevision === expectedBase
+				&& integration.value.approvedHeadRevision === expectedHead
+				&& JSON.stringify(integration.value.approvedCommits) === JSON.stringify(expectedCommits)
+				&& integration.value.builderAttemptId === approval.value.builderAttemptId
+				&& integration.value.reviewerAttemptId === approval.value.reviewerAttemptId
+				&& integration.value.builderManifestSha256 === subject.builderManifestSha256
+				&& integration.value.reviewerManifestSha256 === approval.value.reviewerManifestSha256
+				&& actionMatches;
 			if (!builder || !reviewer || reviewer.evidence?.phase !== "finalized" || builder.evidence?.phase !== "finalized" || builder.evidence.manifestSha256 !== integration.value.builderManifestSha256 || reviewer.evidence.manifestSha256 !== integration.value.reviewerManifestSha256 || !identityMatches) taskDiagnostics.push(diagnostic("invalid-task", "Integration identity must remain exactly bound to the current Approval and protected final evidence.", `${taskPath}.integration`));
 		}
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
 		if (contractResult.value) taskIds.add(contractResult.value.id);
 		if (taskDiagnostics.length > 0 || !contractResult.value || typeof task.specificationHash !== "string") diagnostics.push(...taskDiagnostics);
-		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, ...(hasAttentionDiagnostic ? { attentionDiagnostic: task.attentionDiagnostic as string } : {}), ...(hasAttentionReason ? { attentionReason: task.attentionReason as TaskAttentionReason } : {}), attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}), ...(integration.value ? { integration: integration.value } : {}) });
+		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, ...(hasAttentionDiagnostic ? { attentionDiagnostic: task.attentionDiagnostic as string } : {}), ...(hasAttentionReason ? { attentionReason: task.attentionReason as TaskAttentionReason } : {}), attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}), ...(integration.value ? { integration: integration.value } : {}), ...(hasIntegrationRecoveries ? { integrationRecoveries } : {}) });
 	}
 	if (!plans.value || plans.diagnostics.length > 0) diagnostics.push(...plans.diagnostics.map((item: ConfigDiagnostic) => diagnostic("invalid-config", item.message, item.path)));
 	const settings = validateRecoveryDefaults(value.effectiveSettings, `${path}.effectiveSettings`);
@@ -2546,19 +2808,45 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 				if ("workspaceId" in dispatch && typeof dispatch.workspaceId === "string") claim(dispatch.workspaceId, task.contract.id, "workspace");
 				if ("paneId" in dispatch && typeof dispatch.paneId === "string") claim(dispatch.paneId, task.contract.id, "pane");
 				if ("terminalId" in dispatch && typeof dispatch.terminalId === "string") claim(dispatch.terminalId, task.contract.id, "terminal");
-				if (attempt.role === "builder" && attempt.baseRevision !== base.value.revision && !integratedHeads.some((entry) => entry.index < taskIndex && entry.integratedAt <= attempt.preparedAt && entry.head === attempt.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Builder Attempt baseRevision must be the Run base or an ordered head integrated before that Attempt was prepared.", `${path}.tasks.${task.contract.id}.attempts`));
+				const integrationReworkBase = attempt.role === "builder" && isIntegrationReworkDispatch(attempt.dispatch) && attempt.dispatch.integrationRecovery.advancedTargetRevision === attempt.baseRevision;
+				if (attempt.role === "builder" && attempt.baseRevision !== base.value.revision && !integrationReworkBase && !integratedHeads.some((entry) => entry.index < taskIndex && entry.integratedAt <= attempt.preparedAt && entry.head === attempt.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Builder Attempt baseRevision must be the Run base, an ordered integrated head, or the exact advanced target recorded by integration rework.", `${path}.tasks.${task.contract.id}.attempts`));
+			}
+			let taskExpectedTarget = expectedTarget;
+			for (const recovery of task.integrationRecoveries ?? []) {
+				const approvedBuilder = task.attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === recovery.builderAttemptId && attempt.role === "builder");
+				const approvedReviewer = task.attempts.find((attempt): attempt is ReviewerAttemptRecord => attempt.id === recovery.reviewerAttemptId && attempt.role === "reviewer");
+				const oldSubject = approvedReviewer?.subject;
+				const approvalBindsRecovery = approvedBuilder?.state === "reported"
+					&& approvedBuilder.evidence?.phase === "finalized"
+					&& approvedBuilder.evidence.status === "completed"
+					&& approvedBuilder.evidence.manifestSha256 === recovery.builderManifestSha256
+					&& approvedReviewer?.state === "reported"
+					&& approvedReviewer.evidence?.phase === "finalized"
+					&& approvedReviewer.evidence.verdict === "approved"
+					&& approvedReviewer.evidence.manifestSha256 === recovery.reviewerManifestSha256
+					&& approvedReviewer.integrity?.kind === "preserved"
+					&& oldSubject?.kind === "git"
+					&& oldSubject.baseRevision === recovery.approvedBaseRevision
+					&& oldSubject.headRevision === recovery.approvedHeadRevision
+					&& JSON.stringify(oldSubject.commits) === JSON.stringify(recovery.approvedCommits)
+					&& oldSubject.builderManifestSha256 === recovery.builderManifestSha256;
+				const recoveryDispatch = task.attempts.find((attempt): attempt is BuilderAttemptRecord => attempt.id === recovery.replacementBuilderAttemptId && attempt.role === "builder")?.dispatch;
+				const dispatchBindsRecovery = recoveryDispatch && isIntegrationReworkDispatch(recoveryDispatch)
+					&& JSON.stringify(recoveryDispatch.integrationRecovery) === JSON.stringify({ targetBranch: recovery.targetBranch, recordedTargetRevision: recovery.targetRevision, advancedTargetRevision: recovery.observed.head, difference: recovery.difference, conflictPaths: recovery.conflictPaths });
+				if (recovery.targetBranch !== base.value.branch || recovery.targetRevision !== taskExpectedTarget || !approvalBindsRecovery || !dispatchBindsRecovery) diagnostics.push(diagnostic("invalid-task", "Integration recovery must bind the queue target, protected old evidence, and exact replacement dispatch facts.", `${path}.tasks.${task.contract.id}.integrationRecoveries`));
+				if (recovery.observed.head) taskExpectedTarget = recovery.observed.head;
 			}
 			const isCode = task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit");
 			if (!isCode) continue;
 			const integration = task.integration;
-			const historicalHeads = new Set([base.value.revision, ...tasks.slice(0, taskIndex).flatMap((candidate) => candidate.integration?.phase === "integrated" ? [candidate.integration.observedHead] : [])]);
+			const historicalHeads = new Set([base.value.revision, ...tasks.slice(0, taskIndex).flatMap((candidate) => candidate.integration?.phase === "integrated" ? [candidate.integration.observedHead] : []), ...(task.integrationRecoveries ?? []).map((recovery) => recovery.observed.head).filter((head): head is string => head !== null)]);
 			if (integration && !historicalHeads.has(integration.approvedBaseRevision)) diagnostics.push(diagnostic("invalid-task", "Integration source base must be the Run base or a previously integrated ordered head.", `${path}.tasks.${task.contract.id}.integration`));
 			if (integration?.phase === "integrated") {
-				if (queueOpen || integration.targetRevision !== expectedTarget || integration.targetBranch !== base.value.branch || integration.approvedBaseRevision !== (task.approval?.phase === "valid" && task.approval.subject.kind === "git" ? task.approval.subject.baseRevision : "") || integration.action.kind !== (integration.targetRevision === integration.approvedBaseRevision ? "fast-forward" : "merge-commit")) diagnostics.push(diagnostic("invalid-task", "Integrated code Tasks must form one ordered prefix with the exact local action.", `${path}.tasks.${task.contract.id}.integration`));
+				if (queueOpen || integration.targetRevision !== taskExpectedTarget || integration.targetBranch !== base.value.branch || integration.approvedBaseRevision !== (task.approval?.phase === "valid" && task.approval.subject.kind === "git" ? task.approval.subject.baseRevision : "") || integration.action.kind !== (integration.targetRevision === integration.approvedBaseRevision ? "fast-forward" : "merge-commit")) diagnostics.push(diagnostic("invalid-task", "Integrated code Tasks must form one ordered prefix with the exact local action.", `${path}.tasks.${task.contract.id}.integration`));
 				expectedTarget = integration.observedHead;
 				queueOpen = false;
 			} else if (integration) {
-				if (queueOpen || integration.targetRevision !== expectedTarget || integration.targetBranch !== base.value.branch) diagnostics.push(diagnostic("invalid-task", "Only the first non-integrated code Task may retain an integration intent or classified result.", `${path}.tasks.${task.contract.id}.integration`));
+				if (queueOpen || integration.targetRevision !== taskExpectedTarget || integration.targetBranch !== base.value.branch) diagnostics.push(diagnostic("invalid-task", "Only the first non-integrated code Task may retain an integration intent or classified result.", `${path}.tasks.${task.contract.id}.integration`));
 				queueOpen = true;
 			} else {
 				queueOpen = true;
@@ -2701,9 +2989,11 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 		return reviewer.value ? { value: reviewer.value, diagnostics: [] } : { diagnostics: reviewer.diagnostics.map((item) => diagnostic("invalid-task", item.message, item.path)) };
 	}
 	const hasRework = Object.prototype.hasOwnProperty.call(assignment, "rework");
+	const hasIntegrationRework = Object.prototype.hasOwnProperty.call(assignment, "integrationRework");
 	const hasContinuation = Object.prototype.hasOwnProperty.call(assignment, "continuation");
-	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "allowedScope", "expectedArtifacts", "reportPath", "evidenceDirectory", "verification", "actualModel", "specificationHash", "baseRevision", "worktree", "herdr", ...(hasRework ? ["rework"] : []), ...(hasContinuation ? ["continuation"] : [])];
+	const keys = ["runId", "taskId", "attemptId", "role", "requiredOutcome", "allowedScope", "expectedArtifacts", "reportPath", "evidenceDirectory", "verification", "actualModel", "specificationHash", "baseRevision", "worktree", "herdr", ...(hasRework ? ["rework"] : []), ...(hasIntegrationRework ? ["integrationRework"] : []), ...(hasContinuation ? ["continuation"] : [])];
 	if (!exactKeys(assignment, keys)) return { diagnostics: [diagnostic("invalid-task", "Assignment contains unknown or missing keys.", path)] };
+	if (hasRework && hasIntegrationRework) return { diagnostics: [diagnostic("invalid-task", "Assignment cannot contain both Reviewer-findings rework and integration rework facts.", `${path}.assignment`)] };
 	const diagnostics: RunDiagnostic[] = [];
 	if (!safeIdentifier(assignment.runId) || !assignment.runId.startsWith("run-")) diagnostics.push(diagnostic("invalid-task", "Assignment runId is unsafe.", `${path}.assignment.runId`));
 	if (!safeIdentifier(assignment.taskId) || !safeIdentifier(assignment.attemptId) || assignment.role !== "builder") diagnostics.push(diagnostic("invalid-task", "Assignment identity or role is invalid.", `${path}.assignment`));
@@ -2722,6 +3012,7 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 	const herdr = assignment.herdr;
 	if (!isRecord(herdr) || !exactKeys(herdr, ["workspaceId", "paneId", "terminalId", "agentName"]) || !trimmedString(herdr.workspaceId) || !trimmedString(herdr.paneId) || !trimmedString(herdr.terminalId) || !herdrName(herdr.agentName)) diagnostics.push(diagnostic("invalid-task", "Assignment Herdr identities are invalid.", `${path}.assignment.herdr`));
 	let rework: ReworkAssignmentFacts | undefined;
+	let integrationRework: IntegrationReworkAssignmentFacts | undefined;
 	let continuation: AttemptContinuation | undefined;
 	if (hasContinuation) {
 		const raw = assignment.continuation;
@@ -2744,6 +3035,19 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 			diagnostics.push(...subject.diagnostics, ...findings.diagnostics);
 		}
 	}
+	if (hasIntegrationRework) {
+		const raw = assignment.integrationRework;
+		if (!isRecord(raw) || !exactKeys(raw, ["cycle", "priorBuilderAttemptId", "priorReviewerAttemptId", "reviewedSubject", "reviewerEvidence", "integrationRecovery"]) || !Number.isSafeInteger(raw.cycle) || (raw.cycle as number) < 1 || !safeIdentifier(raw.priorBuilderAttemptId) || !safeIdentifier(raw.priorReviewerAttemptId)) diagnostics.push(diagnostic("invalid-task", "Integration rework Assignment facts have invalid exact identity fields.", `${path}.assignment.integrationRework`));
+		else {
+			const subject = validateReviewSubject(raw.reviewedSubject, `${path}.assignment.integrationRework.reviewedSubject`);
+			const evidence = raw.reviewerEvidence;
+			const recovery = validateIntegrationReworkFacts(raw.integrationRecovery, `${path}.assignment.integrationRework.integrationRecovery`);
+			if (!isRecord(evidence) || !exactKeys(evidence, ["manifestPath", "manifestSha256"]) || !absolutePathValue(evidence.manifestPath) || typeof evidence.manifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(evidence.manifestSha256)) diagnostics.push(diagnostic("invalid-task", "Integration rework Reviewer evidence pointer is invalid.", `${path}.assignment.integrationRework.reviewerEvidence`));
+			if (subject.value && recovery.value && isRecord(evidence) && absolutePathValue(evidence.manifestPath) && typeof evidence.manifestSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(evidence.manifestSha256) && subject.diagnostics.length === 0 && recovery.diagnostics.length === 0) integrationRework = { cycle: raw.cycle as number, priorBuilderAttemptId: raw.priorBuilderAttemptId, priorReviewerAttemptId: raw.priorReviewerAttemptId, reviewedSubject: subject.value, reviewerEvidence: { manifestPath: evidence.manifestPath, manifestSha256: evidence.manifestSha256 }, integrationRecovery: recovery.value };
+			if (recovery.value && assignment.baseRevision !== recovery.value.advancedTargetRevision) diagnostics.push(diagnostic("invalid-task", "Integration rework Assignment baseRevision must equal the recorded advanced target.", `${path}.assignment.baseRevision`));
+			diagnostics.push(...subject.diagnostics, ...recovery.diagnostics);
+		}
+	}
 	if (diagnostics.length > 0 || !artifacts.value || !verification.value || !model.value || typeof assignment.runId !== "string" || typeof assignment.taskId !== "string" || typeof assignment.attemptId !== "string" || typeof assignment.requiredOutcome !== "string" || !Array.isArray(assignment.allowedScope) || typeof assignment.reportPath !== "string" || typeof assignment.evidenceDirectory !== "string" || typeof assignment.specificationHash !== "string" || typeof assignment.baseRevision !== "string" || !isRecord(worktree) || typeof worktree.path !== "string" || typeof worktree.branch !== "string" || !isRecord(herdr) || typeof herdr.workspaceId !== "string" || typeof herdr.paneId !== "string" || typeof herdr.terminalId !== "string" || typeof herdr.agentName !== "string" || (hasContinuation && !continuation)) return { diagnostics };
 	return {
 		value: {
@@ -2764,7 +3068,8 @@ function validateAssignment(value: unknown, path = "assignment.json"): { value?:
 				baseRevision: assignment.baseRevision,
 				worktree: { path: worktree.path, branch: worktree.branch },
 				herdr: { workspaceId: herdr.workspaceId, paneId: herdr.paneId, terminalId: herdr.terminalId, agentName: herdr.agentName },
-				...(rework ? { rework } : {}),
+					...(rework ? { rework } : {}),
+					...(integrationRework ? { integrationRework } : {}),
 				...(continuation ? { continuation } : {}),
 			},
 		},
@@ -2830,13 +3135,21 @@ export function buildBuilderAssignment(input: {
 	if (input.attempt.replacement && !input.continuation) throw new Error("Replacement Builder Assignment requires its exact predecessor continuation.");
 	if (!input.attempt.replacement && input.continuation) throw new Error("A non-replacement Builder Assignment cannot carry a replacement continuation.");
 	const dispatch = input.attempt.dispatch;
-	const rework = "cycle" in dispatch ? {
+	const rework = "cycle" in dispatch && !isIntegrationReworkDispatch(dispatch) ? {
 		cycle: dispatch.cycle,
 		priorBuilderAttemptId: dispatch.priorBuilderAttemptId,
 		priorReviewerAttemptId: dispatch.priorReviewerAttemptId,
 		reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject),
 		reviewerEvidence: { manifestPath: dispatch.reviewerManifestPath, manifestSha256: dispatch.reviewerManifestSha256 },
 		findings: dispatch.findings.map((finding) => ({ ...finding })),
+	} : undefined;
+	const integrationRework = isIntegrationReworkDispatch(dispatch) ? {
+		cycle: dispatch.cycle,
+		priorBuilderAttemptId: dispatch.priorBuilderAttemptId,
+		priorReviewerAttemptId: dispatch.priorReviewerAttemptId,
+		reviewedSubject: cloneReviewSubject(dispatch.reviewedSubject),
+		reviewerEvidence: { manifestPath: dispatch.reviewerManifestPath, manifestSha256: dispatch.reviewerManifestSha256 },
+		integrationRecovery: cloneIntegrationReworkFacts(dispatch.integrationRecovery),
 	} : undefined;
 	const document: BuilderAssignmentDocument = {
 		schemaVersion: 1,
@@ -2857,6 +3170,7 @@ export function buildBuilderAssignment(input: {
 			worktree: { path: input.worktreePath, branch: input.attempt.dispatch.branch },
 				herdr: { workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, agentName: input.agentName },
 				...(rework ? { rework } : {}),
+				...(integrationRework ? { integrationRework } : {}),
 				...(input.continuation ? { continuation: { ...input.continuation, preservedWorktree: { ...input.continuation.preservedWorktree } } } : {}),
 		},
 	};
@@ -2873,9 +3187,10 @@ export function formatBuilderPrompt(document: BuilderAssignmentDocument): string
 		"The following Assignment is authoritative and bounded:",
 		serializeBuilderAssignment(document).trimEnd(),
 		"",
-		`Modify only these worktree-relative paths: ${assignment.allowedScope.join(", ")}.`,
-		"Produce every expected Artifact, run the stated verification, and write the Attempt Report to the absolute reportPath.",
-		...(assignment.rework ? [`This is bounded rework cycle ${assignment.rework.cycle} for the same Builder. Address only the protected findings from Reviewer Attempt ${assignment.rework.priorReviewerAttemptId} and produce a complete Artifact from the frozen Run base to the new head.`] : []),
+			`Modify only these worktree-relative paths: ${assignment.allowedScope.join(", ")}.`,
+			"Produce every expected Artifact, run the stated verification, and write the Attempt Report to the absolute reportPath.",
+			...(assignment.rework ? [`This is bounded rework cycle ${assignment.rework.cycle} for the same Builder. Address only the protected findings from Reviewer Attempt ${assignment.rework.priorReviewerAttemptId} and produce a complete Artifact from the frozen Run base to the new head.`] : []),
+			...(assignment.integrationRework ? [`This is bounded integration-rework cycle ${assignment.integrationRework.cycle} for the same Builder. The old approved Artifact and Review are historical; adapt the preserved clean worktree to advanced target ${assignment.integrationRework.integrationRecovery.advancedTargetRevision} from baseRevision, address only the recorded target conflict paths, and produce a fresh SHA, Attempt Report, finalized evidence, and fresh Review before integration.`] : []),
 		"Terminal or Herdr state is not completion; the Attempt Report is required.",
 		formatTaskFactInstruction(),
 		"Do not modify unrelated paths or dispatch another agent.",
@@ -2890,7 +3205,7 @@ export function cloneRunJournal(journal: RunJournal): RunJournal {
 			...journal.run,
 			...(journal.run.controllerLease ? { controllerLease: cloneControllerLease(journal.run.controllerLease) } : {}),
 			integrationBase: journal.run.integrationBase.kind === "git" ? { ...journal.run.integrationBase } : { kind: "none" },
-			tasks: journal.run.tasks.map((task) => ({ ...task, contract: cloneContract(task.contract), attempts: task.attempts.map(cloneAttempt), ...(task.approval ? { approval: cloneApproval(task.approval) } : {}), ...(task.integration ? { integration: cloneIntegration(task.integration) } : {}) })),
+			tasks: journal.run.tasks.map((task) => ({ ...task, contract: cloneContract(task.contract), attempts: task.attempts.map(cloneAttempt), ...(task.approval ? { approval: cloneApproval(task.approval) } : {}), ...(task.integration ? { integration: cloneIntegration(task.integration) } : {}), ...(task.integrationRecoveries ? { integrationRecoveries: task.integrationRecoveries.map(cloneIntegrationReworkRecord) } : {}) })),
 			modelPlan: cloneModelPlans(journal.run.modelPlan),
 			effectiveSettings: cloneRecoveryDefaults(journal.run.effectiveSettings),
 			finalVerification: cloneVerification(journal.run.finalVerification),

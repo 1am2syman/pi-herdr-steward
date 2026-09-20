@@ -50,6 +50,14 @@ import {
 	type ReviewerEvidenceRecord,
 	type ReviewerAttemptRecord,
 	type ReworkDispatchRecord,
+	type IntegrationReworkDispatchRecord,
+	type IntegrationReworkFacts,
+	type IntegrationTargetDifference,
+	type IntegrationTargetFacts,
+	type IntegrationApplication,
+	type IntegrationMergeability,
+	type IntegrationReworkRecord,
+	type ApprovedIntegrationIdentity,
 	type TaskApproval,
 	type ReportRepairFailure,
 	type IntegrationCheckoutObservation,
@@ -307,7 +315,17 @@ export interface IntegrationCheckoutInput {
 }
 
 export type IntegrationCheckoutResult =
-	| { kind: "inspected"; observation: import("./run.ts").IntegrationCheckoutObservation; resolvedBaseRevision: string; resolvedHeadRevision: string; commits: string[] }
+	| {
+			kind: "inspected";
+			observation: import("./run.ts").IntegrationCheckoutObservation;
+			resolvedBaseRevision: string;
+			resolvedHeadRevision: string;
+			commits: string[];
+			target?: IntegrationTargetFacts;
+			application?: IntegrationApplication;
+			difference?: IntegrationTargetDifference;
+			mergeability?: IntegrationMergeability;
+	  }
 	| { kind: "unavailable"; message: string };
 
 export interface IntegrationMutationInput extends IntegrationCheckoutInput {
@@ -572,10 +590,24 @@ function presentApprovedStatus(journal: RunJournal, note?: string): ActiveStatus
 	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · approved · ${attentionCount} attention` } };
 }
 
+function integrationStatusLines(task: TaskRecord): string[] {
+	const integration = task.integration;
+	if (!integration) return [];
+	const lines = [`Integration: ${integration.phase}`, `Integration target expected: ${integration.targetBranch}@${integration.targetRevision}`];
+	if (integration.phase === "integrated") lines.push(`Integration application: exact @ ${integration.observedHead}`);
+	if (integration.phase === "ambiguous") {
+		lines.push(`Integration observed: ${integration.observed.branch ?? "detached"}@${integration.observed.head ?? "unknown"}`, `Integration dirty paths: ${integration.observed.dirtyPaths.join(", ") || "none"}`, `Integration operation markers: ${integration.observed.operationMarkers.join(", ") || "none"}`, `Integration application: absent/uncertain`);
+		if (integration.difference) lines.push(`Integration delta commits: ${integration.difference.commits.join(", ") || "none"}`, `Integration delta paths: ${integration.difference.changedPaths.map((change) => `${change.status}:${change.paths.join("→")}`).join(", ") || "none"}${integration.difference.truncated ? " (truncated)" : ""}`);
+	}
+	const recovery = task.integrationRecoveries?.at(-1);
+	if (recovery) lines.push(`Integration rework history: ${recovery.targetBranch}@${recovery.targetRevision} advanced to ${recovery.observed.head ?? "unknown"}; conflicts ${recovery.conflictPaths.join(", ")}`);
+	return lines;
+}
+
 function presentCompletionStatus(journal: RunJournal, note?: string): ActiveStatusView {
 	const task = journal.run.tasks[0];
 	const completion = journal.run.completion;
-	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(task ? [`Task ${task.contract.id}: ${task.phase}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : [])] : []), ...(task?.integration ? [`Integration: ${task.integration.phase}`] : []), ...(journal.run.finalVerificationExecution ? [`Final verification: ${journal.run.finalVerificationExecution.phase}`, `Verification result: ${journal.run.finalVerificationExecution.resultPath}`] : []), ...(completion ? [`Completion: ${completion.phase}`] : []), ...(note ? [note] : [])];
+	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(task ? [`Task ${task.contract.id}: ${task.phase}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : []), ...integrationStatusLines(task)] : []), ...(journal.run.finalVerificationExecution ? [`Final verification: ${journal.run.finalVerificationExecution.phase}`, `Verification result: ${journal.run.finalVerificationExecution.resultPath}`] : []), ...(completion ? [`Completion: ${completion.phase}`] : []), ...(note ? [note] : [])];
 	const attentionCount = task && task.attention !== "none" ? 1 : 0;
 	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · ${journal.run.status} · ${attentionCount} attention` } };
 }
@@ -674,12 +706,13 @@ function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatu
 		const attempt = task.attempts.at(-1);
 		const integration = task.integration?.phase ?? (task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? "queued" : "n/a");
 		const reason = task.attention !== "none" ? `/${task.attention}${task.attentionReason ? `:${task.attentionReason}` : ""}` : "";
-		return `Task ${index + 1} ${task.contract.id}: ${task.phase}${reason} · ${attempt ? `${attempt.role}/${attempt.id}/${attempt.state}` : "no-attempt"} · integration ${integration}`;
+		return `Task ${index + 1} ${task.contract.id}: ${task.phase}${reason} · ${attempt ? `${attempt.role}/${attempt.id}/${attempt.state}` : "no-attempt"} · integration ${integration}${task.integration?.phase === "ambiguous" ? ` · observed ${task.integration.observed.branch ?? "detached"}@${task.integration.observed.head ?? "unknown"}` : task.integration?.phase === "integrated" ? ` · applied @${task.integration.observedHead}` : ""}`;
 	}), `Tasks ${integrated}/${codeTasks.length} integrated | Active ${active}/${journal.run.effectiveSettings.maximumActiveTasks} | Approved waiting ${approved} | Attention ${attention} | Next integration ${nextIntegration}`];
 	const detail = journal.run.tasks.find((task) => activePhases.has(task.phase) || task.attention !== "none");
 	const detailAttempt = detail?.attempts.at(-1);
 	if (detail && detailAttempt) {
 		lines.push(`Assignment: ${detailAttempt.assignmentPath}${"assignmentSha256" in detailAttempt.dispatch ? ` (${detailAttempt.dispatch.assignmentSha256})` : ""}`);
+		lines.push(...integrationStatusLines(detail));
 		if (detailAttempt.role === "builder" && detailAttempt.evidence?.phase !== "finalized") lines.push("Completion: not inferred from Herdr activity; awaiting a validated Attempt Report.");
 	}
 	if (note) lines.push(note);
@@ -692,6 +725,7 @@ function pendingControllerAction(journal: RunJournal): ControllerPendingAction {
 		if (attempt && ["prepared", "active", "awaiting-report"].includes(attempt.state) && (attempt.dispatch.phase === "prompt-intended" || attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active")) return { kind: "reconcile-attempt", taskId: task.contract.id, attemptId: attempt.id, role: attempt.role };
 		if (attempt?.role === "builder" && attempt.state === "reported" && attempt.evidence?.phase !== "finalized") return { kind: "validate-builder-evidence", taskId: task.contract.id, attemptId: attempt.id, role: "builder" };
 		if (task.phase === "reviewing" && attempt?.role === "reviewer" && attempt.state === "reported") return { kind: attempt.evidence?.phase === "finalized" ? "advance-review" : "validate-approval", taskId: task.contract.id, attemptId: attempt.id, role: "reviewer" };
+		if (task.integration && task.integration.phase !== "integrated") return { kind: "integrate-task", taskId: task.contract.id };
 		if (task.attention !== "none" && attempt) return { kind: "wait-attention", taskId: task.contract.id, attemptId: attempt.id, role: attempt.role };
 		if (task.phase === "approved") return { kind: "integrate-task", taskId: task.contract.id };
 	}
@@ -1725,7 +1759,7 @@ async function loadCompletionEvidence(repositoryRoot: string, task: TaskRecord, 
 
 function completionIntegrationIdentity(journal: RunJournal, task: TaskRecord, evidence: { subject: ReviewSubject; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord }, targetRevision?: string): TaskIntegration | undefined {
 	if (journal.run.integrationBase.kind !== "git" || evidence.subject.kind !== "git" || evidence.builder.evidence?.phase !== "finalized" || evidence.reviewer.evidence?.phase !== "finalized") return undefined;
-	const target = targetRevision ?? journal.run.integrationBase.revision;
+	const target = targetRevision ?? task.integrationRecoveries?.at(-1)?.observed.head ?? journal.run.integrationBase.revision;
 	const action = target === evidence.subject.baseRevision ? { kind: "fast-forward" as const, argv: ["merge", "--ff-only", "--no-edit", evidence.subject.headRevision] as ["merge", "--ff-only", "--no-edit", string] } : { kind: "merge-commit" as const, argv: ["merge", "--no-ff", "--no-edit", evidence.subject.headRevision] as ["merge", "--no-ff", "--no-edit", string] };
 	return {
 		phase: "intended",
@@ -1756,6 +1790,23 @@ function integrationIdentityMatches(actual: TaskIntegration, expected: TaskInteg
 		&& JSON.stringify(actual.action) === JSON.stringify(expected.action);
 }
 
+function integrationIdentityOnly(identity: TaskIntegration): ApprovedIntegrationIdentity {
+	return {
+		targetBranch: identity.targetBranch,
+		targetRevision: identity.targetRevision,
+		approvedBaseRevision: identity.approvedBaseRevision,
+		approvedHeadRevision: identity.approvedHeadRevision,
+		approvedCommits: [...identity.approvedCommits],
+		builderAttemptId: identity.builderAttemptId,
+		reviewerAttemptId: identity.reviewerAttemptId,
+		builderManifestSha256: identity.builderManifestSha256,
+		reviewerManifestSha256: identity.reviewerManifestSha256,
+		action: identity.action.kind === "fast-forward"
+			? { kind: "fast-forward", argv: [...identity.action.argv] as ["merge", "--ff-only", "--no-edit", string] }
+			: { kind: "merge-commit", argv: [...identity.action.argv] as ["merge", "--no-ff", "--no-edit", string] },
+	};
+}
+
 function completionIntegrationInput(repositoryRoot: string, integration: Extract<TaskIntegration, { phase: "integrated" }>): IntegrationCheckoutInput {
 	return {
 		repositoryRoot,
@@ -1774,6 +1825,206 @@ function integrationObservationExact(input: IntegrationCheckoutInput, result: im
 
 function integrationObservationUnchanged(input: IntegrationCheckoutInput, result: import("./steward.ts").IntegrationCheckoutResult): boolean {
 	return result.kind === "inspected" && result.observation.branch === input.targetBranch && result.observation.head === input.targetRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0;
+}
+
+function integrationFactsAvailable(result: import("./steward.ts").IntegrationCheckoutResult): result is Extract<import("./steward.ts").IntegrationCheckoutResult, { kind: "inspected" }> & { target: IntegrationTargetFacts; application: IntegrationApplication } {
+	return result.kind === "inspected" && result.target !== undefined && result.application !== undefined;
+}
+
+function integrationTargetDiagnostic(input: IntegrationCheckoutInput, result: Extract<import("./steward.ts").IntegrationCheckoutResult, { kind: "inspected" }>): string {
+	const target = result.target;
+	const expected = `${input.targetBranch}@${input.targetRevision}`;
+	const observed = `${target?.observedBranch ?? result.observation.branch ?? "detached"}@${target?.observedHead ?? result.observation.head ?? "unknown"}`;
+	const relation = target?.relation ?? "unavailable";
+	const dirty = result.observation.dirtyPaths.length > 0 ? ` dirty=${result.observation.dirtyPaths.join(",")}` : "";
+	const markers = result.observation.operationMarkers.length > 0 ? ` markers=${result.observation.operationMarkers.join(",")}` : "";
+	const delta = result.difference ? ` deltaCommits=${result.difference.commits.join(",") || "none"} deltaPaths=${result.difference.changedPaths.map((change) => `${change.status}:${change.paths.join("→")}`).join(",") || "none"}${result.difference.truncated ? " delta=truncated" : ""}` : "";
+	return `Integration target expected ${expected}; observed ${observed}; relation=${relation}.${dirty}${markers}${delta}`.slice(0, 2_000);
+}
+
+function integrationAmbiguousRecord(identity: TaskIntegration, result: Extract<import("./steward.ts").IntegrationCheckoutResult, { kind: "inspected" }>, observedAt: string, diagnostic: string): Extract<TaskIntegration, { phase: "ambiguous" }> {
+	return {
+		...integrationIdentityOnly(identity),
+		phase: "ambiguous",
+		intendedAt: "intendedAt" in identity && identity.intendedAt.length > 0 ? identity.intendedAt : observedAt,
+		observedAt,
+		exitCode: null,
+		diagnostic: diagnostic.slice(0, 2_000),
+		observed: { ...result.observation, dirtyPaths: [...result.observation.dirtyPaths], operationMarkers: [...result.observation.operationMarkers] },
+		...(result.difference ? { difference: { commits: [...result.difference.commits], changedPaths: result.difference.changedPaths.map((change) => ({ status: change.status, paths: [...change.paths] })), truncated: result.difference.truncated } } : {}),
+	};
+}
+
+async function persistIntegrationObservation(repositoryRoot: string, journal: RunJournal, taskIndex: number, identity: TaskIntegration, result: Extract<import("./steward.ts").IntegrationCheckoutResult, { kind: "inspected" }>, diagnostic: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
+		const observedAt = transitionTimestamp(journal, dependencies.clock.now());
+		const ambiguous = integrationAmbiguousRecord(identity, result, observedAt, diagnostic);
+		let candidate: RunJournal;
+		try {
+			candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const task = next.run.tasks[taskIndex];
+				if (!task) throw new Error("Integration Task disappeared while retaining its target observation.");
+				if (task.integration && !integrationIdentityMatches(task.integration, identity)) throw new Error("Integration identity changed before retaining its target observation.");
+				task.phase = "integrating";
+				task.integration = ambiguous;
+				task.attention = "needs-user";
+				task.attentionReason = "integration-ambiguous";
+				task.attentionDiagnostic = diagnostic.slice(0, 2_000);
+			});
+		} catch (error: unknown) {
+			return { journal, note: `Integration observation could not be retained; no Git effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+		}
+		const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+		return persisted ? { journal: persisted, note: diagnostic.slice(0, 2_000), action: "record-observation" } : { journal, note: `Integration observation could not be persisted; no Git effect was attempted. ${diagnostic.slice(0, 1_700)}` };
+}
+
+async function persistIntegrationIntegrated(repositoryRoot: string, journal: RunJournal, taskIndex: number, identity: TaskIntegration, integrationHead: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
+		const integratedAt = transitionTimestamp(journal, dependencies.clock.now());
+		let candidate: RunJournal;
+		try {
+			candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+				const task = next.run.tasks[taskIndex];
+				if (!task || !task.integration || !integrationIdentityMatches(task.integration, identity)) throw new Error("Integration identity changed before recording exact application.");
+				const base = integrationIdentityOnly(identity);
+				task.integration = { ...base, phase: "integrated", intendedAt: "intendedAt" in identity && identity.intendedAt.length > 0 ? identity.intendedAt : integratedAt, integratedAt, observedHead: integrationHead };
+				task.phase = "integrating";
+				task.attention = "none";
+				delete task.attentionReason;
+				delete task.attentionDiagnostic;
+			});
+		} catch (error: unknown) {
+			return { journal, note: `Exact integration application was observed but could not be retained; no merge retry was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+		}
+		const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+		return persisted ? { journal: persisted, note: `Exact approved integration application was recognized at ${integrationHead}; no merge was repeated.`, action: "record-observation" } : { journal, note: "Exact integration application was observed but its classification could not be persisted; no merge retry was attempted." };
+}
+
+async function persistIntegrationFailed(repositoryRoot: string, journal: RunJournal, taskIndex: number, identity: TaskIntegration, exitCode: number | null, diagnostic: string, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	const observedAt = transitionTimestamp(journal, dependencies.clock.now());
+	const failed: Extract<TaskIntegration, { phase: "failed" }> = { ...integrationIdentityOnly(identity), phase: "failed", intendedAt: "intendedAt" in identity && identity.intendedAt.length > 0 ? identity.intendedAt : observedAt, observedAt, exitCode, diagnostic: diagnostic.slice(0, 2_000) };
+	let candidate: RunJournal;
+	try {
+		candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const task = next.run.tasks[taskIndex];
+			if (!task || !task.integration || !integrationIdentityMatches(task.integration, identity)) throw new Error("Integration identity changed before recording its failed fixed action.");
+			task.integration = failed;
+			task.phase = "integrating";
+			task.attention = "needs-user";
+			task.attentionReason = "integration-failed";
+			task.attentionDiagnostic = diagnostic.slice(0, 2_000);
+		});
+	} catch (error: unknown) {
+		return { journal, note: `The absent clean target after the fixed integration action could not be retained as failed; no merge retry was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persisted = await persistReviewJournal(repositoryRoot, candidate, dependencies);
+	return persisted ? { journal: persisted, note: diagnostic.slice(0, 2_000), action: "record-observation" } : { journal, note: "The fixed integration action failed at the unchanged clean target, but its failure could not be persisted; no merge retry was attempted." };
+}
+
+async function reconcileTaskIntegration(input: {
+	repositoryRoot: string;
+	journal: RunJournal;
+	taskIndex: number;
+	task: TaskRecord;
+	evidence: { subject: ReviewSubject; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord };
+	integrationInput: IntegrationCheckoutInput;
+	dependencies: StewardDependencies;
+}): Promise<CompletionDecision | undefined> {
+	let journal = input.journal;
+	let task = journal.run.tasks[input.taskIndex] ?? input.task;
+	const current = task.integration;
+	const expected = completionIntegrationIdentity(journal, task, input.evidence, input.integrationInput.targetRevision);
+	if (!expected) return persistCompletionAttention(input.repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved integration identity could not be reconstructed from protected Git evidence.", input.dependencies);
+	if (current && !integrationIdentityMatches(current, expected)) return persistCompletionAttention(input.repositoryRoot, journal, task.contract.id, "integration-ambiguous", "Persisted integration identity no longer matches the current protected Approval and finalized evidence; no Git effect was attempted.", input.dependencies);
+	const result = await inspectCompletionCheckout(input.integrationInput, input.dependencies);
+	if (!integrationFactsAvailable(result)) return result.kind === "unavailable" ? persistCompletionAttention(input.repositoryRoot, journal, task.contract.id, "integration-preflight", `Integration checkout could not be inspected: ${result.message}`, input.dependencies) : undefined;
+	const dirtyOrInProgress = result.observation.dirtyPaths.length > 0 || result.observation.operationMarkers.length > 0;
+	const targetDiagnostic = integrationTargetDiagnostic(input.integrationInput, result);
+	const persistedIdentity = current ?? expected;
+	const hasPersistedIntent = current !== undefined;
+
+	if (dirtyOrInProgress) {
+		if (!hasPersistedIntent) return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, { ...expected, intendedAt: transitionTimestamp(journal, input.dependencies.clock.now()) }, result, `Git integration checkout is dirty or has an operation in progress; Steward preserved it without abort/reset/revert/checkout/clean. ${targetDiagnostic}`, input.dependencies);
+		if (current?.phase === "integrated") return persistCompletionAttention(input.repositoryRoot, journal, task.contract.id, "integration-ambiguous", `The integrated target is now dirty or in progress; Git bytes and markers were preserved. ${targetDiagnostic}`, input.dependencies);
+		return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, persistedIdentity, result, `Git integration checkout is dirty or has an operation in progress; Steward preserved all Git bytes and markers without an abort/reset/revert/checkout/clean effect. ${targetDiagnostic}`, input.dependencies);
+	}
+
+	if (result.target?.relation === "branch-changed") {
+		const identity = hasPersistedIntent ? persistedIdentity : { ...expected, intendedAt: transitionTimestamp(journal, input.dependencies.clock.now()) };
+		return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, identity, result, `Integration target branch changed; no Git mutation was attempted. ${targetDiagnostic}`, input.dependencies);
+	}
+
+	if (result.application.kind === "exact") {
+		if (!hasPersistedIntent) return persistCompletionAttention(input.repositoryRoot, journal, task.contract.id, "integration-preflight", `The approved range is present externally, but no persisted Steward integration intent exists; success was not inferred. ${targetDiagnostic}`, input.dependencies);
+		if (current?.phase === "integrated") return { journal, note: `Exact integration remains recorded at ${current.observedHead}; later target movement was not folded into Steward success.` };
+		return persistIntegrationIntegrated(input.repositoryRoot, journal, input.taskIndex, persistedIdentity, result.application.integrationHead, input.dependencies);
+	}
+
+	if (result.target?.relation === "advanced" && result.mergeability?.kind === "conflicted" && result.difference && current?.phase !== "integrated") {
+		const limit = journal.run.effectiveSettings.reworkCycleLimit;
+		if (task.reworkCycles < limit) {
+			return dispatchIntegrationReworkBuilder(input.repositoryRoot, journal, { index: input.taskIndex, task, builder: input.evidence.builder, reviewer: input.evidence.reviewer }, persistedIdentity, result, result.difference, result.mergeability.paths, input.dependencies);
+		}
+	}
+
+	const movement = result.target?.relation !== "recorded";
+	if (movement || result.mergeability?.kind === "unavailable" || result.mergeability?.kind === "clean") {
+		const reason = result.mergeability?.kind === "unavailable" ? `Merge-tree classification was unavailable; no integration-rework Attempt was created. ${result.mergeability.diagnostic}` : movement ? "The recorded target moved or changed branch; no Git mutation was attempted." : "The advanced target is cleanly mergeable, but Steward does not invent a new integration action from movement facts.";
+		if (!hasPersistedIntent) return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, { ...expected, intendedAt: transitionTimestamp(journal, input.dependencies.clock.now()) }, result, `${reason} ${targetDiagnostic}`, input.dependencies);
+		return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, persistedIdentity, result, `${reason} ${targetDiagnostic}`, input.dependencies);
+	}
+
+	if (result.target?.relation === "recorded" && result.application.kind === "absent") {
+		if (!hasPersistedIntent) {
+			const intendedAt = transitionTimestamp(journal, input.dependencies.clock.now());
+			let intended: RunJournal;
+			try {
+				intended = advanceRunJournal(journal, input.dependencies.clock.now(), (next) => {
+					const nextTask = next.run.tasks[input.taskIndex];
+					if (!nextTask || nextTask.integration) throw new Error("Integration Task changed before initial intent.");
+					nextTask.phase = "integrating";
+					nextTask.attention = "none";
+					delete nextTask.attentionReason;
+					delete nextTask.attentionDiagnostic;
+					nextTask.integration = { ...expected, phase: "intended", intendedAt };
+				});
+			} catch (error: unknown) {
+				return { journal, note: `Integration intent could not be persisted; no Git merge was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+			}
+			const persisted = await persistReviewJournal(input.repositoryRoot, intended, input.dependencies);
+			if (!persisted) return { journal, note: "Integration intent could not be persisted; no Git merge was attempted." };
+			journal = persisted;
+			task = journal.run.tasks[input.taskIndex]!;
+		}
+		const activeIdentity = journal.run.tasks[input.taskIndex]?.integration;
+		if (!activeIdentity || (activeIdentity.phase !== "intended" && activeIdentity.phase !== "retry-intended")) return { journal, note: "Integration intent is no longer eligible for one fixed recovery action; no merge was attempted." };
+		if (activeIdentity.phase === "retry-intended") return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, activeIdentity, result, "The retry-intended integration remains absent at the unchanged clean target; acknowledgement is ambiguous and no third merge was attempted.", input.dependencies);
+		const retryIntendedAt = transitionTimestamp(journal, input.dependencies.clock.now());
+		let retry: RunJournal;
+		try {
+			retry = advanceRunJournal(journal, input.dependencies.clock.now(), (next) => {
+				const nextTask = next.run.tasks[input.taskIndex];
+				if (!nextTask?.integration || nextTask.integration.phase !== "intended" || !integrationIdentityMatches(nextTask.integration, activeIdentity)) throw new Error("Integration intent changed before retry reservation.");
+				nextTask.integration = { ...nextTask.integration, phase: "retry-intended", retryIntendedAt };
+			});
+		} catch (error: unknown) {
+			return { journal, note: `Integration retry reservation could not be built; no Git merge was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+		}
+		const persistedRetry = await persistReviewJournal(input.repositoryRoot, retry, input.dependencies);
+		if (!persistedRetry) return { journal, note: "Integration retry reservation could not be persisted; no Git merge was attempted." };
+		journal = persistedRetry;
+		const stored = journal.run.tasks[input.taskIndex]?.integration;
+		if (!stored || stored.phase !== "retry-intended") return { journal, note: "Integration retry reservation disappeared after CAS; no Git merge was attempted." };
+		let outcome: GitCommandOutcome;
+		try { outcome = input.dependencies.git.integrateApprovedRange ? await input.dependencies.git.integrateApprovedRange({ ...input.integrationInput, action: stored.action }) : { kind: "thrown", message: "Integration effect adapter is unavailable." }; }
+		catch (error: unknown) { outcome = { kind: "thrown", message: error instanceof Error ? error.message : "Integration retry failed." }; }
+		const post = await inspectCompletionCheckout(input.integrationInput, input.dependencies);
+		if (!integrationFactsAvailable(post)) return { journal, note: `Integration retry acknowledgement is ambiguous; retry-intended remains durable and no merge was repeated. ${post.kind === "unavailable" ? post.message : "The post-probe omitted strict application facts."}`, action: "integrate-approved-range" };
+		if (post.observation.dirtyPaths.length > 0 || post.observation.operationMarkers.length > 0) return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, stored, post, `Integration retry left a dirty or in-progress checkout; all Git bytes and markers were preserved. ${integrationTargetDiagnostic(input.integrationInput, post)}`, input.dependencies);
+		if (post.application.kind === "exact") return persistIntegrationIntegrated(input.repositoryRoot, journal, input.taskIndex, stored, post.application.integrationHead, input.dependencies);
+		const outcomeText = outcome.kind === "completed" ? (outcome.stderr.trim() || `Git integration exited with code ${outcome.code}.`) : outcome.message;
+		if (post.target?.relation === "recorded" && outcome.kind === "completed") return persistIntegrationFailed(input.repositoryRoot, journal, input.taskIndex, stored, outcome.code, `The fixed integration action did not apply at the unchanged clean target (${outcomeText}); no third merge was attempted. ${integrationTargetDiagnostic(input.integrationInput, post)}`, input.dependencies);
+		return persistIntegrationObservation(input.repositoryRoot, journal, input.taskIndex, stored, post, `The fixed integration retry returned without exact application (${outcomeText}); acknowledgement is ambiguous and no third merge was attempted. ${integrationTargetDiagnostic(input.integrationInput, post)}`, input.dependencies);
+	}
+	return undefined;
 }
 
 async function inspectCompletionCheckout(input: IntegrationCheckoutInput, dependencies: StewardDependencies): Promise<import("./steward.ts").IntegrationCheckoutResult> {
@@ -1858,7 +2109,19 @@ async function persistStopFailure(repositoryRoot: string, journal: RunJournal, t
 async function advanceMultiTaskIntegration(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<CompletionDecision> {
 	let journal = journalInput;
 	const queue = selectIntegrationQueueHead(journal.run);
-	if (queue.kind !== "ready") return { journal, note: queue.kind === "waiting" ? `Task ${queue.taskId} is waiting for ordered ${queue.reason}; no later integration effect was attempted.` : "No ordered integration is ready." };
+	if (queue.kind !== "ready") {
+		if (queue.kind === "waiting" && (queue.reason === "integration" || queue.reason === "attention")) {
+			const existingTask = journal.run.tasks[queue.index];
+			if (existingTask?.integration && existingTask.integration.phase !== "integrated" && existingTask.approval?.phase === "valid" && journal.run.integrationBase.kind === "git") {
+				const evidence = await loadCompletionEvidence(repositoryRoot, existingTask, journal, dependencies);
+				if (!("message" in evidence) && evidence.subject.kind === "git") {
+					const result = await reconcileTaskIntegration({ repositoryRoot, journal, taskIndex: queue.index, task: existingTask, evidence, integrationInput: { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: existingTask.integration.targetRevision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] }, dependencies });
+					if (result) return result;
+				}
+			}
+		}
+		return { journal, note: queue.kind === "waiting" ? `Task ${queue.taskId} is waiting for ordered ${queue.reason}; no later integration effect was attempted.` : "No ordered integration is ready." };
+	}
 	const task = journal.run.tasks[queue.index];
 	if (!task) return { journal, note: "Ordered integration Task disappeared; no Git effect was attempted." };
 	if (journal.run.finalVerification.kind !== "command") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-unexecutable", "Final verification is criteria-only; no ordered integration effect was attempted.", dependencies);
@@ -1868,6 +2131,10 @@ async function advanceMultiTaskIntegration(repositoryRoot: string, journalInput:
 	if (evidence.subject.kind !== "git" || journal.run.integrationBase.kind !== "git") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved completion requires a Git Builder subject and Git integration base; no Git effect was attempted.", dependencies);
 	const input: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: queue.targetRevision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] };
 	const preflight = await inspectCompletionCheckout(input, dependencies);
+	if (integrationFactsAvailable(preflight)) {
+		const recovered = await reconcileTaskIntegration({ repositoryRoot, journal, taskIndex: queue.index, task, evidence, integrationInput: input, dependencies });
+		if (recovered) return recovered;
+	}
 	const preflightExact = preflight.kind === "inspected" && preflight.observation.rangeExact && preflight.observation.branch === input.targetBranch && preflight.observation.head === input.targetRevision && preflight.observation.dirtyPaths.length === 0 && preflight.observation.operationMarkers.length === 0 && preflight.resolvedBaseRevision === input.approvedBaseRevision && preflight.resolvedHeadRevision === input.approvedHeadRevision && JSON.stringify(preflight.commits) === JSON.stringify(input.approvedCommits);
 	if (!preflightExact) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", preflight.kind === "inspected" ? `Integration checkout is not the clean exact ordered target (${preflight.observation.branch ?? "detached"}@${preflight.observation.head ?? "unknown"}); no Git effect was attempted.` : `Integration checkout could not be inspected: ${preflight.message}`, dependencies);
 	const identity = completionIntegrationIdentity(journal, task, evidence, queue.targetRevision);
@@ -1964,6 +2231,7 @@ async function advanceMultiTaskFinalization(repositoryRoot: string, journalInput
 async function advanceMultiTaskCompletion(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies, oneAction: boolean): Promise<CompletionDecision> {
 	const queue = selectIntegrationQueueHead(journal.run);
 	if (queue.kind === "ready") return advanceMultiTaskIntegration(repositoryRoot, journal, dependencies);
+	if (queue.kind === "waiting" && (queue.reason === "integration" || queue.reason === "attention")) return advanceMultiTaskIntegration(repositoryRoot, journal, dependencies);
 	if (queue.kind === "waiting") return { journal, note: queue.reason === "attention" ? journal.run.tasks[queue.index]?.attentionDiagnostic ?? `Task ${queue.taskId} requires attention before integration.` : `Task ${queue.taskId} is waiting for ordered ${queue.reason}; no final verification was attempted.` };
 	return advanceMultiTaskFinalization(repositoryRoot, journal, dependencies, oneAction);
 }
@@ -1975,6 +2243,14 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 	if (journal.run.tasks.length > 1) return advanceMultiTaskCompletion(repositoryRoot, journal, dependencies, oneAction);
 	const approvedTasks = journal.run.tasks.filter((candidate) => candidate.phase === "approved" && candidate.attention === "none" && candidate.approval?.phase === "valid");
 	const integratingTask = journal.run.tasks.find((candidate) => candidate.integration?.phase === "integrated");
+	const pendingIntegrationTask = journal.run.tasks.find((candidate) => candidate.integration && candidate.integration.phase !== "integrated");
+	if (pendingIntegrationTask && pendingIntegrationTask.approval?.phase === "valid" && journal.run.integrationBase.kind === "git") {
+		const evidence = await loadCompletionEvidence(repositoryRoot, pendingIntegrationTask, journal, dependencies);
+		if (!("message" in evidence) && evidence.subject.kind === "git") {
+			const recovered = await reconcileTaskIntegration({ repositoryRoot, journal, taskIndex: 0, task: pendingIntegrationTask, evidence, integrationInput: { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: pendingIntegrationTask.integration!.targetRevision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] }, dependencies });
+			if (recovered) return recovered;
+		}
+	}
 	if (approvedTasks.length === 0 && !integratingTask) return { journal, note: "" };
 	if (approvedTasks.length > 1 || journal.run.tasks.length !== 1) {
 		const target = approvedTasks[0] ?? journal.run.tasks[0];
@@ -1988,8 +2264,13 @@ async function advanceApprovedCompletion(repositoryRoot: string, journalInput: R
 		const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
 		if ("message" in evidence) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", evidence.message, dependencies);
 		if (evidence.subject.kind !== "git" || journal.run.integrationBase.kind !== "git") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved completion requires a Git Builder subject and Git integration base; no Git effect was attempted.", dependencies);
-		const input: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: journal.run.integrationBase.revision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] };
+		const targetRevision = task.integrationRecoveries?.at(-1)?.observed.head ?? journal.run.integrationBase.revision;
+		const input: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] };
 		const preflight = await inspectCompletionCheckout(input, dependencies);
+		if (integrationFactsAvailable(preflight)) {
+			const recovered = await reconcileTaskIntegration({ repositoryRoot, journal, taskIndex: 0, task, evidence, integrationInput: input, dependencies });
+			if (recovered) return recovered;
+		}
 		if (input.targetRevision !== input.approvedBaseRevision || preflight.kind !== "inspected" || !preflight.observation.rangeExact || preflight.observation.branch !== input.targetBranch || preflight.observation.head !== input.targetRevision || preflight.observation.dirtyPaths.length > 0 || preflight.observation.operationMarkers.length > 0 || preflight.resolvedBaseRevision !== input.approvedBaseRevision || preflight.resolvedHeadRevision !== input.approvedHeadRevision || JSON.stringify(preflight.commits) !== JSON.stringify(input.approvedCommits)) {
 			const detail = preflight.kind === "inspected" ? `Integration checkout ${repositoryRoot} is not the clean exact target (${preflight.observation.branch ?? "detached"}@${preflight.observation.head ?? "unknown"}); the recorded Builder worktree remains untouched.` : `Integration checkout ${repositoryRoot} could not be inspected: ${preflight.message}`;
 			return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", detail, dependencies);
@@ -2185,6 +2466,106 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 		return { journal: finalJournal, note: `Run ${journal.run.id} archived and completion notification was attempted.`, action: "publish-completion-archive", completed: true };
 	}
 	return { journal, note: "" };
+}
+
+async function dispatchIntegrationReworkBuilder(
+	repositoryRoot: string,
+	journalInput: RunJournal,
+	candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord },
+	currentIntegration: TaskIntegration,
+	result: Extract<import("./steward.ts").IntegrationCheckoutResult, { kind: "inspected" }>,
+	difference: IntegrationTargetDifference,
+	conflictPaths: string[],
+	dependencies: StewardDependencies,
+): Promise<ReviewDecision> {
+	let journal = journalInput;
+	const previousDispatch = candidate.builder.dispatch;
+	const pauseRework = (diagnostic: string): Promise<ReviewDecision> => persistIntegrationObservation(repositoryRoot, journal, candidate.index, currentIntegration, result, diagnostic, dependencies);
+	if ((previousDispatch.phase !== "prompted" && previousDispatch.phase !== "reconciled-active") || !dependencies.git.inspectBuilderWorktree || !dependencies.herdr.promptBuilder) return pauseRework("Advanced-target integration conflict requires the exact same proven Builder identity and read-only worktree/prompt adapters; no rework Attempt was reserved.");
+	if (candidate.reviewer.evidence?.phase !== "finalized" || candidate.reviewer.evidence.verdict !== "approved" || candidate.reviewer.integrity?.kind !== "preserved" || candidate.reviewer.subject.kind !== "git") return pauseRework("Advanced-target integration conflict requires the immediately preceding finalized approved Review; no rework Attempt was reserved.");
+	if (result.target?.relation !== "advanced" || result.observation.head === null || result.mergeability?.kind !== "conflicted") return pauseRework("Integration-rework preflight facts are no longer an exact clean advanced-target conflict; no Attempt was reserved.");
+	const inspected = await dependencies.git.inspectBuilderWorktree(previousDispatch.worktreePath, candidate.reviewer.subject.headRevision).catch((error: unknown) => ({ kind: "unavailable" as const, message: error instanceof Error ? error.message : "Builder worktree inspection failed." }));
+	if (inspected.kind !== "ready" || inspected.head !== candidate.reviewer.subject.headRevision || !inspected.clean) return pauseRework(`Integration-rework preflight requires the same clean Builder worktree at reviewed head ${candidate.reviewer.subject.headRevision}; no Attempt was reserved.`);
+	const cycle = candidate.task.reworkCycles + 1;
+	if (cycle > journal.run.effectiveSettings.reworkCycleLimit) return { journal, note: "The frozen rework cycle limit is exhausted; the advanced conflict remains needs-user and Git was not changed." };
+	const attemptId = `attempt-${String(candidate.task.attempts.length + 1).padStart(2, "0")}`;
+	const normalizedConflictPaths = [...new Set(conflictPaths)].sort();
+	if (normalizedConflictPaths.length === 0 || normalizedConflictPaths.length > 100) return { journal, note: "The advanced conflict path facts are empty or exceed the bounded recovery shape; no Attempt was reserved." };
+	const recoveryFacts: IntegrationReworkFacts = { targetBranch: currentIntegration.targetBranch, recordedTargetRevision: currentIntegration.targetRevision, advancedTargetRevision: result.observation.head, difference: { commits: [...difference.commits], changedPaths: difference.changedPaths.map((change) => ({ status: change.status, paths: [...change.paths] })), truncated: difference.truncated }, conflictPaths: normalizedConflictPaths };
+	const priorApproval = candidate.task.approval;
+	if (!priorApproval || priorApproval.phase !== "valid") return { journal, note: "The old valid Approval disappeared before integration-rework reservation; no Attempt was created." };
+	const reviewerEvidence = candidate.reviewer.evidence;
+	if (reviewerEvidence.phase !== "finalized") return { journal, note: "The old Reviewer manifest is not finalized; no integration-rework Attempt was created." };
+	const dispatch: IntegrationReworkDispatchRecord = { phase: "assignment-intended", branch: previousDispatch.branch, agentName: previousDispatch.agentName, worktreePath: previousDispatch.worktreePath, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, cycle, priorBuilderAttemptId: candidate.builder.id, priorReviewerAttemptId: candidate.reviewer.id, reviewedSubject: cloneReviewSubject(candidate.reviewer.subject), reviewerManifestPath: reviewerEvidence.manifestPath, reviewerManifestSha256: reviewerEvidence.manifestSha256, integrationRecovery: recoveryFacts };
+	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, candidate.task.contract.id, attemptId);
+	const prepared: BuilderAttemptRecord = { id: attemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...candidate.builder.actualModel }, specificationHash: candidate.task.specificationHash, baseRevision: result.observation.head, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch };
+	const observed = { ...result.observation, dirtyPaths: [...result.observation.dirtyPaths], operationMarkers: [...result.observation.operationMarkers] };
+	let reserved: RunJournal;
+	try {
+		reserved = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const task = next.run.tasks[candidate.index];
+			if (!task || task.attempts.length !== candidate.task.attempts.length || task.reworkCycles !== candidate.task.reworkCycles || !task.approval || task.approval.phase !== "valid" || (task.integration && !integrationIdentityMatches(task.integration, currentIntegration))) throw new Error("Integration-rework predecessor changed before cycle reservation.");
+			const approval = task.approval;
+			task.approval = { ...approval, phase: "invalidated", invalidatedAt: transitionTimestamp(journal, dependencies.clock.now()), reason: "target-advanced", diagnostic: `Recorded target ${currentIntegration.targetRevision} advanced to ${result.observation.head} and merge-tree found conflicts at ${normalizedConflictPaths.join(", ")}.` };
+			const recovery: IntegrationReworkRecord = { targetBranch: currentIntegration.targetBranch, targetRevision: currentIntegration.targetRevision, approvedBaseRevision: currentIntegration.approvedBaseRevision, approvedHeadRevision: currentIntegration.approvedHeadRevision, approvedCommits: [...currentIntegration.approvedCommits], builderAttemptId: currentIntegration.builderAttemptId, reviewerAttemptId: currentIntegration.reviewerAttemptId, builderManifestSha256: currentIntegration.builderManifestSha256, reviewerManifestSha256: currentIntegration.reviewerManifestSha256, action: currentIntegration.action, kind: "advanced-target-conflict", ...(task.integration ? { intendedAt: task.integration.intendedAt } : {}), ...(task.integration?.phase === "retry-intended" ? { retryIntendedAt: task.integration.retryIntendedAt } : {}), observedAt: transitionTimestamp(journal, dependencies.clock.now()), observed, difference: recoveryFacts.difference, conflictPaths: normalizedConflictPaths, replacementBuilderAttemptId: attemptId };
+			task.integrationRecoveries = [...(task.integrationRecoveries ?? []), recovery];
+			delete task.integration;
+			task.phase = "reworking";
+			task.attention = "none";
+			delete task.attentionReason;
+			delete task.attentionDiagnostic;
+			task.reworkCycles = cycle;
+			task.attempts.push(prepared);
+			clearTaskMonitor(next.run, task.contract.id);
+		});
+	} catch (error: unknown) {
+		return { journal, note: `Integration-rework reservation failed before Assignment or prompt effects. ${error instanceof Error ? error.message : "Journal validation failed."}` };
+	}
+	const persistedReserved = await persistReviewJournal(repositoryRoot, reserved, dependencies);
+	if (!persistedReserved) return { journal, note: "Integration-rework reservation could not be persisted; no Assignment or prompt effect was attempted." };
+	journal = persistedReserved;
+	const task = journal.run.tasks[candidate.index];
+	const attempt = task?.attempts.at(-1);
+	if (!task || !attempt || attempt.role !== "builder") return { journal, note: "Reserved integration-rework Attempt disappeared; no external effect was attempted." };
+	let assignment: BuilderAssignmentDocument;
+	try { assignment = buildBuilderAssignment({ run: journal.run, task, attempt, worktreePath: previousDispatch.worktreePath, branch: previousDispatch.branch, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, agentName: previousDispatch.agentName }); }
+	catch (error: unknown) { return { journal, note: `Integration-rework Assignment could not be built; reserved Attempt is retained without a prompt. ${error instanceof Error ? error.message : "Assignment validation failed."}` }; }
+	let assignmentResult: AssignmentCreateResult;
+	try { assignmentResult = await dependencies.runJournal.createAssignment(repositoryRoot, assignment); } catch (error: unknown) { return { journal, note: `Integration-rework Assignment storage failed; reserved Attempt is retained without a prompt. ${error instanceof Error ? error.message : "Storage failed."}` }; }
+	if (assignmentResult.kind !== "created" && assignmentResult.kind !== "existing-match") return { journal, note: "Integration-rework Assignment conflicts with different bytes; reserved Attempt is retained and no prompt was sent." };
+	const assignmentHash = builderAssignmentSha256(assignmentResult.bytes);
+	let promptIntent: RunJournal;
+	try {
+		promptIntent = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const currentTask = next.run.tasks[candidate.index];
+			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			if (!current || current.role !== "builder" || !isIntegrationReworkDispatchForSteward(current.dispatch)) throw new Error("Reserved integration-rework Attempt disappeared before prompt intent.");
+			current.dispatch = { ...current.dispatch, phase: "prompt-intended", assignmentSha256: assignmentHash };
+		});
+	} catch (error: unknown) { return { journal, note: `Integration-rework Builder prompt intent could not be built; no prompt was sent. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedIntent = await persistReviewJournal(repositoryRoot, promptIntent, dependencies);
+	if (!persistedIntent) return { journal, note: "Integration-rework Builder prompt intent could not be persisted; no prompt was sent." };
+	journal = persistedIntent;
+	let prompted: HerdrPromptResult;
+	try { prompted = await dependencies.herdr.promptBuilder({ repositoryRoot, name: previousDispatch.agentName, assignmentPrompt: formatBuilderPrompt(assignment) }); } catch (error: unknown) { return { journal, note: `Same Builder integration-rework prompt failed; prompt-intended state is retained without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
+	if (prompted.kind !== "prompted" || prompted.name !== previousDispatch.agentName || prompted.workspaceId !== previousDispatch.workspaceId || prompted.paneId !== previousDispatch.paneId || prompted.terminalId !== previousDispatch.terminalId || !validIdentity(prompted.tabId)) return { journal, note: "Same Builder integration-rework prompt acknowledgement was malformed or contradictory; prompt-intended state is retained without a resend." };
+	let active: RunJournal;
+	try {
+		active = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
+			const currentTask = next.run.tasks[candidate.index];
+			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			if (!current || current.role !== "builder" || current.dispatch.phase !== "prompt-intended" || !("integrationRecovery" in current.dispatch)) throw new Error("Integration-rework prompt intent disappeared after prompt.");
+			current.state = "active";
+			current.activatedAt = transitionTimestamp(journal, dependencies.clock.now());
+			current.dispatch = { ...current.dispatch, phase: "prompted", promptedAt: current.activatedAt };
+		});
+	} catch (error: unknown) { return { journal, note: `Same Builder integration-rework prompt succeeded but activation could not be built; no resend will be attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedActive = await persistReviewJournal(repositoryRoot, active, dependencies);
+	return persistedActive ? { journal: persistedActive, note: `Integration-rework cycle ${cycle} reserved and prompted the existing Builder ${previousDispatch.agentName} against advanced target ${result.observation.head}; awaiting fresh Attempt ${attemptId} evidence.`, action: "dispatch-rework-builder" } : { journal, note: "Same Builder integration-rework prompt succeeded but activation could not be persisted; no resend will be attempted." };
+}
+
+function isIntegrationReworkDispatchForSteward(dispatch: AttemptRecord["dispatch"]): dispatch is IntegrationReworkDispatchRecord {
+	return "integrationRecovery" in dispatch;
 }
 
 async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, findings: import("./review.ts").ReviewerFinding[], dependencies: StewardDependencies): Promise<ReviewDecision> {

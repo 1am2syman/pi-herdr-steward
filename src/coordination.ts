@@ -108,20 +108,22 @@ export function selectIntegrationQueueHead(run: Pick<RunRecord, "tasks" | "integ
 		}
 		if (queueIndex > 0 && codeTasks[queueIndex - 1]!.task.integration?.phase !== "integrated") return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: "predecessor" };
 		if (task.attention !== "none") return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: "attention" };
-		if (task.integration?.phase === "intended" || task.integration?.phase === "failed" || task.integration?.phase === "ambiguous") return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: task.integration.phase === "intended" ? "integration" : "attention" };
+		if (task.integration?.phase === "intended" || task.integration?.phase === "retry-intended" || task.integration?.phase === "failed" || task.integration?.phase === "ambiguous") return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: task.integration.phase === "intended" || task.integration.phase === "retry-intended" ? "integration" : "attention" };
 		if (task.phase !== "approved" && task.phase !== "integrating") return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: "approval" };
 		if (!task.approval || task.approval.phase !== "valid" || task.approval.subject.kind !== "git") return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: "approval" };
 		const subject = task.approval.subject;
 		const builder = task.attempts.find((attempt) => attempt.role === "builder" && attempt.id === task.approval?.builderAttemptId);
 		if (!builder || builder.evidence?.phase !== "finalized" || builder.evidence.producedRevision !== subject.headRevision) return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: "source" };
+		const recoveryHead = task.integrationRecoveries?.at(-1)?.observed.head;
+		const targetRevision = recoveryHead ?? previousHead;
 		return {
 			kind: "ready",
 			taskId: task.contract.id,
 			index: entry.index,
-			targetRevision: previousHead,
+			targetRevision,
 			approvedBaseRevision: subject.baseRevision,
 			approvedHeadRevision: subject.headRevision,
-			action: previousHead === subject.baseRevision ? "fast-forward" : "merge-commit",
+			action: targetRevision === subject.baseRevision ? "fast-forward" : "merge-commit",
 		};
 	}
 	return { kind: "none", reason: "all-integrated" };
