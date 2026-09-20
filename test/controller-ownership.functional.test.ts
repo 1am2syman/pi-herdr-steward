@@ -474,25 +474,36 @@ it.sequential("registered concurrent takeovers elect one revision-N+1 owner and 
 	registerStewardExtension(loserSurface.surface, () => depsC);
 	const b = context(root, "controller-b");
 	const c = context(root, "controller-c");
-	await winnerSurface.event("session_start")({ type: "session_start", reason: "replacement" }, b);
-	await loserSurface.event("session_start")({ type: "session_start", reason: "replacement" }, c);
-	const winnerPass = winnerSurface.command()("resume --takeover", b);
-	const loserPass = loserSurface.command()("resume --takeover", c);
-	await bothInspected;
-	releaseInspections();
-	await Promise.all([winnerPass, loserPass]);
-	ok(winnerResult?.kind === "taken-over" || loserResult?.kind === "taken-over", JSON.stringify({ winnerResult, loserResult, casResults, contenderB: contenderB.calls, contenderC: contenderC.calls }));
-	ok(winnerResult?.kind === "taken-over" ? loserResult?.kind === "stale" : false, JSON.stringify({ winnerResult, loserResult, casResults, contenderB: contenderB.calls, contenderC: contenderC.calls }));
-	const winnerSession = winnerResult?.kind === "taken-over" ? "controller-b" : "controller-c";
-	const current = await loadJournal(depsB.runJournal, root);
-	equal(current.journalRevision, 3);
-	equal(current.run.controllerSessionId, winnerSession);
-	equal(current.run.controllerLease?.takeover?.basisJournalRevision, 2);
-	equal((await activityEvents(root)).filter((event) => event === "controller-taken-over").length, 1);
-	equal(casResults.filter((kind) => kind === "replaced").length, 1);
-	await waitFor(() => waitCalls === 1);
-	await winnerSurface.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, b);
-	await loserSurface.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, c);
+	let winnerStarted = false;
+	let loserStarted = false;
+	try {
+		await winnerSurface.event("session_start")({ type: "session_start", reason: "replacement" }, b);
+		winnerStarted = true;
+		await loserSurface.event("session_start")({ type: "session_start", reason: "replacement" }, c);
+		loserStarted = true;
+		const winnerPass = winnerSurface.command()("resume --takeover", b);
+		const loserPass = loserSurface.command()("resume --takeover", c);
+		await bothInspected;
+		releaseInspections();
+		await Promise.all([winnerPass, loserPass]);
+		const winnerSession = winnerResult?.kind === "taken-over" && loserResult?.kind === "stale"
+			? "controller-b"
+			: loserResult?.kind === "taken-over" && winnerResult?.kind === "stale"
+				? "controller-c"
+				: undefined;
+		ok(winnerSession !== undefined, JSON.stringify({ winnerResult, loserResult, casResults, contenderB: contenderB.calls, contenderC: contenderC.calls }));
+		const current = await loadJournal(depsB.runJournal, root);
+		equal(current.journalRevision, 3);
+		equal(current.run.controllerSessionId, winnerSession);
+		equal(current.run.controllerLease?.takeover?.basisJournalRevision, 2);
+		equal((await activityEvents(root)).filter((event) => event === "controller-taken-over").length, 1);
+		equal(casResults.filter((kind) => kind === "replaced").length, 1);
+		await waitFor(() => waitCalls === 1);
+	} finally {
+		releaseInspections();
+		if (winnerStarted) await winnerSurface.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, b);
+		if (loserStarted) await loserSurface.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, c);
+	}
 });
 
 it.sequential.each([
