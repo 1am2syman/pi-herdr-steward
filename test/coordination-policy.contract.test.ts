@@ -4,6 +4,8 @@ import {
 	allowedScopesOverlap,
 	allRequiredTasksIntegrated,
 	countActiveTasks,
+	currentIntegratedHead,
+	orderedIntegratedHeadChain,
 	selectIntegrationQueueHead,
 	selectTaskAdmission,
 } from "../src/coordination.ts";
@@ -60,5 +62,19 @@ describe("ticket-13 pure coordination policy", () => {
 		const selected = selectIntegrationQueueHead(run([first, second]));
 		expect(selected).toMatchObject({ kind: "ready", taskId: "task-02", targetRevision: sha("1"), action: "merge-commit" });
 		expect(allRequiredTasksIntegrated(run([first, second]))).toBe(false);
+	});
+
+	it("derives the ordered integrated head chain and current head from the same Task array", () => {
+		const first = task("task-01", "src/a", "integrating", { integration: { phase: "integrated", targetBranch: "main", targetRevision: sha("0"), approvedBaseRevision: sha("0"), approvedHeadRevision: sha("1"), approvedCommits: [sha("1")], builderAttemptId: "attempt-01", reviewerAttemptId: "attempt-02", builderManifestSha256: `sha256:${"b".repeat(64)}`, reviewerManifestSha256: `sha256:${"c".repeat(64)}`, action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", sha("1")] }, intendedAt: "2026-09-19T00:00:00.000Z", integratedAt: "2026-09-19T00:00:01.000Z", observedHead: sha("1") } });
+		const second = task("task-02", "src/b", "integrating", { integration: { phase: "integrated", targetBranch: "main", targetRevision: sha("1"), approvedBaseRevision: sha("0"), approvedHeadRevision: sha("2"), approvedCommits: [sha("2")], builderAttemptId: "attempt-03", reviewerAttemptId: "attempt-04", builderManifestSha256: `sha256:${"d".repeat(64)}`, reviewerManifestSha256: `sha256:${"e".repeat(64)}`, action: { kind: "merge-commit", argv: ["merge", "--no-ff", "--no-edit", sha("2")] }, intendedAt: "2026-09-19T00:00:02.000Z", integratedAt: "2026-09-19T00:00:03.000Z", observedHead: sha("3") } });
+		const third = task("task-03", "src/c", "approved");
+		const coordinated = run([first, second, third]);
+		expect(orderedIntegratedHeadChain(coordinated)).toEqual([
+			{ taskId: "task-01", index: 0, targetRevision: sha("0"), observedHead: sha("1") },
+			{ taskId: "task-02", index: 1, targetRevision: sha("1"), observedHead: sha("3") },
+		]);
+		expect(currentIntegratedHead(coordinated)).toBe(sha("3"));
+		expect(orderedIntegratedHeadChain(run([first, third]))).toHaveLength(1);
+		expect(currentIntegratedHead(run([first, third]))).toBe(sha("1"));
 	});
 });
