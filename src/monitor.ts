@@ -16,6 +16,8 @@ export interface StewardSessionMonitor {
 	markAgentBusy(): void;
 	markAgentSettled(): void;
 	markCompactionStarted(): void;
+	markCompactionSucceeded(): void;
+	markCompactionFailed(): void;
 	markCompactionEnded(): void;
 	markUiPromptStarted(): void;
 	markUiPromptEnded(): void;
@@ -47,6 +49,7 @@ export function createStewardSessionMonitor(input: StewardSessionMonitorInput): 
 	let exclusiveBusy = false;
 	let exclusiveTail = Promise.resolve();
 	let completedDormant = false;
+	let compactionFailurePending = false;
 
 	function currentGeneration(): number {
 		return generation;
@@ -129,9 +132,16 @@ export function createStewardSessionMonitor(input: StewardSessionMonitorInput): 
 
 	async function runPass(value: number, trigger: MonitorTrigger): Promise<void> {
 		if (!isCurrent(value) || exclusiveBusy) return;
+		const skipWorkflow = compactionFailurePending;
+		compactionFailurePending = false;
+		if (skipWorkflow) return;
 		const observed = await input.steward.observeMonitorProgress(input.repositoryRoot, input.controllerSessionId, trigger);
 		if (!isCurrent(value)) return;
 		await present(observed, value);
+		if (skipWorkflow || compactionFailurePending) {
+			compactionFailurePending = false;
+			return;
+		}
 		if (!isCurrent(value) || !safeIdle() || observed.condition === "degraded" || observed.action === "approval-required" || observed.action === "blocked") return;
 		const advanced = await input.steward.advanceNext(input.repositoryRoot, input.controllerSessionId, { interactive: false, maximumActions: 1 });
 		if (!isCurrent(value)) return;
@@ -214,13 +224,27 @@ export function createStewardSessionMonitor(input: StewardSessionMonitorInput): 
 	function markCompactionStarted(): void {
 		if (closed) return;
 		compacting = true;
+		compactionFailurePending = false;
 		requestPass("compaction");
 	}
 
-	function markCompactionEnded(): void {
+	function markCompactionSucceeded(): void {
 		if (closed) return;
 		compacting = false;
-		requestPass("compaction");
+		compactionFailurePending = false;
+		requestPass("compaction-success");
+	}
+
+	function markCompactionFailed(): void {
+		if (closed) return;
+		compacting = false;
+		compactionFailurePending = true;
+		pending = false;
+		restartWaiter();
+	}
+
+	function markCompactionEnded(): void {
+		markCompactionSucceeded();
 	}
 
 	function markUiPromptStarted(): void {
@@ -273,5 +297,5 @@ export function createStewardSessionMonitor(input: StewardSessionMonitorInput): 
 		waiter = undefined;
 	}
 
-	return { start, markAgentBusy, markAgentSettled, markCompactionStarted, markCompactionEnded, markUiPromptStarted, markUiPromptEnded, wake, runExclusive, stop };
+	return { start, markAgentBusy, markAgentSettled, markCompactionStarted, markCompactionSucceeded, markCompactionFailed, markCompactionEnded, markUiPromptStarted, markUiPromptEnded, wake, runExclusive, stop };
 }

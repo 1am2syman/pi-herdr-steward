@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { lstatSync } from "node:fs";
 import { lstat, readFile, realpath } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
-import { type ExecResult, type ExtensionContext, type ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import { compact, type CompactionResult, type ExecResult, type ExtensionContext, type ExtensionUIContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 
 import {
 	formatModelChoice,
@@ -60,6 +60,8 @@ type HostScopedModel = ExtensionContext["scopedModels"][number];
 type PiStatusUi = Pick<ExtensionUIContext, "notify" | "setStatus">;
 type PiConfigUi = Pick<ExtensionUIContext, "select" | "confirm" | "input">;
 
+export type StewardCompactionContext = Pick<ExtensionContext, "model" | "modelRegistry" | "thinkingLevel" | "sessionManager">;
+
 export interface StewardHostRequest {
 	ui: StewardUiSurface;
 	modelRegistry: HostModelRegistry;
@@ -69,6 +71,19 @@ export interface StewardHostRequest {
 
 function safeErrorText(error: unknown): string {
 	return error instanceof Error && error.message.length > 0 ? error.message : "Authentication resolution failed.";
+}
+
+/** Call Pi's native compactor at the host edge while preserving the exact durable continuity pointer. */
+export async function compactWithStewardContinuity(event: SessionBeforeCompactEvent, ctx: StewardCompactionContext, continuity: string): Promise<CompactionResult> {
+	if (!ctx.model) throw new Error("Pi has no current model for Steward compaction continuity.");
+	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(ctx.model);
+	if (!auth.ok) throw new Error(auth.error);
+	const customInstructions = [event.customInstructions, continuity].filter((value): value is string => Boolean(value && value.length > 0)).join("\n\n");
+	const headers = auth.headers
+		? Object.fromEntries(Object.entries(auth.headers).flatMap(([key, value]) => value === null ? [] : [[key, value]])) as Record<string, string>
+		: undefined;
+	const result = await compact(event.preparation, ctx.model, auth.apiKey, headers, customInstructions, event.signal, ctx.thinkingLevel, undefined, auth.env, undefined, undefined, ctx.sessionManager.getSessionId());
+	return { ...result, summary: `${result.summary.trimEnd()}\n\n${continuity}` };
 }
 
 /** Probe only the Steward-owned active journal path, without creating its parents. */

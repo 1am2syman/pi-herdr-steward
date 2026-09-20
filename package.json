@@ -39,6 +39,7 @@
     "test:git": "vitest run test/git-evidence.contract.test.ts",
     "test:dispatch": "vitest run test/dispatch.functional.test.ts",
     "test:monitor": "vitest run test/monitor.functional.test.ts --maxWorkers=1",
+    "test:ownership": "vitest run test/controller-ownership.functional.test.ts test/controller-ownership.contract.test.ts test/controller-ownership.storage.test.ts --maxWorkers=1",
     "test:herdr": "vitest run test/herdr-adapter.contract.test.ts test/herdr-completion.contract.test.ts test/herdr-monitor.contract.test.ts test/herdr-recovery.contract.test.ts --maxWorkers=1",
     "test:start": "vitest run test/start.functional.test.ts",
     "test:storage": "vitest run test/run-journal.storage.test.ts",

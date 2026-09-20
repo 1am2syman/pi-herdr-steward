@@ -73,6 +73,7 @@ import {
 	type AttemptContinuation,
 	type InfrastructureOutcome,
 	type RecoveryPreservation,
+	type ControllerPendingAction,
 } from "./run.ts";
 import {
 	buildReviewerAssignment,
@@ -369,7 +370,7 @@ export type ManagedWorktreeProgress =
 	| { kind: "observed"; head: string; worktree: MonitorDigest; git: { head: string; digest: MonitorDigest } }
 	| { kind: "unavailable"; diagnostic: string };
 
-export type MonitorTrigger = "start" | "lifecycle" | "fallback" | "settled" | "turn" | "compaction" | "prompt" | "manual";
+export type MonitorTrigger = "start" | "lifecycle" | "fallback" | "settled" | "turn" | "compaction" | "compaction-success" | "prompt" | "manual";
 
 export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-builder" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "silence-nudge" | "silence-interrupt" | "silence-resume" | "reserve-silent-replacement" | "reserve-transient-replacement" | "none" | "approval-required" | "blocked" | "degraded";
 
@@ -398,9 +399,28 @@ export type ResumeResult =
 	| { kind: "missing"; message: string }
 	| { kind: "invalid"; message: string }
 	| { kind: "foreign-session"; recordedSessionId: string; currentSessionId: string; message: string }
+	| { kind: "already-owner"; currentSessionId: string; message: string }
+	| { kind: "taken-over"; journal: RunJournal; message: string; pendingAction: ControllerPendingAction }
+	| { kind: "stale"; message: string }
 	| { kind: "usage"; message: string }
 	| { kind: "reconciled"; result: MonitorPassResult }
 	| { kind: "degraded"; message: string; result?: MonitorPassResult };
+
+export type ControllerSessionRestoreResult =
+	| { kind: "restored"; journal: RunJournal }
+	| { kind: "dormant"; reason: "missing" | "invalid" | "foreign-session" | "completed"; message: string; journal?: RunJournal };
+
+export type CompactionContinuityResult =
+	| { kind: "prepared"; journal: RunJournal; runId: string; journalRevision: number; controllerSessionId: string; pendingAction: ControllerPendingAction; block: string }
+	| { kind: "missing" | "invalid" | "foreign-session" | "completed" | "stale"; message: string };
+
+export interface CompactionFailureDetails {
+	reason: "manual" | "threshold" | "overflow";
+	errorMessage?: string;
+	aborted: boolean;
+	willRetry: boolean;
+	fromExtension: boolean;
+}
 
 export interface MonitorAdvanceOptions {
 	interactive: boolean;
@@ -493,7 +513,11 @@ export type StartResult =
 /** The ticket-01 and ticket-02 orchestration operations. */
 export interface Steward {
 	status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView>;
-	resume(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult>;
+	resume(repositoryRoot: string, controllerSessionId: string, takeover?: boolean): Promise<ResumeResult>;
+	takeover(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult>;
+	restoreControllerSession(repositoryRoot: string, controllerSessionId: string): Promise<ControllerSessionRestoreResult>;
+	prepareCompactionContinuity(repositoryRoot: string, controllerSessionId: string): Promise<CompactionContinuityResult>;
+	recordCompactionFailure(repositoryRoot: string, controllerSessionId: string, details: CompactionFailureDetails): Promise<{ kind: "recorded" | "ignored" | "degraded"; message: string }>;
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
 	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
 	waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult>;
@@ -573,7 +597,7 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 	if (!task || !attempt) {
 		return {
 			kind: "present",
-			markdown: `Run ${journal.run.id} is active; no Builder Attempt has been dispatched.`,
+			markdown: [`Run ${journal.run.id} is active; no Builder Attempt has been dispatched.`, ...(note ? [note] : [])].join("\n"),
 			footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` },
 		};
 	}
@@ -660,6 +684,43 @@ function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatu
 	}
 	if (note) lines.push(note);
 	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount: attention, text: `steward: ${journal.run.id} · ${detail?.phase ?? journal.run.status} · ${attention} attention · ${active}/${journal.run.effectiveSettings.maximumActiveTasks} active` } };
+}
+
+function pendingControllerAction(journal: RunJournal): ControllerPendingAction {
+	for (const task of journal.run.tasks) {
+		const attempt = task.attempts.at(-1);
+		if (attempt && ["prepared", "active", "awaiting-report"].includes(attempt.state) && (attempt.dispatch.phase === "prompt-intended" || attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active")) return { kind: "reconcile-attempt", taskId: task.contract.id, attemptId: attempt.id, role: attempt.role };
+		if (attempt?.role === "builder" && attempt.state === "reported" && attempt.evidence?.phase !== "finalized") return { kind: "validate-builder-evidence", taskId: task.contract.id, attemptId: attempt.id, role: "builder" };
+		if (task.phase === "reviewing" && attempt?.role === "reviewer" && attempt.state === "reported") return { kind: attempt.evidence?.phase === "finalized" ? "advance-review" : "validate-approval", taskId: task.contract.id, attemptId: attempt.id, role: "reviewer" };
+		if (task.attention !== "none" && attempt) return { kind: "wait-attention", taskId: task.contract.id, attemptId: attempt.id, role: attempt.role };
+		if (task.phase === "approved") return { kind: "integrate-task", taskId: task.contract.id };
+	}
+	if (journal.run.status === "completing") return { kind: "final-verification" };
+	if (journal.run.completion) return { kind: "completion-lifecycle" };
+	if (selectTaskAdmission(journal.run).kind === "admit") {
+		const admission = selectTaskAdmission(journal.run);
+		return admission.kind === "admit" ? { kind: "admit-task", taskId: admission.taskId } : { kind: "none" };
+	}
+	return { kind: "none" };
+}
+
+function continuityBlock(runId: string, journalRevision: number, controllerSessionId: string, pendingAction: ControllerPendingAction): string {
+	const identity = "taskId" in pendingAction
+		? ` ${pendingAction.taskId}${"attemptId" in pendingAction ? `/${pendingAction.attemptId}/${pendingAction.role}` : ""}`
+		: "";
+	return [
+		"--- Steward Controller Continuity ---",
+		`Steward Run: ${runId}`,
+		`Verified Journal revision: ${journalRevision}`,
+		`Controller Session: ${controllerSessionId}`,
+		`Pending Controller action: ${pendingAction.kind}${identity}`,
+		"Authoritative recovery source: .pi/steward/active-run.json; reconcile before mutation.",
+		"--- End Steward Controller Continuity ---",
+	].join("\n");
+}
+
+function canonicalTakeoverHash(input: { runId: string; journalRevision: number; previousSessionId: string; previousLeaseId?: string; facts: unknown; pendingAction: ControllerPendingAction }): string {
+	return `sha256:${createHash("sha256").update(JSON.stringify(input), "utf8").digest("hex")}`;
 }
 
 function silenceStatusLines(journal: RunJournal, task: TaskRecord, attempt: AttemptRecord): string[] {
@@ -3451,7 +3512,117 @@ async function inspectSilenceAttempt(repositoryRoot: string, task: TaskRecord, a
 
 /** Assemble the plain-function orchestration seam without adding lifecycle machinery. */
 export function createSteward({ runJournal, herdr, git, process, model, clock, ui }: StewardDependencies): Steward {
-	void process;
+	function controllerIdentityMatches(journal: RunJournal, currentSessionId: string): boolean {
+		return journal.run.controllerSessionId === currentSessionId && (!journal.run.controllerLease || journal.run.controllerLease.sessionId === currentSessionId);
+	}
+
+	async function inspectTakeoverFacts(repositoryRoot: string, journal: RunJournal): Promise<unknown[]> {
+		const facts: unknown[] = [];
+		for (const task of journal.run.tasks) {
+			const attempt = task.attempts.at(-1);
+			if (!attempt || !["building", "reviewing", "reworking"].includes(task.phase)) {
+				facts.push({ taskId: task.contract.id, phase: task.phase, attention: task.attention });
+				continue;
+			}
+			const identity = "workspaceId" in attempt.dispatch && typeof attempt.dispatch.workspaceId === "string" && "paneId" in attempt.dispatch && typeof attempt.dispatch.paneId === "string" && "terminalId" in attempt.dispatch && typeof attempt.dispatch.terminalId === "string" && "agentName" in attempt.dispatch && typeof attempt.dispatch.agentName === "string"
+				? { name: attempt.dispatch.agentName, workspaceId: attempt.dispatch.workspaceId, paneId: attempt.dispatch.paneId, terminalId: attempt.dispatch.terminalId }
+				: undefined;
+			const report = runJournal.inspectAttemptReport ? await runJournal.inspectAttemptReport(repositoryRoot, attempt.reportPath).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message.slice(0, 500) : "Attempt Report inspection failed." })) : { kind: "unavailable", diagnostic: "Attempt Report inspection is unavailable." };
+			const live = identity && herdr.inspectManagedAgent ? await herdr.inspectManagedAgent(identity).catch((error: unknown) => ({ kind: "unclear", diagnostic: error instanceof Error ? error.message.slice(0, 500) : "Herdr inspection failed." } as ManagedAgentInspection)) : { kind: "unclear", diagnostic: "Exact Herdr identity is unavailable." } as ManagedAgentInspection;
+			const worktreePath = "worktreePath" in attempt.dispatch ? attempt.dispatch.worktreePath : attempt.role === "reviewer" ? attempt.worktree.path : "";
+			const worktree = worktreePath && git.inspectManagedWorktreeProgress ? await git.inspectManagedWorktreeProgress(worktreePath).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message.slice(0, 500) : "Managed worktree inspection failed." } as ManagedWorktreeProgress)) : { kind: "unavailable", diagnostic: "Managed worktree inspection is unavailable." } as ManagedWorktreeProgress;
+			const assignment = runJournal.inspectAttemptAssignment ? await runJournal.inspectAttemptAssignment({ repositoryRoot, attempt }).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message.slice(0, 500) : "Assignment inspection failed." })) : { kind: "unavailable", diagnostic: "Assignment inspection is unavailable." };
+			const preservation = runJournal.inspectAttemptPreservation ? await runJournal.inspectAttemptPreservation({ repositoryRoot, attempt }).catch((error: unknown) => ({ kind: "unavailable", diagnostic: error instanceof Error ? error.message.slice(0, 500) : "Evidence inspection failed." })) : { kind: "unavailable", diagnostic: "Evidence inspection is unavailable." };
+			facts.push({ taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, report: report.kind, live: live.kind, ...(live.kind === "observed" ? { lifecycle: live.lifecycle, stateChangeSequence: live.stateChangeSequence } : {}), worktree: worktree.kind, assignment: assignment.kind, preservation: preservation.kind });
+		}
+		return facts;
+	}
+
+	async function takeover(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult> {
+		const initial = await runJournal.loadActive(repositoryRoot);
+		if (initial.kind === "missing") return { kind: "missing", message: "No active Steward Run exists in this repository." };
+		if (initial.kind === "invalid") return { kind: "invalid", message: `Active Steward Run state is invalid at ${initial.paths.activePath}; takeover is read-only.` };
+		if (initial.journal.run.status === "completed" || initial.journal.run.completion?.phase === "archived") return { kind: "stale", message: "The active Steward Run is completed; takeover is dormant." };
+		if (controllerIdentityMatches(initial.journal, controllerSessionId)) return { kind: "already-owner", currentSessionId: controllerSessionId, message: "This Controller Session already owns the active Steward Run; use plain resume." };
+		const basis = initial.journal;
+		const previousSessionId = basis.run.controllerSessionId;
+		const previousLease = basis.run.controllerLease;
+		let facts: unknown[];
+		try { facts = await inspectTakeoverFacts(repositoryRoot, basis); }
+		catch (error: unknown) { return { kind: "stale", message: `Takeover reconciliation was unavailable; no Controller identity changed. ${error instanceof Error ? error.message.slice(0, 2_000) : "Read-only inspection failed."}` }; }
+		const pendingAction = pendingControllerAction(basis);
+		const reconciliationSha256 = canonicalTakeoverHash({ runId: basis.run.id, journalRevision: basis.journalRevision, previousSessionId, ...(previousLease ? { previousLeaseId: previousLease.leaseId } : {}), facts, pendingAction });
+		const completedAt = new Date(Math.max(clock.now().getTime(), new Date(basis.run.updatedAt).getTime())).toISOString();
+		const current = await runJournal.loadActive(repositoryRoot);
+		if (current.kind !== "loaded" || current.journal.run.id !== basis.run.id || current.journal.journalRevision !== basis.journalRevision || current.journal.run.controllerSessionId !== previousSessionId || JSON.stringify(current.journal.run.controllerLease) !== JSON.stringify(previousLease)) return { kind: "stale", message: "The active Run changed during read-only takeover reconciliation; no Controller identity changed." };
+		let candidate: RunJournal;
+		try {
+			candidate = advanceRunJournal(current.journal, clock.now(), (next) => {
+				const acquiredAt = new Date(Math.max(clock.now().getTime(), new Date(current.journal.run.updatedAt).getTime() + 1, new Date(completedAt).getTime())).toISOString();
+				const rawLeaseId = clock.randomUUID().replace(/[^A-Za-z0-9._-]/g, "").slice(0, 72);
+				const proposedLeaseId = `lease-${rawLeaseId || `${current.journal.journalRevision + 1}`}`;
+				const leaseId = proposedLeaseId === previousLease?.leaseId ? `${proposedLeaseId}-takeover-${current.journal.journalRevision + 1}`.slice(0, 128) : proposedLeaseId;
+				next.run.controllerSessionId = controllerSessionId;
+				next.run.controllerLease = {
+					sessionId: controllerSessionId,
+					leaseId,
+					acquiredAt,
+					acquiredJournalRevision: current.journal.journalRevision + 1,
+					takeover: {
+						previousSessionId,
+						...(previousLease ? { previousLeaseId: previousLease.leaseId } : {}),
+						reconciledAt: completedAt,
+						basisJournalRevision: current.journal.journalRevision,
+						reconciliationSha256,
+						pendingAction,
+					},
+				};
+			});
+		} catch (error: unknown) { return { kind: "degraded", message: `Takeover candidate was rejected; no Controller identity changed. ${error instanceof Error ? error.message.slice(0, 2_000) : "Journal validation failed."}` }; }
+		let replaced: import("./run-journal-store.ts").ReplaceActiveResult;
+		try { replaced = await runJournal.replaceActive(repositoryRoot, candidate); }
+		catch (error: unknown) { return { kind: "degraded", message: `Takeover storage failed; no Controller identity was claimed. ${error instanceof Error ? error.message.slice(0, 2_000) : "CAS failed."}` }; }
+		if (replaced.kind !== "replaced") return { kind: "stale", message: "Takeover lost the Run Journal compare-and-swap; the actual winner remains authoritative." };
+		let warning = "";
+		try {
+			const activity = await runJournal.appendActivity(repositoryRoot, { timestamp: replaced.journal.run.updatedAt, runId: replaced.journal.run.id, event: "controller-taken-over", message: `Controller Session ${controllerSessionId} took ownership from ${previousSessionId} after read-only reconciliation at Journal revision ${basis.journalRevision}.` });
+			if (activity.kind !== "appended") warning = " Activity logging is degraded; ownership remains authoritative.";
+		} catch { warning = " Activity logging is degraded; ownership remains authoritative."; }
+		return { kind: "taken-over", journal: replaced.journal, pendingAction, message: `Controller ownership transferred to Session ${controllerSessionId}; the next serialized pass will reconcile before one workflow action.${warning}` };
+	}
+
+	async function restoreControllerSession(repositoryRoot: string, controllerSessionId: string): Promise<ControllerSessionRestoreResult> {
+		const loaded = await runJournal.loadActive(repositoryRoot);
+		if (loaded.kind === "missing") return { kind: "dormant", reason: "missing", message: "No active Steward Run exists; Controller monitoring is dormant." };
+		if (loaded.kind === "invalid") return { kind: "dormant", reason: "invalid", message: "Active Steward Run state is invalid; Controller monitoring is dormant." };
+		if (loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "dormant", reason: "completed", message: "The Steward Run is completed; Controller monitoring is dormant.", journal: loaded.journal };
+		if (!controllerIdentityMatches(loaded.journal, controllerSessionId)) return { kind: "dormant", reason: "foreign-session", message: `This Pi Session is foreign to Controller Session ${loaded.journal.run.controllerSessionId}; run /steward resume --takeover to claim it.`, journal: loaded.journal };
+		return { kind: "restored", journal: loaded.journal };
+	}
+
+	async function prepareCompactionContinuity(repositoryRoot: string, controllerSessionId: string): Promise<CompactionContinuityResult> {
+		const first = await runJournal.loadActive(repositoryRoot);
+		if (first.kind === "missing") return { kind: "missing", message: "No active Steward Run exists; normal Pi compaction remains available." };
+		if (first.kind === "invalid") return { kind: "invalid", message: "Active Steward Run state is invalid; normal Pi compaction remains available." };
+		if (first.journal.run.status === "completed" || first.journal.run.completion?.phase === "archived") return { kind: "completed", message: "The Steward Run is completed; normal Pi compaction remains available." };
+		if (!controllerIdentityMatches(first.journal, controllerSessionId)) return { kind: "foreign-session", message: `This Pi Session is foreign to Controller Session ${first.journal.run.controllerSessionId}; normal Pi compaction remains available.` };
+		const pendingAction = pendingControllerAction(first.journal);
+		const second = await runJournal.loadActive(repositoryRoot);
+		if (second.kind !== "loaded" || second.journal.run.id !== first.journal.run.id || second.journal.journalRevision !== first.journal.journalRevision || JSON.stringify(second.journal.run.controllerLease) !== JSON.stringify(first.journal.run.controllerLease) || !controllerIdentityMatches(second.journal, controllerSessionId)) return { kind: "stale", message: "The Run changed while continuity was being verified; normal Pi compaction remains available." };
+		return { kind: "prepared", journal: second.journal, runId: second.journal.run.id, journalRevision: second.journal.journalRevision, controllerSessionId, pendingAction, block: continuityBlock(second.journal.run.id, second.journal.journalRevision, controllerSessionId, pendingAction) };
+	}
+
+	async function recordCompactionFailure(repositoryRoot: string, controllerSessionId: string, details: CompactionFailureDetails): Promise<{ kind: "recorded" | "ignored" | "degraded"; message: string }> {
+		const loaded = await runJournal.loadActive(repositoryRoot);
+		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "ignored", message: "Compaction failure was not recorded because this session is not the active Controller." };
+		const safeError = details.errorMessage?.replace(/[\u0000\r\n]+/g, " ").slice(0, 500);
+		const message = `Compaction failed (${details.reason}; aborted=${details.aborted}; willRetry=${details.willRetry}; fromExtension=${details.fromExtension})${safeError ? `: ${safeError}` : ""}. Task state remains authoritative and unchanged.`;
+		try {
+			const result = await runJournal.appendActivity(repositoryRoot, { timestamp: loaded.journal.run.updatedAt, runId: loaded.journal.run.id, event: "compaction-continuity-failed", message });
+			return result.kind === "appended" ? { kind: "recorded", message } : { kind: "degraded", message: `${message} Activity logging is degraded.` };
+		} catch { return { kind: "degraded", message: `${message} Activity logging is degraded.` }; }
+	}
+
 	async function status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		let statusView: StatusView = loaded.kind === "missing"
@@ -3463,7 +3634,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 					footer: { run: "active" as const, attentionCount: 0 as const, text: "steward: active Run needs recovery" },
 				}
 				: presentStatusForJournal(loaded.journal);
-		if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && loaded.journal.run.controllerSessionId === controllerSessionId) {
+		if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && controllerIdentityMatches(loaded.journal, controllerSessionId)) {
 			let currentJournal = loaded.journal;
 			let note = "";
 			const hasRecoverySignal = currentJournal.run.tasks.some((candidateTask) => {
@@ -3503,19 +3674,24 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			const latestAttempt = latestTask?.attempts.at(-1);
 			if (latestTask?.phase === "building" && latestAttempt?.role === "builder" && latestAttempt.state === "reported" && latestAttempt.evidence?.phase === "finalized" && note.startsWith("Review dispatch pending")) note = `Builder Attempt ${latestAttempt.id} report was validated and finalized.`;
 			statusView = completion.completed ? presentCompletedStatus(currentJournal, completion.note) : presentStatusForJournal(currentJournal, note);
-		} else if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && loaded.journal.run.controllerSessionId !== controllerSessionId) {
-			statusView = presentStatusForJournal(loaded.journal, "Controller Session does not match; evidence validation is read-only until the authorized Controller returns.");
+		} else if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && !controllerIdentityMatches(loaded.journal, controllerSessionId)) {
+			statusView = presentStatusForJournal(loaded.journal, `Controller Session ${loaded.journal.run.controllerSessionId} is recorded; current Session ${controllerSessionId} is read-only. Run /steward resume --takeover to reconcile and claim ownership.`);
 		}
 		ui.presentStatus(statusView, target);
 		return statusView;
 	}
 
-	async function resume(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult> {
+	async function resume(repositoryRoot: string, controllerSessionId: string, takeoverRequested = false): Promise<ResumeResult> {
+		if (takeoverRequested) {
+			const result = await takeover(repositoryRoot, controllerSessionId);
+			ui.presentResumeResult?.(result);
+			return result;
+		}
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		let result: ResumeResult;
 		if (loaded.kind === "missing") result = { kind: "missing", message: "No active Steward Run exists in this repository." };
 		else if (loaded.kind === "invalid") result = { kind: "invalid", message: `Active Steward Run state is invalid at ${loaded.paths.activePath}; resume is read-only. ${loaded.diagnostics.map((item) => item.message).join(" ")}` };
-		else if (loaded.journal.run.controllerSessionId !== controllerSessionId) result = { kind: "foreign-session", recordedSessionId: loaded.journal.run.controllerSessionId, currentSessionId: controllerSessionId, message: "The active Steward Run belongs to a different Controller Session; resume performed no mutation." };
+		else if (!controllerIdentityMatches(loaded.journal, controllerSessionId)) result = { kind: "foreign-session", recordedSessionId: loaded.journal.run.controllerSessionId, currentSessionId: controllerSessionId, message: `The active Steward Run belongs to Controller Session ${loaded.journal.run.controllerSessionId}; resume performed no mutation. Run /steward resume --takeover to reconcile and claim ownership.` };
 		else {
 			const pass = await advanceNext(repositoryRoot, controllerSessionId, { interactive: true, maximumActions: 1, source: "resume" });
 			result = pass.condition === "degraded" ? { kind: "degraded", message: pass.note, result: pass } : { kind: "reconciled", result: pass };
@@ -4038,7 +4214,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; monitoring is dormant." : "Active Run state is invalid; monitoring is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
 		const journal = loaded.journal;
-		if (journal.run.controllerSessionId !== controllerSessionId) return monitorResult("none", journal, "Controller Session does not match; monitor observation is read-only.");
+		if (!controllerIdentityMatches(journal, controllerSessionId)) return monitorResult("none", journal, "Controller Session does not match; monitor observation is read-only.");
 		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; monitoring is dormant.", undefined, true);
 		const selected = currentMonitorAttempts(journal);
 		if (selected.length === 0) return monitorResult("none", journal, "No current prompted Steward Attempt is available for monitoring.");
@@ -4093,7 +4269,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
-		if (loaded.kind !== "loaded" || loaded.journal.run.controllerSessionId !== controllerSessionId || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active Controller-owned Run is available for a lifecycle wait." };
+		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active Controller-owned Run is available for a lifecycle wait." };
 		if (loaded.journal.run.tasks.length > 1) {
 			const selected = currentMonitorAttempts(loaded.journal);
 			if (selected.length === 0 || !herdr.inspectManagedAgent || !herdr.waitForManagedAgent) return { kind: "unavailable", diagnostic: "No current prompted multi-Task Attempt or Herdr lifecycle wait is available." };
@@ -4165,7 +4341,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; advancement is dormant." : "Active Run state is invalid; advancement is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
 		let journal = loaded.journal;
-		if (journal.run.controllerSessionId !== controllerSessionId) return monitorResult("none", journal, "Controller Session does not match; advancement is read-only.");
+		if (!controllerIdentityMatches(journal, controllerSessionId)) return monitorResult("none", journal, "Controller Session does not match; advancement is read-only.");
 		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; advancement is dormant.", undefined, true);
 		const reconciliation = await reconcileCurrentAttempt(repositoryRoot, controllerSessionId, journal, monitorDependencies);
 		journal = reconciliation.journal;
@@ -4273,5 +4449,5 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (target === "command" && journal) ui.presentStatus(presentStatusForJournal(journal, result.note), "command");
 	}
 
-	return { status, resume, configure, start, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
+	return { status, resume, takeover, restoreControllerSession, prepareCompactionContinuity, recordCompactionFailure, configure, start, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
 }

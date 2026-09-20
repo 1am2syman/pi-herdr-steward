@@ -880,6 +880,7 @@ export interface RunRecord {
 	createdAt: string;
 	updatedAt: string;
 	controllerSessionId: string;
+	controllerLease?: ControllerLease;
 	integrationBase: IntegrationBase;
 	tasks: TaskRecord[];
 	modelPlan: ProjectModelPlans;
@@ -889,6 +890,33 @@ export interface RunRecord {
 	completion?: CompletionRecord;
 	monitor?: MonitorCheckpoint;
 	monitors?: MonitorCheckpoint[];
+}
+
+export type ControllerPendingAction =
+	| { kind: "reconcile-attempt"; taskId: string; attemptId: string; role: "builder" | "reviewer" }
+	| { kind: "validate-builder-evidence"; taskId: string; attemptId: string; role: "builder" }
+	| { kind: "validate-approval"; taskId: string; attemptId: string; role: "reviewer" }
+	| { kind: "advance-review"; taskId: string; attemptId: string; role: "reviewer" }
+	| { kind: "integrate-task"; taskId: string }
+	| { kind: "admit-task"; taskId: string }
+	| { kind: "final-verification" }
+	| { kind: "completion-lifecycle" }
+	| { kind: "wait-attention"; taskId: string; attemptId: string; role: "builder" | "reviewer" }
+	| { kind: "none" };
+
+export interface ControllerLease {
+	sessionId: string;
+	leaseId: string;
+	acquiredAt: string;
+	acquiredJournalRevision: number;
+	takeover?: {
+		previousSessionId: string;
+		previousLeaseId?: string;
+		reconciledAt: string;
+		basisJournalRevision: number;
+		reconciliationSha256: string;
+		pendingAction: ControllerPendingAction;
+	};
 }
 
 export interface RunJournal {
@@ -955,6 +983,7 @@ export interface RunConfirmationSummary {
 export interface RunIdentity {
 	runId: string;
 	createdAt: string;
+	leaseId?: string;
 }
 
 export interface RunDiagnostic {
@@ -1734,6 +1763,29 @@ function cloneMonitorCheckpoint(monitor: MonitorCheckpoint): MonitorCheckpoint {
 	};
 }
 
+function cloneControllerPendingAction(action: ControllerPendingAction): ControllerPendingAction {
+	return { ...action };
+}
+
+function cloneControllerLease(lease: ControllerLease): ControllerLease {
+	return {
+		sessionId: lease.sessionId,
+		leaseId: lease.leaseId,
+		acquiredAt: lease.acquiredAt,
+		acquiredJournalRevision: lease.acquiredJournalRevision,
+		...(lease.takeover ? {
+			takeover: {
+				previousSessionId: lease.takeover.previousSessionId,
+				...(lease.takeover.previousLeaseId ? { previousLeaseId: lease.takeover.previousLeaseId } : {}),
+				reconciledAt: lease.takeover.reconciledAt,
+				basisJournalRevision: lease.takeover.basisJournalRevision,
+				reconciliationSha256: lease.takeover.reconciliationSha256,
+				pendingAction: cloneControllerPendingAction(lease.takeover.pendingAction),
+			},
+		} : {}),
+	};
+}
+
 function canonicalContract(contract: TaskContract): TaskContract {
 	return cloneContract(contract);
 }
@@ -2276,7 +2328,71 @@ function validateMonitorCheckpoints(value: unknown, path: string, run: { created
 	return diagnostics.length > 0 ? { diagnostics } : { value: monitors, diagnostics: [] };
 }
 
-function validateRunRecord(value: unknown, path: string, options: { atActivePath: boolean } = { atActivePath: false }): { value?: RunRecord; diagnostics: RunDiagnostic[] } {
+function validateControllerPendingAction(value: unknown, path: string, run: { tasks: TaskRecord[] }): { value?: ControllerPendingAction; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.kind !== "string") return { diagnostics: [diagnostic("invalid-run", "Controller pending action must be a recognized exact record.", path)] };
+	const taskFor = (taskId: unknown, attemptId: unknown, role: unknown): TaskRecord | undefined => {
+		if (!safeIdentifier(taskId) || !safeIdentifier(attemptId) || (role !== "builder" && role !== "reviewer")) return undefined;
+		const task = run.tasks.find((candidate) => candidate.contract.id === taskId);
+		const attempt = task?.attempts.find((candidate) => candidate.id === attemptId);
+		return attempt?.role === role ? task : undefined;
+	};
+	if (value.kind === "none" && exactKeys(value, ["kind"])) return { value: { kind: "none" }, diagnostics: [] };
+	if (["reconcile-attempt", "wait-attention"].includes(value.kind) && exactKeys(value, ["kind", "taskId", "attemptId", "role"])) {
+		const task = taskFor(value.taskId, value.attemptId, value.role);
+		if (task) return { value: { kind: value.kind as "reconcile-attempt" | "wait-attention", taskId: value.taskId as string, attemptId: value.attemptId as string, role: value.role as "builder" | "reviewer" }, diagnostics: [] };
+	}
+	if (value.kind === "validate-builder-evidence" && exactKeys(value, ["kind", "taskId", "attemptId", "role"]) && value.role === "builder" && taskFor(value.taskId, value.attemptId, value.role)) return { value: { kind: value.kind, taskId: value.taskId as string, attemptId: value.attemptId as string, role: "builder" }, diagnostics: [] };
+	if ((value.kind === "validate-approval" || value.kind === "advance-review") && exactKeys(value, ["kind", "taskId", "attemptId", "role"]) && value.role === "reviewer" && taskFor(value.taskId, value.attemptId, value.role)) return { value: { kind: value.kind, taskId: value.taskId as string, attemptId: value.attemptId as string, role: "reviewer" }, diagnostics: [] };
+	if (["integrate-task", "admit-task"].includes(value.kind) && exactKeys(value, ["kind", "taskId"]) && safeIdentifier(value.taskId) && run.tasks.some((task) => task.contract.id === value.taskId)) return { value: { kind: value.kind as "integrate-task" | "admit-task", taskId: value.taskId as string }, diagnostics: [] };
+	if ((value.kind === "final-verification" || value.kind === "completion-lifecycle") && exactKeys(value, ["kind"])) return { value: { kind: value.kind }, diagnostics: [] };
+	return { diagnostics: [diagnostic("invalid-run", "Controller pending action has unknown keys, invalid identity, or a foreign Task/Attempt.", path)] };
+}
+
+function validateControllerLease(value: unknown, path: string, run: { id: string; controllerSessionId: string; createdAt: string; updatedAt: string; journalRevision: number; tasks: TaskRecord[] }): { value?: ControllerLease; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["sessionId", "leaseId", "acquiredAt", "acquiredJournalRevision", ...(Object.prototype.hasOwnProperty.call(value, "takeover") ? ["takeover"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Controller lease contains unknown or missing keys.", path)] };
+	const diagnostics: RunDiagnostic[] = [];
+	if (!trimmedString(value.sessionId) || value.sessionId !== run.controllerSessionId || Buffer.byteLength(value.sessionId as string, "utf8") > 256) diagnostics.push(diagnostic("invalid-run", "Controller lease sessionId must exactly match controllerSessionId and be bounded.", `${path}.sessionId`));
+	if (!safeIdentifier(value.leaseId) || !String(value.leaseId).startsWith("lease-") || String(value.leaseId).length <= "lease-".length || String(value.leaseId).length > 128) diagnostics.push(diagnostic("invalid-run", "Controller lease leaseId must be a bounded filesystem-safe lease identifier.", `${path}.leaseId`));
+	if (!canonicalTimestamp(value.acquiredAt) || value.acquiredAt < run.createdAt || value.acquiredAt > run.updatedAt) diagnostics.push(diagnostic("invalid-run", "Controller lease acquiredAt must be canonical and within the Run lifetime.", `${path}.acquiredAt`));
+	if (typeof value.acquiredJournalRevision !== "number" || !Number.isSafeInteger(value.acquiredJournalRevision) || value.acquiredJournalRevision < 1 || value.acquiredJournalRevision > run.journalRevision) diagnostics.push(diagnostic("invalid-run", "Controller lease acquiredJournalRevision must be within the Journal revisions.", `${path}.acquiredJournalRevision`));
+	const takeoverPresent = Object.prototype.hasOwnProperty.call(value, "takeover");
+	if (!takeoverPresent) {
+		if (value.acquiredJournalRevision !== 1 || value.acquiredAt !== run.createdAt) diagnostics.push(diagnostic("invalid-run", "An initial Controller lease must be acquired at Journal revision 1 and Run creation.", path));
+		return diagnostics.length > 0 ? { diagnostics } : { value: { sessionId: value.sessionId as string, leaseId: value.leaseId as string, acquiredAt: value.acquiredAt as string, acquiredJournalRevision: value.acquiredJournalRevision as number }, diagnostics: [] };
+	}
+	const takeover = value.takeover;
+	if (!isRecord(takeover) || !exactKeys(takeover, ["previousSessionId", ...(Object.prototype.hasOwnProperty.call(takeover, "previousLeaseId") ? ["previousLeaseId"] : []), "reconciledAt", "basisJournalRevision", "reconciliationSha256", "pendingAction"])) {
+		diagnostics.push(diagnostic("invalid-run", "Controller lease takeover contains unknown or missing keys.", `${path}.takeover`));
+		return { diagnostics };
+	}
+	if (!trimmedString(takeover.previousSessionId) || takeover.previousSessionId === run.controllerSessionId || Buffer.byteLength(takeover.previousSessionId as string, "utf8") > 256) diagnostics.push(diagnostic("invalid-run", "Takeover previousSessionId must be a different bounded Controller Session.", `${path}.takeover.previousSessionId`));
+	if (Object.prototype.hasOwnProperty.call(takeover, "previousLeaseId") && (!safeIdentifier(takeover.previousLeaseId) || !String(takeover.previousLeaseId).startsWith("lease-") || String(takeover.previousLeaseId).length <= "lease-".length || String(takeover.previousLeaseId).length > 128 || takeover.previousLeaseId === value.leaseId)) diagnostics.push(diagnostic("invalid-run", "Takeover previousLeaseId must be a valid bounded lease distinct from the new lease.", `${path}.takeover.previousLeaseId`));
+	if (!canonicalTimestamp(takeover.reconciledAt) || takeover.reconciledAt < run.createdAt || !canonicalTimestamp(value.acquiredAt) || takeover.reconciledAt > value.acquiredAt) diagnostics.push(diagnostic("invalid-run", "Takeover reconciledAt must be ordered before acquiredAt and after Run creation.", `${path}.takeover.reconciledAt`));
+	if (typeof takeover.basisJournalRevision !== "number" || !Number.isSafeInteger(takeover.basisJournalRevision) || takeover.basisJournalRevision < 1 || takeover.basisJournalRevision + 1 !== value.acquiredJournalRevision) diagnostics.push(diagnostic("invalid-run", "Takeover basisJournalRevision must be immediately before acquiredJournalRevision.", `${path}.takeover.basisJournalRevision`));
+	if (typeof takeover.reconciliationSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(takeover.reconciliationSha256)) diagnostics.push(diagnostic("invalid-run", "Takeover reconciliationSha256 must be a canonical lowercase sha256 value.", `${path}.takeover.reconciliationSha256`));
+	const pending = validateControllerPendingAction(takeover.pendingAction, `${path}.takeover.pendingAction`, run);
+	diagnostics.push(...pending.diagnostics);
+	if (diagnostics.length > 0 || !pending.value) return { diagnostics };
+	return {
+		value: {
+			sessionId: value.sessionId as string,
+			leaseId: value.leaseId as string,
+			acquiredAt: value.acquiredAt as string,
+			acquiredJournalRevision: value.acquiredJournalRevision as number,
+			takeover: {
+				previousSessionId: takeover.previousSessionId as string,
+				...(Object.prototype.hasOwnProperty.call(takeover, "previousLeaseId") ? { previousLeaseId: takeover.previousLeaseId as string } : {}),
+				reconciledAt: takeover.reconciledAt as string,
+				basisJournalRevision: takeover.basisJournalRevision as number,
+				reconciliationSha256: takeover.reconciliationSha256 as string,
+				pendingAction: pending.value,
+			},
+		},
+		diagnostics: [],
+	};
+}
+
+function validateRunRecord(value: unknown, path: string, options: { atActivePath: boolean; journalRevision?: number } = { atActivePath: false }): { value?: RunRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) {
 		return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	}
@@ -2284,8 +2400,9 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	const hasCompletion = Object.prototype.hasOwnProperty.call(value, "completion");
 	const hasMonitor = Object.prototype.hasOwnProperty.call(value, "monitor");
 	const hasMonitors = Object.prototype.hasOwnProperty.call(value, "monitors");
+	const hasControllerLease = Object.prototype.hasOwnProperty.call(value, "controllerLease");
 	if (hasMonitor && hasMonitors) return { diagnostics: [diagnostic("invalid-run", "Run cannot contain both legacy monitor and multi-Task monitors.", path)] };
-	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : []), ...(hasMonitors ? ["monitors"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
+	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", ...(hasControllerLease ? ["controllerLease"] : []), "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : []), ...(hasMonitors ? ["monitors"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	const diagnostics: RunDiagnostic[] = [];
 	if (!safeIdentifier(value.id) || !String(value.id).startsWith("run-")) diagnostics.push(diagnostic("invalid-run", "Run id must be a filesystem-safe run identifier.", `${path}.id`));
 	if (value.status !== "active" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "Run status must be active, completing, or completed.", `${path}.status`));
@@ -2458,6 +2575,10 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	diagnostics.push(...monitor.diagnostics);
 	const monitors = hasMonitors ? validateMonitorCheckpoints(value.monitors, `${path}.monitors`, { createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, tasks }) : { diagnostics: [] };
 	diagnostics.push(...monitors.diagnostics);
+	const controllerLease = hasControllerLease
+		? validateControllerLease(value.controllerLease, `${path}.controllerLease`, { id: value.id as string, controllerSessionId: value.controllerSessionId as string, createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, journalRevision: options.journalRevision ?? 1, tasks })
+		: { diagnostics: [] };
+	diagnostics.push(...controllerLease.diagnostics);
 	if (hasMonitors && tasks.length < 2) diagnostics.push(diagnostic("invalid-run", "The multi-Task monitors representation requires more than one Task.", `${path}.monitors`));
 	if (completion.value) {
 		const prompted = new Set<string>();
@@ -2534,6 +2655,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			createdAt,
 			updatedAt,
 			controllerSessionId,
+			...(controllerLease.value ? { controllerLease: controllerLease.value } : {}),
 			integrationBase: base.value,
 			tasks,
 			modelPlan: cloneModelPlans(plans.value),
@@ -2554,7 +2676,7 @@ export function validateRunJournal(value: unknown, path?: string): { value?: Run
 	if (value.schemaVersion !== RUN_JOURNAL_SCHEMA_VERSION) return { diagnostics: [diagnostic("invalid-run", "Unsupported Run Journal schemaVersion; expected 1.", journalPath)] };
 	if (typeof value.journalRevision !== "number" || !Number.isSafeInteger(value.journalRevision) || value.journalRevision < 1) return { diagnostics: [diagnostic("invalid-run", "journalRevision must be a positive safe integer.", `${journalPath}.journalRevision`)] };
 	const atActivePath = journalPath === "active-run.json" || journalPath.endsWith("/active-run.json");
-	const result = validateRunRecord(value.run, `${journalPath}.run`, { atActivePath });
+	const result = validateRunRecord(value.run, `${journalPath}.run`, { atActivePath, journalRevision: value.journalRevision });
 	if (result.value && value.journalRevision === 1 && result.value.createdAt !== result.value.updatedAt) result.diagnostics.push(diagnostic("invalid-run", "Initial Run Journal revision must have equal createdAt and updatedAt values.", `${journalPath}.run.updatedAt`));
 	return result.value && result.diagnostics.length === 0 ? { value: { schemaVersion: 1, journalRevision: value.journalRevision, run: result.value }, diagnostics: [] } : { diagnostics: result.diagnostics };
 }
@@ -2766,6 +2888,7 @@ export function cloneRunJournal(journal: RunJournal): RunJournal {
 		journalRevision: journal.journalRevision,
 		run: {
 			...journal.run,
+			...(journal.run.controllerLease ? { controllerLease: cloneControllerLease(journal.run.controllerLease) } : {}),
 			integrationBase: journal.run.integrationBase.kind === "git" ? { ...journal.run.integrationBase } : { kind: "none" },
 			tasks: journal.run.tasks.map((task) => ({ ...task, contract: cloneContract(task.contract), attempts: task.attempts.map(cloneAttempt), ...(task.approval ? { approval: cloneApproval(task.approval) } : {}), ...(task.integration ? { integration: cloneIntegration(task.integration) } : {}) })),
 			modelPlan: cloneModelPlans(journal.run.modelPlan),
@@ -2808,7 +2931,7 @@ export function createRunIdentity(now: Date, uuid: string): RunIdentity {
 	const compactTime = createdAt.replace(/[-:.]/g, "");
 	const compactUuid = uuid.replace(/[^A-Za-z0-9]/g, "").slice(0, 8);
 	if (!compactUuid) throw new Error("Clock randomUUID must provide filesystem-safe identity material.");
-	return { runId: `run-${compactTime}-${compactUuid}`, createdAt };
+	return { runId: `run-${compactTime}-${compactUuid}`, createdAt, leaseId: `lease-${compactUuid}` };
 }
 
 export function isCodeChanging(tasks: readonly TaskRecord[] | readonly RunDraftTask[]): boolean {
@@ -2855,6 +2978,12 @@ export function buildInitialRunJournal(input: {
 			createdAt: input.identity.createdAt,
 			updatedAt: input.identity.createdAt,
 			controllerSessionId: input.controllerSessionId,
+			controllerLease: {
+				sessionId: input.controllerSessionId,
+				leaseId: input.identity.leaseId ?? `lease-${input.identity.runId.replace(/^run-/, "").replace(/[^A-Za-z0-9._-]/g, "").slice(-64)}`,
+				acquiredAt: input.identity.createdAt,
+				acquiredJournalRevision: 1,
+			},
 			integrationBase: input.integrationBase.kind === "none" ? { kind: "none" } : { ...input.integrationBase },
 			tasks,
 			modelPlan: cloneModelPlans(input.modelPlan),

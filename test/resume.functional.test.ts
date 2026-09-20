@@ -553,7 +553,7 @@ it.sequential("non-TUI resume refuses before adapter creation and extra args are
 	equal(factoryCalls, 0);
 	const tui = context(root);
 	tui.ui.notify = (message) => notifications.push(message);
-	await command("resume --takeover", tui);
+	await command("resume --takeover unexpected", tui);
 	equal(factoryCalls, 0);
 	ok(notifications.some((message) => message.includes("Usage: /steward")));
 });
