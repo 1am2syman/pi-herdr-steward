@@ -147,8 +147,8 @@ function multiDraft(maximumActiveTasks: number, modelPlan = models, transientRet
 	};
 }
 
-function multiContext(root: string): StewardCommandContext {
-	return { ...context(root), sessionManager: { getSessionId: () => "coordination-controller" } as StewardCommandContext["sessionManager"] };
+function multiContext(root: string, session = "coordination-controller"): StewardCommandContext {
+	return { ...context(root), sessionManager: { getSessionId: () => session } as StewardCommandContext["sessionManager"] };
 }
 
 async function makeCompletionDependencies(root: string, maximumActiveTasks: number, effects: MultiEffects, observed: { markdown?: string; condition?: string }, options: CompletionHarnessOptions = {}): Promise<StewardDependencies> {
@@ -321,9 +321,9 @@ async function writeMultiReviewerReport(journal: RunJournal, taskId: string): Pr
 	await writeFile(attempt.reportPath, serializeReviewerAttemptReport(report));
 }
 
-async function resumeUntil(root: string, command: StewardCommandHandler, predicate: (journal: RunJournal) => boolean, limit = 30): Promise<RunJournal> {
+async function resumeUntil(root: string, command: StewardCommandHandler, predicate: (journal: RunJournal) => boolean, limit = 30, session = "coordination-controller"): Promise<RunJournal> {
 	for (let index = 0; index < limit; index += 1) {
-		await command("resume", multiContext(root));
+		await command("resume", multiContext(root, session));
 		const journal = await createRunJournalAdapter().loadActive(root);
 		if (journal.kind === "loaded" && predicate(journal.journal)) return journal.journal;
 	}
@@ -546,6 +546,54 @@ describe("registered multi-Task coordination", () => {
 		expect(journal.run.completion?.gate).toMatchObject({ kind: "multi-task", tasks: expect.arrayContaining([expect.objectContaining({ taskId: "task-01" }), expect.objectContaining({ taskId: "task-02" }), expect.objectContaining({ taskId: "task-03" })]) });
 	});
 
+	it("hands a registered multi-Task Run to one new owner without changing slots or integration order", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-herdr-coordination-takeover-"));
+		roots.push(root);
+		const config = createConfigStore();
+		await config.saveRecoveryDefaults(recovery(2));
+		await config.saveModelPlans(root, models);
+		const effects: MultiEffects = { currentHead: baseRevision, integrations: [], verifications: 0, stops: [] };
+		const takeover: { kind?: string } = {};
+		const dependencies = await makeCompletionDependencies(root, 2, effects, {});
+		const ownerCommand = register(dependencies)();
+		const approved = await prepareApprovedPair(root, dependencies, ownerCommand);
+		const before = await dependencies.runJournal.loadActive(root);
+		expect(before.kind).toBe("loaded");
+		if (before.kind !== "loaded") return;
+		const order = before.journal.run.tasks.map((task) => task.contract.id);
+		const slots = before.journal.run.tasks.map((task) => ({ id: task.contract.id, attempts: task.attempts.map((attempt) => attempt.assignmentPath) }));
+		expect(before.journal.run.effectiveSettings.maximumActiveTasks).toBe(2);
+		expect(countActiveTasks(before.journal.run)).toBeLessThanOrEqual(2);
+		const beforeTaskThree = structuredClone(before.journal.run.tasks[2]);
+		dependencies.ui = { ...dependencies.ui, presentResumeResult(value) { takeover.kind = value.kind; } };
+		const replacementCommand = register(dependencies)();
+		await replacementCommand("resume --takeover", multiContext(root, "controller-b"));
+		const taken = await dependencies.runJournal.loadActive(root);
+		expect(taken.kind).toBe("loaded");
+		if (taken.kind !== "loaded") return;
+		expect(takeover.kind).toBe("taken-over");
+		expect(taken.journal.run.controllerSessionId).toBe("controller-b");
+		expect(taken.journal.run.controllerLease?.takeover?.basisJournalRevision).toBe(before.journal.journalRevision);
+		expect(taken.journal.run.tasks.map((task) => task.contract.id)).toEqual(order);
+		expect(taken.journal.run.tasks.map((task) => ({ id: task.contract.id, attempts: task.attempts.map((attempt) => attempt.assignmentPath) }))).toEqual(slots);
+		expect(taken.journal.run.tasks[2]).toEqual(beforeTaskThree);
+		expect(countActiveTasks(taken.journal.run)).toBeLessThanOrEqual(2);
+
+		let journal = await resumeUntil(root, replacementCommand, (candidate) => effects.integrations.length === 1, 30, "controller-b");
+		expect(effects.integrations.map((item) => item.taskId)).toEqual(["task-01"]);
+		expect(journal.run.tasks[2]).toEqual(beforeTaskThree);
+		journal = await resumeUntil(root, replacementCommand, (candidate) => effects.integrations.length === 2, 30, "controller-b");
+		expect(effects.integrations.map((item) => item.taskId)).toEqual(["task-01", "task-02"]);
+		expect(journal.run.tasks.map((task) => task.contract.id)).toEqual(order);
+		expect(countActiveTasks(journal.run)).toBeLessThanOrEqual(2);
+		journal = await resumeUntil(root, replacementCommand, (candidate) => candidate.run.tasks[2]?.phase === "building", 30, "controller-b");
+		expect(journal.run.tasks[0]?.contract.id).toBe("task-01");
+		expect(journal.run.tasks[1]?.contract.id).toBe("task-02");
+		expect(journal.run.tasks[2]?.phase).toBe("building");
+		expect(countActiveTasks(journal.run)).toBeLessThanOrEqual(2);
+		expect(effects.integrations.map((item) => item.taskId)).toEqual(["task-01", "task-02"]);
+	});
+
 	it("keeps approved completion order as the integration queue even when a later Task is ready", () => {
 		const later = queueTask("task-02", "approved", { approval: { phase: "valid", subject: { kind: "git", baseRevision, headRevision: "2222222222222222222222222222222222222222", commits: ["2222222222222222222222222222222222222222"], builderManifestSha256: `sha256:${"a".repeat(64)}` }, builderAttemptId: "attempt-01", reviewerAttemptId: "attempt-02", approvedAt: "2026-09-19T00:00:00.000Z", reviewerManifestPath: "/reviewer.json", reviewerManifestSha256: `sha256:${"b".repeat(64)}`, worktreeSnapshot: { head: "2222222222222222222222222222222222222222", dirtyStateFingerprint: `sha256:${"c".repeat(64)}`, dirtyPaths: [], operationMarkers: [] }, verdict: "approved" }, attempts: [{ id: "attempt-01", role: "builder", state: "reported", preparedAt: "2026-09-19T00:00:00.000Z", actualModel: { model: "builder/primary", thinkingLevel: "high" }, specificationHash: `sha256:${"a".repeat(64)}`, baseRevision, assignmentPath: "/a", reportPath: "/r", evidenceDirectory: "/e", dispatch: { phase: "prompted", branch: "b", agentName: "builder", worktreePath: "/w", workspaceId: "ws", paneId: "p", terminalId: "t", assignmentSha256: `sha256:${"d".repeat(64)}`, promptedAt: "2026-09-19T00:00:00.000Z" }, evidence: { phase: "finalized", finalizedAt: "2026-09-19T00:00:01.000Z", status: "completed", reportSha256: `sha256:${"e".repeat(64)}`, manifestPath: "/m", manifestSha256: `sha256:${"f".repeat(64)}`, producedRevision: "2222222222222222222222222222222222222222" } }] });
 		const earlier = queueTask("task-01", "pending");
@@ -696,9 +744,23 @@ describe("registered multi-Task coordination", () => {
 		const dependencies = await makeCompletionDependencies(root, 2, effects, {}, { modelPlan: isolationModels, transientRetryLimit: 2, builderTransientFailures: 1 });
 		const inspectProcesses = dependencies.process.inspectAttemptProcesses!;
 		dependencies.process.inspectAttemptProcesses = async (input) => ({ ...(await inspectProcesses(input)), processCount: 1 });
-		const command = register(dependencies)();
+		let command = register(dependencies)();
 		await command("start", multiContext(root));
 		let journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[1]?.phase === "building");
+		const taskOrderBeforeTakeover = journal.run.tasks.map((task) => task.contract.id);
+		let takeoverKind: string | undefined;
+		dependencies.ui = { ...dependencies.ui, presentResumeResult(value) { takeoverKind = value.kind; } };
+		const replacementCommand = register(dependencies)();
+		await replacementCommand("resume --takeover", multiContext(root, "controller-b"));
+		expect(takeoverKind).toBe("taken-over");
+		const afterTakeover = await dependencies.runJournal.loadActive(root);
+		expect(afterTakeover.kind).toBe("loaded");
+		if (afterTakeover.kind !== "loaded") return;
+		expect(afterTakeover.journal.run.controllerSessionId).toBe("controller-b");
+		expect(afterTakeover.journal.run.tasks.map((task) => task.contract.id)).toEqual(taskOrderBeforeTakeover);
+		expect(countActiveTasks(afterTakeover.journal.run)).toBeLessThanOrEqual(2);
+		command = replacementCommand;
+		const ownerSession = "controller-b";
 		const taskAInitial = journal.run.tasks[0]!;
 		const initialAttempt = taskAInitial.attempts[0]!;
 		if (initialAttempt.role !== "builder" || (initialAttempt.dispatch.phase !== "prompted" && initialAttempt.dispatch.phase !== "reconciled-active")) throw new Error("Task A Builder identity missing");
@@ -717,8 +779,8 @@ describe("registered multi-Task coordination", () => {
 		dependencies.herdr.createRecoveryPane = async (input) => { replacementNames.add(input.agentName); return createRecoveryPane(input); };
 		const startReplacementAgent = dependencies.herdr.startReplacementAgent!;
 		dependencies.herdr.startReplacementAgent = async (input) => { replacementStarted.add(input.name); return startReplacementAgent(input); };
-		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.live !== undefined);
-		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[1]?.attempts[0]?.recovery?.live !== undefined);
+		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.live !== undefined, 30, ownerSession);
+		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[1]?.attempts[0]?.recovery?.live !== undefined, 30, ownerSession);
 		const taskBBefore = structuredClone(journal.run.tasks[1]);
 		journal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.effectiveSettings = { ...next.run.effectiveSettings, passiveInspectionIntervalSeconds: 1, secondInspectionAndNudgeIntervalSeconds: 1, nudgeGracePeriodSeconds: 1 }; });
 		expect((await dependencies.runJournal.replaceActive(root, journal)).kind).toBe("replaced");
@@ -737,27 +799,27 @@ describe("registered multi-Task coordination", () => {
 		});
 		expect((await dependencies.runJournal.replaceActive(root, journal)).kind).toBe("replaced");
 		effects.now = new Date(Date.parse(liveAt) + 1_000);
-		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.silence?.phase === "nudged");
+		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.silence?.phase === "nudged", 30, ownerSession);
 		expect(effects.nudges).toBe(1);
 		expect(journal.run.tasks[1]).toEqual(taskBBefore);
 		const nudgedAt = Date.parse(journal.run.tasks[0]!.attempts[0]!.recovery!.silence!.phaseAt);
 		effects.now = new Date(nudgedAt + 1_000);
-		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.silence?.phase === "interrupted");
+		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.silence?.phase === "interrupted", 30, ownerSession);
 		expect(effects.interrupts).toBe(1);
 		expect(journal.run.tasks[1]).toEqual(taskBBefore);
-		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.silence?.phase === "resumed");
+		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts[0]?.recovery?.silence?.phase === "resumed", 30, ownerSession);
 		expect(effects.resumes).toBe(1);
 		expect(journal.run.tasks[1]).toEqual(taskBBefore);
 		const resumedAt = Date.parse(journal.run.tasks[0]!.attempts[0]!.recovery!.silence!.phaseAt);
 		const activeBeforeReplacement = countActiveTasks(journal.run);
 		effects.now = new Date(resumedAt + 1_000);
-		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts.some((attempt) => attempt.replacement?.kind === "silent-agent-recovery") === true);
+		journal = await resumeUntil(root, command, (candidate) => candidate.run.tasks[0]?.attempts.some((attempt) => attempt.replacement?.kind === "silent-agent-recovery") === true, 30, ownerSession);
 		expect(journal.run.tasks[1]).toEqual(taskBBefore);
 		expect(countActiveTasks(journal.run)).toBeLessThanOrEqual(activeBeforeReplacement);
 		expect(effects.recoveryPanes ?? 0).toBe(0);
 		let transientFailureAttempt: AttemptRecord | undefined;
 		for (let index = 0; index < 8 && !(journal.run.tasks[0]?.attempts.some((attempt) => attempt.replacement?.kind === "transient-recovery" && attempt.replacement.retryOrdinal === 2)); index += 1) {
-			journal = await command("resume", multiContext(root)).then(async () => {
+			journal = await command("resume", multiContext(root, ownerSession)).then(async () => {
 				const loaded = await dependencies.runJournal.loadActive(root);
 				if (loaded.kind !== "loaded") throw new Error("Task-isolation Journal disappeared");
 				return loaded.journal;

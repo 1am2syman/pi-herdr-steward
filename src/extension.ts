@@ -246,22 +246,23 @@ export function registerStewardExtension(
 			}
 			const current = runtime;
 			if (!current) return;
+			const commandSteward = createSteward(adapterFactory(requestFromContext(ctx, exec)));
 			await current.monitor.runExclusive(async () => {
 				const controllerSessionId = ctx.sessionManager.getSessionId();
 				if (command === "status") {
-					await current.steward.status(ctx.cwd, "command", controllerSessionId);
+					await commandSteward.status(ctx.cwd, "command", controllerSessionId);
 					return;
 				}
 				if (command === "config") {
-					await current.steward.configure(ctx.cwd, proposalFromContext(ctx));
+					await commandSteward.configure(ctx.cwd, proposalFromContext(ctx));
 					return;
 				}
 				if (command === "start") {
-					await current.steward.start(ctx.cwd, controllerSessionId);
+					await commandSteward.start(ctx.cwd, controllerSessionId);
 					return;
 				}
 				if (command === "resume" || command === "resume --takeover") {
-					await current.steward.resume(ctx.cwd, controllerSessionId, command === "resume --takeover");
+					await commandSteward.resume(ctx.cwd, controllerSessionId, command === "resume --takeover");
 					return;
 				}
 			});

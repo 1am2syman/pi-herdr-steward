@@ -991,7 +991,7 @@ async function persistEvidenceRejection(repositoryRoot: string, journal: RunJour
 		nextAttempt.evidence = rejection;
 	});
 	const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate);
-	if (replaced.kind !== "replaced") return { kind: "rejected", journal, note: `Evidence rejected (${rejection.codes.join(", ")}); durable rejection write failed and original evidence was preserved.` };
+	if (replaced.kind !== "replaced") return { kind: "unaccepted", journal, note: `Evidence rejected (${rejection.codes.join(", ")}); durable rejection write failed and original evidence was preserved.` };
 	await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: replaced.journal.run.updatedAt, runId: replaced.journal.run.id, event: "builder-evidence-rejected", message: `Builder Attempt ${attempt.id} evidence rejected: ${rejection.codes.join(", ")}.` }).catch(() => undefined);
 	return { kind: "rejected", journal: replaced.journal, note: `Evidence rejected (${rejection.codes.join(", ")}); Review is blocked and original evidence is preserved.` };
 }
@@ -3230,6 +3230,7 @@ async function reconcileOneCurrentAttempt(repositoryRoot: string, controllerSess
 		if (candidate && candidate.task.contract.id === task.contract.id && candidate.attempt.id === attempt.id && journal.run.controllerSessionId === controllerSessionId) {
 			const evidence = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, journal, dependencies, candidate);
 			journal = evidence.journal;
+			if (evidence.kind === "unaccepted") return { kind: "degraded", journal, note: evidence.note, diagnostic: evidence.note };
 			if (evidence.kind === "finalized" || journal.run.tasks[index]?.attempts.find((item) => item.id === attempt.id)?.state === "reported") return { kind: "changed", journal, note: evidence.note || `Builder Attempt ${attempt.id} report was validated and finalized.`, action: "finalize-builder-evidence" };
 			const observed = dependencies.runJournal.inspectAttemptReport ? await dependencies.runJournal.inspectAttemptReport(repositoryRoot, reportPath).catch(() => ({ kind: "unavailable", diagnostic: "Attempt Report observation failed." } as AttemptReportInspection)) : { kind: "missing" as const };
 			reportState = observed.kind === "present" ? "invalid" : observed.kind === "unavailable" ? "unclear" : "missing";

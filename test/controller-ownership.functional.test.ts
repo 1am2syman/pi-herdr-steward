@@ -1,4 +1,4 @@
-import { mkdir, readFile, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -167,6 +167,28 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 	throw new Error("registered lifecycle checkpoint did not settle");
 }
 
+async function loadJournal(store: StewardDependencies["runJournal"], root: string): Promise<RunJournal> {
+	const loaded = await store.loadActive(root);
+	if (loaded.kind !== "loaded") throw new Error(`Expected an active Journal, got ${loaded.kind}.`);
+	return loaded.journal;
+}
+
+async function mutateActiveJournal(root: string, update: (journal: RunJournal) => void): Promise<RunJournal> {
+	const store = createRunJournalAdapter();
+	const current = await loadJournal(store, root);
+	const candidate = advanceRunJournal(current, new Date("2026-09-20T00:00:00.010Z"), update);
+	const replaced = await store.replaceActive(root, candidate);
+	if (replaced.kind !== "replaced") throw new Error(`Race fixture could not replace the active Journal: ${replaced.kind}.`);
+	return replaced.journal;
+}
+
+async function activityEvents(root: string): Promise<string[]> {
+	const paths = resolveRunJournalPaths(root);
+	const activityPath = join(paths.activityRoot, "run-20260920T000000000Z-owner", "activity.log");
+	const content = await readFile(activityPath, "utf8").catch(() => "");
+	return content.trim().length === 0 ? [] : content.trimEnd().split("\n").map((line) => (JSON.parse(line) as { event: string }).event);
+}
+
 it.sequential("registered foreign status and plain resume remain read-only before explicit takeover", async () => {
 	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-ownership-functional-"));
 	roots.push(root);
@@ -236,6 +258,298 @@ it.sequential("registered takeover reconciles before one CAS, records the lease,
 	const after = await bytes(root, seeded);
 	ok(after.active !== before.active);
 	ok(after.previous !== before.previous);
+});
+
+it.sequential.each([
+	"invalid journal",
+	"owner changed during inspection",
+	"revision changed during inspection",
+	"lease changed during inspection",
+	"rejected CAS",
+	"byte-race replaceActive",
+	"activity append failure after a winning CAS",
+] as const)("registered takeover refuses %s without a false success or workflow effect", async (caseName) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-ownership-stale-"));
+	roots.push(root);
+	const seeded = await seed(root, "controller-a");
+	const { deps, calls } = dependencies(root);
+	let result: import("../src/steward.ts").ResumeResult | undefined;
+	deps.ui = { ...deps.ui, presentResumeResult(value) { result = value; } };
+	const registered = capture();
+	registerStewardExtension(registered.surface, () => deps);
+	const b = context(root, "controller-b");
+
+	if (caseName === "invalid journal") {
+		await writeFile(resolveRunJournalPaths(root).activePath, "{ invalid journal\n", "utf8");
+		await registered.command()("resume --takeover", b);
+		equal(result?.kind, "invalid");
+		equal(calls.replace, 0);
+		equal(calls.activity, 0);
+		equal(calls.herdr + calls.git + calls.process + calls.model, 0);
+		return;
+	}
+
+	await seedPromptedAttempt(root, seeded);
+	if (caseName === "rejected CAS") {
+		deps.runJournal.replaceActive = async () => ({ kind: "invalid-current", paths: resolveRunJournalPaths(root), diagnostics: [] });
+	} else if (caseName === "byte-race replaceActive") {
+		const replace = deps.runJournal.replaceActive;
+		let raced = false;
+		deps.runJournal.replaceActive = async (...args) => {
+			if (!raced) {
+				raced = true;
+				await mutateActiveJournal(root, (next) => { next.run.declaredOutcome = "CAS byte race"; });
+			}
+			return replace(...args);
+		};
+	} else if (caseName === "activity append failure after a winning CAS") {
+		deps.runJournal.appendActivity = async () => {
+			calls.activity += 1;
+			calls.order.push("activity");
+			return { kind: "storage-error", path: join(resolveRunJournalPaths(root).activityRoot, seeded.run.id, "activity.log"), diagnostics: [] };
+		};
+	} else {
+		const report = deps.runJournal.inspectAttemptReport!;
+		let changed = false;
+		deps.runJournal.inspectAttemptReport = async (...args) => {
+			const observed = await report(...args);
+			if (!changed) {
+				changed = true;
+				await mutateActiveJournal(root, (next) => {
+					if (caseName === "owner changed during inspection") {
+						next.run.controllerSessionId = "controller-z";
+						if (next.run.controllerLease) next.run.controllerLease = { ...next.run.controllerLease, sessionId: "controller-z", leaseId: "lease-controller-z" };
+					} else if (caseName === "revision changed during inspection") {
+						next.run.declaredOutcome = "revision changed during inspection";
+					} else if (caseName === "lease changed during inspection" && next.run.controllerLease) {
+						next.run.controllerLease = { ...next.run.controllerLease, leaseId: "lease-controller-a-changed" };
+					}
+				});
+			}
+			return observed;
+		};
+	}
+
+	await registered.command()("resume --takeover", b);
+	if (caseName === "activity append failure after a winning CAS") {
+		equal(result?.kind, "taken-over");
+		if (result?.kind === "taken-over") ok(result.message.includes("Activity logging is degraded"));
+		const after = await loadJournal(deps.runJournal, root);
+		equal(after.run.controllerSessionId, "controller-b");
+		equal(after.journalRevision, 3);
+		equal(calls.replace, 1);
+		equal(calls.activity, 1);
+		equal((await activityEvents(root)).filter((event) => event === "controller-taken-over").length, 0);
+	} else if (caseName === "rejected CAS") {
+		equal(result?.kind, "stale");
+		const after = await loadJournal(deps.runJournal, root);
+		equal(after.run.controllerSessionId, "controller-a");
+		equal(after.journalRevision, 2);
+		equal(calls.replace, 0);
+		equal(calls.activity, 0);
+	} else if (caseName === "byte-race replaceActive") {
+		equal(result?.kind, "stale");
+		const after = await loadJournal(deps.runJournal, root);
+		equal(after.run.controllerSessionId, "controller-a");
+		equal(after.journalRevision, 3);
+		equal(calls.replace, 1);
+		equal(calls.activity, 0);
+	} else {
+		equal(result?.kind, "stale");
+		const after = await loadJournal(deps.runJournal, root);
+		equal(after.run.controllerSessionId, caseName === "owner changed during inspection" ? "controller-z" : "controller-a");
+		equal(after.journalRevision, 3);
+		equal(calls.replace, 0);
+		equal(calls.activity, 0);
+	}
+	equal(calls.herdr + calls.git + calls.process + calls.model, 0);
+});
+
+it.sequential("registered stale old-owner pass loses after takeover without a post-CAS effect", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-ownership-old-owner-"));
+	roots.push(root);
+	const seeded = await seed(root, "controller-a");
+	await seedPromptedAttempt(root, seeded);
+	const ownerA = dependencies(root);
+	const contenderB = dependencies(root);
+	let oldOwnerResult: import("../src/steward.ts").ResumeResult | undefined;
+	let contenderResult: import("../src/steward.ts").ResumeResult | undefined;
+	ownerA.deps.ui = { ...ownerA.deps.ui, presentResumeResult(value) { oldOwnerResult = value; } };
+	contenderB.deps.ui = { ...contenderB.deps.ui, presentResumeResult(value) { contenderResult = value; } };
+	let releaseOldOwner!: () => void;
+	let reportOldOwnerReached!: () => void;
+	const oldOwnerReached = new Promise<void>((resolve) => { reportOldOwnerReached = resolve; });
+	const oldOwnerRelease = new Promise<void>((resolve) => { releaseOldOwner = resolve; });
+	const originalReplace = ownerA.deps.runJournal.replaceActive;
+	let paused = false;
+	ownerA.deps.runJournal.replaceActive = async (...args) => {
+		if (!paused) {
+			paused = true;
+			reportOldOwnerReached();
+			await oldOwnerRelease;
+		}
+		return originalReplace(...args);
+	};
+	const registeredA = capture();
+	const registeredB = capture();
+	registerStewardExtension(registeredA.surface, () => ownerA.deps);
+	registerStewardExtension(registeredB.surface, () => contenderB.deps);
+	const oldOwnerPass = registeredA.command()("resume", context(root, "controller-a"));
+	await oldOwnerReached;
+	await registeredB.command()("resume --takeover", context(root, "controller-b"));
+	equal(contenderResult?.kind, "taken-over");
+	releaseOldOwner();
+	await oldOwnerPass;
+	equal(oldOwnerResult?.kind, "degraded");
+	const winner = await loadJournal(contenderB.deps.runJournal, root);
+	equal(winner.run.controllerSessionId, "controller-b");
+	equal(winner.journalRevision, 3);
+	equal(ownerA.calls.replace, 1, JSON.stringify(ownerA.calls.order));
+	equal(ownerA.calls.activity, 0);
+	equal(ownerA.calls.herdr + ownerA.calls.git + ownerA.calls.process + ownerA.calls.model, 0);
+	equal(contenderB.calls.replace, 1);
+	equal(contenderB.calls.activity, 1);
+	equal((await activityEvents(root)).filter((event) => event === "controller-taken-over").length, 1);
+});
+
+it.sequential("registered concurrent takeovers elect one revision-N+1 owner and one monitor", async () => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-ownership-concurrent-"));
+	roots.push(root);
+	const seeded = await seed(root, "controller-a");
+	await seedPromptedAttempt(root, seeded);
+	const contenderB = dependencies(root);
+	const contenderC = dependencies(root);
+	const depsB = contenderB.deps;
+	const depsC = contenderC.deps;
+	let inspections = 0;
+	let releaseInspections!: () => void;
+	let reportBothInspected!: () => void;
+	const bothInspected = new Promise<void>((resolve) => { reportBothInspected = resolve; });
+	const release = new Promise<void>((resolve) => { releaseInspections = resolve; });
+	const inspectReportB = depsB.runJournal.inspectAttemptReport!;
+	const inspectReportC = depsC.runJournal.inspectAttemptReport!;
+	const inspectDuringTakeover = async (inspect: typeof inspectReportB, ...args: Parameters<typeof inspectReportB>) => {
+		const observed = await inspect(...args);
+		inspections += 1;
+		if (inspections === 2) reportBothInspected();
+		await release;
+		return observed;
+	};
+	depsB.runJournal.inspectAttemptReport = (...args) => inspectDuringTakeover(inspectReportB, ...args);
+	depsC.runJournal.inspectAttemptReport = (...args) => inspectDuringTakeover(inspectReportC, ...args);
+	const casResults: string[] = [];
+	let replaceCalls = 0;
+	let releaseSecondReplace!: () => void;
+	const firstReplaceDone = new Promise<void>((resolve) => { releaseSecondReplace = resolve; });
+	const gateReplace = async (replace: typeof depsB.runJournal.replaceActive, ...args: Parameters<typeof depsB.runJournal.replaceActive>) => {
+		const call = replaceCalls;
+		replaceCalls += 1;
+		if (call === 1) await firstReplaceDone;
+		const outcome = await replace(...args);
+		casResults.push(outcome.kind);
+		if (call === 0) releaseSecondReplace();
+		return outcome;
+	};
+	const replaceB = depsB.runJournal.replaceActive;
+	const replaceC = depsC.runJournal.replaceActive;
+	depsB.runJournal.replaceActive = (...args) => gateReplace(replaceB, ...args);
+	depsC.runJournal.replaceActive = (...args) => gateReplace(replaceC, ...args);
+	let waitCalls = 0;
+	const configureMonitorAdapters = (deps: StewardDependencies): void => {
+		deps.herdr.inspectManagedAgent = async (identity) => ({ kind: "observed", identity, lifecycle: "working", stateChangeSequence: 1 });
+		deps.herdr.waitForManagedAgent = async (_identity, _timeoutMs, signal) => await new Promise((resolve) => {
+		waitCalls += 1;
+		signal.addEventListener("abort", () => resolve({ kind: "cancelled" }), { once: true });
+		});
+	};
+	configureMonitorAdapters(depsB);
+	configureMonitorAdapters(depsC);
+	let winnerResult: import("../src/steward.ts").ResumeResult | undefined;
+	let loserResult: import("../src/steward.ts").ResumeResult | undefined;
+	const winnerSurface = capture();
+	const loserSurface = capture();
+	depsB.ui = { ...depsB.ui, presentResumeResult(value) { winnerResult = value; } };
+	depsC.ui = { ...depsC.ui, presentResumeResult(value) { loserResult = value; } };
+	registerStewardExtension(winnerSurface.surface, () => depsB);
+	registerStewardExtension(loserSurface.surface, () => depsC);
+	const b = context(root, "controller-b");
+	const c = context(root, "controller-c");
+	await winnerSurface.event("session_start")({ type: "session_start", reason: "replacement" }, b);
+	await loserSurface.event("session_start")({ type: "session_start", reason: "replacement" }, c);
+	const winnerPass = winnerSurface.command()("resume --takeover", b);
+	const loserPass = loserSurface.command()("resume --takeover", c);
+	await bothInspected;
+	releaseInspections();
+	await Promise.all([winnerPass, loserPass]);
+	ok(winnerResult?.kind === "taken-over" || loserResult?.kind === "taken-over", JSON.stringify({ winnerResult, loserResult, casResults, contenderB: contenderB.calls, contenderC: contenderC.calls }));
+	ok(winnerResult?.kind === "taken-over" ? loserResult?.kind === "stale" : false, JSON.stringify({ winnerResult, loserResult, casResults, contenderB: contenderB.calls, contenderC: contenderC.calls }));
+	const winnerSession = winnerResult?.kind === "taken-over" ? "controller-b" : "controller-c";
+	const current = await loadJournal(depsB.runJournal, root);
+	equal(current.journalRevision, 3);
+	equal(current.run.controllerSessionId, winnerSession);
+	equal(current.run.controllerLease?.takeover?.basisJournalRevision, 2);
+	equal((await activityEvents(root)).filter((event) => event === "controller-taken-over").length, 1);
+	equal(casResults.filter((kind) => kind === "replaced").length, 1);
+	await waitFor(() => waitCalls === 1);
+	await winnerSurface.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, b);
+	await loserSurface.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, c);
+});
+
+it.sequential.each([
+	"foreign",
+	"invalid",
+	"completed",
+	"stale revision between continuity loads",
+	"post-shutdown",
+] as const)("registered %s compaction continuity stays fail-closed and leaves Pi compaction available", async (caseName) => {
+	const root = await mkdtemp(join(tmpdir(), "pi-herdr-steward-ownership-compaction-state-"));
+	roots.push(root);
+	const seeded = await seed(root, "controller-owner");
+	const { deps } = dependencies(root);
+	const registered = capture();
+	let hostCalls = 0;
+	registerStewardExtension(registered.surface, () => deps, undefined, async () => {
+		hostCalls += 1;
+		return { summary: "unexpected custom compaction", firstKeptEntryId: "entry-1", tokensBefore: 1, usage: { input: 1, output: 1, totalTokens: 2 } as never, details: {} } as unknown as CompactionResult;
+	});
+	const owner = context(root, "controller-owner");
+	const foreign = context(root, "controller-foreign");
+	const session = caseName === "foreign" ? foreign : owner;
+	if (caseName === "invalid" || caseName === "completed") {
+		const path = resolveRunJournalPaths(root).activePath;
+		const raw = JSON.parse(await readFile(path, "utf8")) as Record<string, unknown>;
+		const run = raw.run as Record<string, unknown>;
+		if (caseName === "invalid") raw.run = { ...run, declaredOutcome: "invalid fixture", unexpected: true };
+		else raw.run = { ...run, status: "completed" };
+		await writeFile(path, `${JSON.stringify(raw, null, 2)}\n`, "utf8");
+	}
+	if (caseName === "stale revision between continuity loads") {
+		await registered.event("session_start")({ type: "session_start", reason: "test" }, owner);
+		await registered.event("session_shutdown")({ type: "session_shutdown", reason: "reload" }, owner);
+		await registered.command()("status", owner);
+	} else if (caseName !== "post-shutdown") await registered.event("session_start")({ type: "session_start", reason: "test" }, session);
+	if (caseName === "stale revision between continuity loads") {
+		const originalLoad = deps.runJournal.loadActive;
+		let eventLoad = 0;
+		deps.runJournal.loadActive = async (...args) => {
+			const loaded = await originalLoad(...args);
+			eventLoad += 1;
+			if (eventLoad === 1) await mutateActiveJournal(root, (next) => { next.run.declaredOutcome = "continuity race"; });
+			return loaded;
+		};
+	}
+	if (caseName === "post-shutdown") {
+		await registered.event("session_start")({ type: "session_start", reason: "test" }, owner);
+		await registered.event("session_shutdown")({ type: "session_shutdown", reason: "reload" }, owner);
+	}
+	const before = await bytes(root, seeded);
+	const result = await registered.event("session_before_compact")({ type: "session_before_compact", preparation: { branchEntries: [] }, branchEntries: [], customInstructions: "keep default compaction", reason: "manual", willRetry: false, signal: new AbortController().signal }, session);
+	equal(result, undefined);
+	equal(hostCalls, 0);
+	const after = await bytes(root, seeded);
+	equal(after.activity, before.activity);
+	if (caseName !== "stale revision between continuity loads") deepStrictEqual(after, before);
+	if (caseName !== "post-shutdown") await registered.event("session_shutdown")({ type: "session_shutdown", reason: "quit" }, session);
 });
 
 it.sequential("successful and failed registered compaction hooks preserve continuity and failure-only diagnostics", async () => {

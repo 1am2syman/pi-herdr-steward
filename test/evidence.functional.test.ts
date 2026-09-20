@@ -260,7 +260,7 @@ it.sequential("footer and non-controller status stay read-only", async () => {
 	const before = (await dependencies.runJournal.loadActive(root));
 	if (before.kind !== "loaded") throw new Error("Journal missing");
 	const view = await invokeStatus(root, dependencies, "another-session");
-	match(view.markdown, /Controller Session does not match/);
+	match(view.markdown, /Controller Session controller-session is recorded; current Session another-session is read-only\. Run \/steward resume --takeover to reconcile and claim ownership\./);
 	const after = await dependencies.runJournal.loadActive(root);
 	if (after.kind !== "loaded") throw new Error("Journal missing after authority check");
 	equal(after.journal.journalRevision, before.journal.journalRevision);
