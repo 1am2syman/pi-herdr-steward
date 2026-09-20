@@ -31,7 +31,15 @@ export type TaskAdmissionDecision =
 	| { kind: "blocked-by-overlap"; taskId: string; blockedBy: string[] }
 	| { kind: "admit"; taskId: string; index: number; baseRevision: string };
 
-function currentIntegrationHead(run: Pick<RunRecord, "integrationBase" | "tasks">): string | undefined {
+function latestRevisionDelta(run: Pick<RunRecord, "tasks" | "revisions">, taskId: string) {
+	for (let index = (run.revisions?.length ?? 0) - 1; index >= 0; index -= 1) {
+		const delta = run.revisions?.[index]?.taskDeltas.find((candidate) => candidate.taskId === taskId);
+		if (delta) return delta;
+	}
+	return undefined;
+}
+
+function currentIntegrationHead(run: Pick<RunRecord, "integrationBase" | "tasks" | "revisions">): string | undefined {
 	if (run.integrationBase.kind !== "git") return undefined;
 	let head = run.integrationBase.revision;
 	for (const task of run.tasks) {
@@ -43,6 +51,11 @@ function currentIntegrationHead(run: Pick<RunRecord, "integrationBase" | "tasks"
 		const preserved = task.finalVerificationReworks?.at(-1)?.priorIntegration;
 		if (preserved?.phase === "integrated") {
 			head = preserved.observedHead;
+			continue;
+		}
+		const revised = latestRevisionDelta(run, task.contract.id)?.priorIntegration;
+		if (revised?.phase === "integrated") {
+			head = revised.observedHead;
 			continue;
 		}
 		break;
@@ -102,7 +115,7 @@ export type IntegrationQueueDecision =
 	  };
 
 /** Returns the first non-integrated code Task in immutable Run array order. */
-export function selectIntegrationQueueHead(run: Pick<RunRecord, "tasks" | "integrationBase">): IntegrationQueueDecision {
+export function selectIntegrationQueueHead(run: Pick<RunRecord, "tasks" | "integrationBase" | "revisions">): IntegrationQueueDecision {
 	if (run.integrationBase.kind !== "git") return { kind: "none", reason: "no-code-task" };
 	const codeTasks = run.tasks.flatMap((task, index) => (isCodeTask(task) ? [{ task, index }] : []));
 	if (codeTasks.length === 0) return { kind: "none", reason: "no-code-task" };
@@ -124,7 +137,9 @@ export function selectIntegrationQueueHead(run: Pick<RunRecord, "tasks" | "integ
 		if (!builder || builder.evidence?.phase !== "finalized" || builder.evidence.producedRevision !== subject.headRevision) return { kind: "waiting", taskId: task.contract.id, index: entry.index, reason: "source" };
 		const recoveryHead = task.integrationRecoveries?.at(-1)?.observed.head;
 		const verificationReworkHead = task.finalVerificationReworks?.at(-1)?.priorIntegration.observedHead;
-		const targetRevision = recoveryHead ?? verificationReworkHead ?? previousHead;
+		const latestRevision = latestRevisionDelta(run, task.contract.id);
+		const revisionHead = latestRevision?.priorIntegration?.phase === "integrated" ? latestRevision.priorIntegration.observedHead : undefined;
+		const targetRevision = recoveryHead ?? verificationReworkHead ?? revisionHead ?? previousHead;
 		return {
 			kind: "ready",
 			taskId: task.contract.id,
@@ -163,6 +178,6 @@ export function allRequiredTasksIntegrated(run: Pick<RunRecord, "tasks" | "integ
 	return run.tasks.every((task) => !isCodeTask(task) ? task.phase === "completed" : task.integration?.phase === "integrated");
 }
 
-export function currentIntegratedHead(run: Pick<RunRecord, "tasks" | "integrationBase">): string | undefined {
+export function currentIntegratedHead(run: Pick<RunRecord, "tasks" | "integrationBase" | "revisions">): string | undefined {
 	return currentIntegrationHead(run);
 }

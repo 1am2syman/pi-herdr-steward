@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { createRunJournalAdapter } from "../src/adapters.ts";
-import { buildInitialRunJournal, deserializeRunJournal, evaluateCompletionGate, serializeRunJournal, validateRunJournal, type BuilderAttemptRecord, type ReviewWorktreeSnapshot, type ReviewerAttemptRecord, type RunDraft, type RunJournal, type TaskRecord } from "../src/run.ts";
+import { buildInitialRunJournal, deserializeRunJournal, evaluateCompletionGate, serializeRunJournal, specificationHash, validateRunJournal, type BuilderAttemptRecord, type ReviewWorktreeSnapshot, type ReviewerAttemptRecord, type RunDraft, type RunJournal, type TaskRecord } from "../src/run.ts";
 import { validateRecoveryDefaults, type ProjectModelPlans, type RecoveryDefaults } from "../src/config.ts";
 import type { ReviewSubject } from "../src/review.ts";
 
@@ -160,5 +160,42 @@ describe("ticket-13 schema and storage boundaries", () => {
 		delete first.integration;
 		first.phase = "approved";
 		expect(deserializeRunJournal(JSON.stringify(bypass)).value).toBeUndefined();
+	});
+
+	it("accepts one additive schema-v1 revision and rejects broken history without normalization", async () => {
+		const initial = journal();
+		const before = initial.run.tasks[0]!;
+		const afterContract = { ...before.contract, requiredOutcome: "Revised evidence outcome" };
+		const after = { ...before, specificationVersion: 2, specificationHash: specificationHash(afterContract), contract: afterContract };
+		const revision = {
+			revision: 2,
+			confirmedAt: "2026-09-19T00:00:01.000Z",
+			controllerSessionId: initial.run.controllerSessionId,
+			basisJournalRevision: 1,
+			taskDeltas: [{ taskId: before.contract.id, before: { specificationVersion: 1, specificationHash: before.specificationHash, contract: before.contract }, after: { specificationVersion: 2, specificationHash: after.specificationHash, contract: after.contract }, priorReworkCycles: 0, cancelledAttemptIds: [], invalidatedReviewerAttempts: [] }],
+		};
+		const candidate = { ...initial, journalRevision: 2, run: { ...initial.run, updatedAt: "2026-09-19T00:00:01.000Z", tasks: [after], revisions: [revision] } };
+		const validated = validateRunJournal(candidate);
+		expect(validated.value).toBeDefined();
+		const root = await mkdtemp(join(tmpdir(), "pi-herdr-revision-storage-"));
+		roots.push(root);
+		const store = createRunJournalAdapter();
+		expect((await store.createActive(root, initial)).kind).toBe("created");
+		expect((await store.replaceActive(root, candidate)).kind).toBe("replaced");
+		const bytes = await readFile(join(root, ".pi", "steward", "active-run.json"), "utf8");
+		expect(deserializeRunJournal(bytes).value?.run.revisions?.[0]?.revision).toBe(2);
+
+		const wrongHash = JSON.parse(bytes) as { run: { revisions: Array<{ taskDeltas: Array<{ after: { specificationHash: string } }> }>} };
+		wrongHash.run.revisions[0]!.taskDeltas[0]!.after.specificationHash = `sha256:${"f".repeat(64)}`;
+		expect(deserializeRunJournal(JSON.stringify(wrongHash)).value).toBeUndefined();
+		const unknownKey = JSON.parse(bytes) as { run: { revisions: Array<Record<string, unknown>> } };
+		unknownKey.run.revisions[0]!.unexpected = true;
+		expect(deserializeRunJournal(JSON.stringify(unknownKey)).value).toBeUndefined();
+		const foreignAttempt = JSON.parse(bytes) as { run: { revisions: Array<{ taskDeltas: Array<{ cancelledAttemptIds: string[] }> }> } };
+		foreignAttempt.run.revisions[0]!.taskDeltas[0]!.cancelledAttemptIds = ["attempt-99"];
+		expect(deserializeRunJournal(JSON.stringify(foreignAttempt)).value).toBeUndefined();
+		const currentOld = JSON.parse(bytes) as { run: { tasks: Array<{ specificationVersion: number }> } };
+		currentOld.run.tasks[0]!.specificationVersion = 1;
+		expect(deserializeRunJournal(JSON.stringify(currentOld)).value).toBeUndefined();
 	});
 });

@@ -45,6 +45,7 @@
     "test:start": "vitest run test/start.functional.test.ts",
     "test:storage": "vitest run test/run-journal.storage.test.ts",
     "test:coordination": "vitest run test/coordination-policy.contract.test.ts test/coordination.functional.test.ts test/multi-task-storage.contract.test.ts --maxWorkers=1",
+    "test:revise": "vitest run test/revise.functional.test.ts --maxWorkers=1",
     "test:config": "vitest run test/config.functional.test.ts",
     "test": "vitest run --maxWorkers=1"
   }

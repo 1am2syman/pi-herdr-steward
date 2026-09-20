@@ -77,4 +77,13 @@ describe("ticket-13 pure coordination policy", () => {
 		expect(orderedIntegratedHeadChain(run([first, third]))).toHaveLength(1);
 		expect(currentIntegratedHead(run([first, third]))).toBe(sha("1"));
 	});
+
+	it("uses a revised Task's preserved integrated head as the next admission base", () => {
+		const first = task("task-01", "src/a", "completed", { integration: { phase: "integrated", targetBranch: "main", targetRevision: sha("0"), approvedBaseRevision: sha("0"), approvedHeadRevision: sha("1"), approvedCommits: [sha("1")], builderAttemptId: "attempt-01", reviewerAttemptId: "attempt-02", builderManifestSha256: `sha256:${"b".repeat(64)}`, reviewerManifestSha256: `sha256:${"c".repeat(64)}`, action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", sha("1")] }, intendedAt: "2026-09-19T00:00:00.000Z", integratedAt: "2026-09-19T00:00:01.000Z", observedHead: sha("1") } });
+		const revised = task("task-02", "src/b", "pending", { specificationVersion: 2 });
+		const runWithRevision = run([first, revised]);
+		runWithRevision.revisions = [{ revision: 2, confirmedAt: "2026-09-19T00:00:02.000Z", controllerSessionId: "controller", basisJournalRevision: 1, taskDeltas: [{ taskId: "task-02", before: { specificationVersion: 1, specificationHash: `sha256:${"a".repeat(64)}`, contract: { ...revised.contract, id: "task-02" } }, after: { specificationVersion: 2, specificationHash: revised.specificationHash, contract: revised.contract }, priorReworkCycles: 0, cancelledAttemptIds: [], invalidatedReviewerAttempts: [], priorIntegration: { phase: "integrated", targetBranch: "main", targetRevision: sha("1"), approvedBaseRevision: sha("0"), approvedHeadRevision: sha("2"), approvedCommits: [sha("2")], builderAttemptId: "attempt-01", reviewerAttemptId: "attempt-02", builderManifestSha256: `sha256:${"d".repeat(64)}`, reviewerManifestSha256: `sha256:${"e".repeat(64)}`, action: { kind: "merge-commit", argv: ["merge", "--no-ff", "--no-edit", sha("2")] }, intendedAt: "2026-09-19T00:00:03.000Z", integratedAt: "2026-09-19T00:00:04.000Z", observedHead: sha("2") } }] }];
+		expect(currentIntegratedHead(runWithRevision)).toBe(sha("2"));
+		expect(selectTaskAdmission(runWithRevision)).toMatchObject({ kind: "admit", taskId: "task-02", baseRevision: sha("2") });
+	});
 });

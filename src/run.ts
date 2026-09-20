@@ -50,7 +50,8 @@ export type TaskAttentionReason =
 	| "transient-infrastructure-recovery"
 	| "transient-stop-ambiguous"
 	| "transient-fallback-unavailable"
-	| "transient-retries-exhausted";
+	| "transient-retries-exhausted"
+	| "revision-stop-ambiguous";
 
 export type Verification =
 	| { kind: "command"; command: string }
@@ -438,6 +439,18 @@ export type RecoveryStop =
 	| { phase: "acknowledged"; intendedAt: string; acknowledgedAt: string; agent: RecoveryAgentIdentity }
 	| { phase: "ambiguous"; intendedAt: string; observedAt: string; agent: RecoveryAgentIdentity; diagnostic: string };
 
+export interface RevisionAttemptCancellation {
+	reason: "task-specification-revised";
+	cancelledAt: string;
+	previousState: "prepared" | "active" | "awaiting-report";
+	oldSpecificationVersion: number;
+	oldSpecificationHash: string;
+	replacementSpecificationVersion: number;
+	replacementSpecificationHash: string;
+	owningRunRevision: number;
+	stop: RecoveryStop;
+}
+
 export interface InfrastructureOutcome {
 	kind: TransientInfrastructureKind;
 	stage: TransientInfrastructureStage;
@@ -491,10 +504,11 @@ export interface AttemptRecovery {
 export interface BuilderAttemptRecord {
 	id: string;
 	role: "builder";
-	state: "prepared" | "active" | "awaiting-report" | "reported" | "ended-error" | "superseded";
+	state: "prepared" | "active" | "awaiting-report" | "reported" | "ended-error" | "superseded" | "cancelled";
 	preparedAt: string;
 	activatedAt?: string;
 	actualModel: ModelChoice;
+	specificationVersion?: number;
 	specificationHash: string;
 	baseRevision: string;
 	assignmentPath: string;
@@ -504,6 +518,7 @@ export interface BuilderAttemptRecord {
 	replacement?: AttemptReplacement;
 	recovery?: AttemptRecovery;
 	evidence?: BuilderEvidenceRecord;
+	revisionCancellation?: RevisionAttemptCancellation;
 }
 
 export interface ReviewWorktreeSnapshot {
@@ -527,10 +542,11 @@ export type ReviewerReportRepair =
 export interface ReviewerAttemptRecord {
 	id: string;
 	role: "reviewer";
-	state: "prepared" | "active" | "awaiting-report" | "reported" | "ended-error" | "superseded";
+	state: "prepared" | "active" | "awaiting-report" | "reported" | "ended-error" | "superseded" | "cancelled";
 	preparedAt: string;
 	activatedAt?: string;
 	actualModel: ModelChoice;
+	specificationVersion?: number;
 	specificationHash: string;
 	assignmentPath: string;
 	reportPath: string;
@@ -544,6 +560,7 @@ export interface ReviewerAttemptRecord {
 	reportRepair?: ReviewerReportRepair;
 	integrity?: { kind: "preserved"; after: ReviewWorktreeSnapshot } | { kind: "violated"; detectedAt: string; before: ReviewWorktreeSnapshot; after: ReviewWorktreeSnapshot; code: "reviewer-modified-worktree" };
 	evidence?: ReviewerEvidenceRecord;
+	revisionCancellation?: RevisionAttemptCancellation;
 }
 
 export type AttemptRecord = BuilderAttemptRecord | ReviewerAttemptRecord;
@@ -699,7 +716,7 @@ export interface FinalVerificationReworkRecord {
 }
 
 export interface TaskRecord {
-	specificationVersion: 1;
+	specificationVersion: number;
 	specificationHash: string;
 	contract: TaskContract;
 	phase: TaskPhase;
@@ -737,7 +754,7 @@ export type TaskApproval =
 			worktreeSnapshot: ReviewWorktreeSnapshot;
 			verdict: "approved";
 			invalidatedAt: string;
-			reason: "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced" | "final-verification-failed";
+			reason: "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced" | "final-verification-failed" | "task-specification-revised";
 			diagnostic: string;
 			observedSnapshot?: ReviewWorktreeSnapshot;
 	  };
@@ -924,6 +941,52 @@ export type FinalVerificationExecution =
 			resultSha256?: string;
 			checkout?: IntegrationCheckoutObservation;
 	  };
+
+export interface RevisionTaskSpecification {
+	specificationVersion: number;
+	specificationHash: string;
+	contract: TaskContract;
+}
+
+export interface RevisionInvalidatedReviewer {
+	attemptId: string;
+	manifestPath: string;
+	manifestSha256: string;
+}
+
+export interface RunRevisionTaskDelta {
+	taskId: string;
+	before: RevisionTaskSpecification;
+	after: RevisionTaskSpecification;
+	priorReworkCycles: number;
+	cancelledAttemptIds: string[];
+	invalidatedReviewerAttempts: RevisionInvalidatedReviewer[];
+	priorApproval?: TaskApproval;
+	priorIntegration?: TaskIntegration;
+	priorIntegrationRecoveries?: IntegrationReworkRecord[];
+	priorFinalVerificationReworks?: FinalVerificationReworkRecord[];
+}
+
+export interface RunRevisionModelPlanDelta {
+	before: ProjectModelPlans;
+	after: ProjectModelPlans;
+}
+
+export interface RunRevisionFinalVerification {
+	execution: FinalVerificationExecution;
+	invalidatedAt: string;
+	reason: "task-specification-revised";
+}
+
+export interface RunRevisionRecord {
+	revision: number;
+	confirmedAt: string;
+	controllerSessionId: string;
+	basisJournalRevision: number;
+	taskDeltas: RunRevisionTaskDelta[];
+	modelPlanDelta?: RunRevisionModelPlanDelta;
+	invalidatedFinalVerification?: RunRevisionFinalVerification;
+}
 
 export const COMPLETION_GATE_PREDICATES = [
 	"one-task-exact-specification",
@@ -1190,6 +1253,7 @@ export interface RunRecord {
 	modelPlan: ProjectModelPlans;
 	effectiveSettings: RecoveryDefaults;
 	finalVerification: Verification;
+	revisions?: RunRevisionRecord[];
 	finalVerificationExecution?: FinalVerificationExecution;
 	completion?: CompletionRecord;
 	monitor?: MonitorCheckpoint;
@@ -1197,6 +1261,7 @@ export interface RunRecord {
 }
 
 export type ControllerPendingAction =
+	| { kind: "revision-stop"; taskId: string; attemptId: string; role: "builder" | "reviewer" }
 	| { kind: "reconcile-attempt"; taskId: string; attemptId: string; role: "builder" | "reviewer" }
 	| { kind: "validate-builder-evidence"; taskId: string; attemptId: string; role: "builder" }
 	| { kind: "validate-approval"; taskId: string; attemptId: string; role: "reviewer" }
@@ -1263,6 +1328,35 @@ export interface RunDraftInput {
 }
 
 export type RunDraftResult = { kind: "cancelled" } | { kind: "drafted"; draft: RunDraft };
+
+export interface RunRevisionDraftTask {
+	id: string;
+	contract: TaskContract;
+}
+
+export interface RunRevisionDraft {
+	tasks: RunRevisionDraftTask[];
+	modelPlan: ProjectModelPlans;
+}
+
+export interface RunRevisionDraftInput {
+	runId: string;
+	tasks: RunRevisionDraftTask[];
+	modelPlan: ProjectModelPlans;
+	modelChoices: readonly { reference: string; name: string }[];
+	activeJournalPath: string;
+	activityLogPath: string;
+}
+
+export type RunRevisionDraftResult = { kind: "cancelled" } | { kind: "drafted"; draft: RunRevisionDraft };
+
+export interface RunRevisionConfirmationSummary {
+	runId: string;
+	basisJournalRevision: number;
+	tasks: RunRevisionTaskDelta[];
+	modelPlanDelta?: RunRevisionModelPlanDelta;
+	markdown: string;
+}
 
 export interface RunConfirmationTask {
 	number: number;
@@ -1485,6 +1579,13 @@ function validateRecoveryStop(value: unknown, path: string): { value?: import(".
 	if (value.phase === "acknowledged" && exactKeys(value, ["phase", "intendedAt", "acknowledgedAt", "agent"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.acknowledgedAt) && value.acknowledgedAt >= value.intendedAt && agent.value) return { value: { phase: value.phase, intendedAt: value.intendedAt, acknowledgedAt: value.acknowledgedAt, agent: agent.value }, diagnostics: [] };
 	if (value.phase === "ambiguous" && exactKeys(value, ["phase", "intendedAt", "observedAt", "agent", "diagnostic"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.observedAt) && value.observedAt >= value.intendedAt && boundedText(value.diagnostic, 2_000) && agent.value) return { value: { phase: value.phase, intendedAt: value.intendedAt, observedAt: value.observedAt, agent: agent.value, diagnostic: value.diagnostic }, diagnostics: [] };
 	return { diagnostics: [diagnostic("invalid-task", "Infrastructure stop record has invalid exact identity or timestamps.", path)] };
+}
+
+function validateRevisionAttemptCancellation(value: unknown, path: string): { value?: RevisionAttemptCancellation; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["reason", "cancelledAt", "previousState", "oldSpecificationVersion", "oldSpecificationHash", "replacementSpecificationVersion", "replacementSpecificationHash", "owningRunRevision", "stop"]) || value.reason !== "task-specification-revised" || !canonicalTimestamp(value.cancelledAt) || !["prepared", "active", "awaiting-report"].includes(value.previousState as string) || !Number.isSafeInteger(value.oldSpecificationVersion) || (value.oldSpecificationVersion as number) < 1 || !Number.isSafeInteger(value.replacementSpecificationVersion) || (value.replacementSpecificationVersion as number) !== (value.oldSpecificationVersion as number) + 1 || !Number.isSafeInteger(value.owningRunRevision) || (value.owningRunRevision as number) < 2 || typeof value.oldSpecificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.oldSpecificationHash) || typeof value.replacementSpecificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.replacementSpecificationHash)) return { diagnostics: [diagnostic("invalid-task", "Revision cancellation has invalid exact lifecycle, version, or hash fields.", path)] };
+	const stop = validateRecoveryStop(value.stop, `${path}.stop`);
+	if (!stop.value) return { diagnostics: stop.diagnostics };
+	return { value: { reason: "task-specification-revised", cancelledAt: value.cancelledAt as string, previousState: value.previousState as RevisionAttemptCancellation["previousState"], oldSpecificationVersion: value.oldSpecificationVersion as number, oldSpecificationHash: value.oldSpecificationHash as string, replacementSpecificationVersion: value.replacementSpecificationVersion as number, replacementSpecificationHash: value.replacementSpecificationHash as string, owningRunRevision: value.owningRunRevision as number, stop: stop.value }, diagnostics: [] };
 }
 
 function validateInfrastructureOutcome(value: unknown, path: string, preparedAt: string): { value?: import("./run.ts").InfrastructureOutcome; diagnostics: RunDiagnostic[] } {
@@ -1751,15 +1852,17 @@ function validateReviewerEvidence(value: unknown, path: string): { value?: Revie
 	return { diagnostics: [diagnostic("invalid-task", "Reviewer evidence has invalid exact fields.", path)] };
 }
 
-function validateReviewerAttempt(value: Record<string, unknown>, path: string, task: TaskContract, base: IntegrationBase): { value?: ReviewerAttemptRecord; diagnostics: RunDiagnostic[] } {
+function validateReviewerAttempt(value: Record<string, unknown>, path: string, task: TaskContract, base: IntegrationBase, allowedSpecificationHashes: ReadonlySet<string> = new Set([specificationHash(task)])): { value?: ReviewerAttemptRecord; diagnostics: RunDiagnostic[] } {
 	const hasActivatedAt = Object.prototype.hasOwnProperty.call(value, "activatedAt");
 	const hasIntegrity = Object.prototype.hasOwnProperty.call(value, "integrity");
 	const hasEvidence = Object.prototype.hasOwnProperty.call(value, "evidence");
 	const hasRepair = Object.prototype.hasOwnProperty.call(value, "reportRepair");
 	const hasRecovery = Object.prototype.hasOwnProperty.call(value, "recovery");
 	const hasReplacement = Object.prototype.hasOwnProperty.call(value, "replacement");
-	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", "specificationHash", "assignmentPath", "reportPath", "evidenceDirectory", "subject", "independence", "worktree", "dispatch", ...(hasReplacement ? ["replacement"] : []), ...(hasRecovery ? ["recovery"] : []), ...(hasRepair ? ["reportRepair"] : []), ...(hasIntegrity ? ["integrity"] : []), ...(hasEvidence ? ["evidence"] : [])];
-	if (!exactKeys(value, keys) || value.role !== "reviewer" || !safeIdentifier(value.id) || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || (value.state === "superseded" && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || hasIntegrity || hasRepair || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && (!hasEvidence || !hasIntegrity))) return { diagnostics: [diagnostic("invalid-task", "Reviewer Attempt has invalid lifecycle fields.", path)] };
+	const hasSpecificationVersion = Object.prototype.hasOwnProperty.call(value, "specificationVersion");
+	const hasRevisionCancellation = Object.prototype.hasOwnProperty.call(value, "revisionCancellation");
+	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", ...(hasSpecificationVersion ? ["specificationVersion"] : []), "specificationHash", "assignmentPath", "reportPath", "evidenceDirectory", "subject", "independence", "worktree", "dispatch", ...(hasReplacement ? ["replacement"] : []), ...(hasRecovery ? ["recovery"] : []), ...(hasRepair ? ["reportRepair"] : []), ...(hasIntegrity ? ["integrity"] : []), ...(hasEvidence ? ["evidence"] : []), ...(hasRevisionCancellation ? ["revisionCancellation"] : [])];
+	if (!exactKeys(value, keys) || value.role !== "reviewer" || !safeIdentifier(value.id) || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded", "cancelled"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || ((value.state === "superseded" || value.state === "cancelled") && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || hasIntegrity || hasRepair || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && (!hasEvidence || !hasIntegrity)) || (value.state === "cancelled" && !hasRevisionCancellation) || (hasSpecificationVersion && (!Number.isSafeInteger(value.specificationVersion) || (value.specificationVersion as number) < 1))) return { diagnostics: [diagnostic("invalid-task", "Reviewer Attempt has invalid lifecycle fields.", path)] };
 	const model = modelChoiceValue(value.actualModel, `${path}.actualModel`);
 	const dispatch = validateReviewerDispatch(value.dispatch, `${path}.dispatch`);
 	const replacement = hasReplacement ? validateAttemptReplacement(value.replacement, `${path}.replacement`, value.id as string) : { diagnostics: [] };
@@ -1767,23 +1870,27 @@ function validateReviewerAttempt(value: Record<string, unknown>, path: string, t
 	const subjectResult = validateReviewSubject(value.subject, `${path}.subject`);
 	const independence = validateReviewerIndependence(value.independence, `${path}.independence`);
 	const evidence = hasEvidence ? validateReviewerEvidence(value.evidence, `${path}.evidence`) : { diagnostics: [] };
+	const revisionCancellation = hasRevisionCancellation ? validateRevisionAttemptCancellation(value.revisionCancellation, `${path}.revisionCancellation`) : { diagnostics: [] };
+	const cancellationPreviousState = revisionCancellation.value?.previousState;
 	const reportRepair = hasRepair ? validateReportRepair(value.reportRepair, `${path}.reportRepair`) : { diagnostics: [] };
 	const integrity = hasIntegrity ? validateReviewerIntegrity(value.integrity, `${path}.integrity`) : { diagnostics: [] };
 	const recovery = hasRecovery && dispatch.value ? validateAttemptRecovery(value.recovery, `${path}.recovery`, dispatch.value, { id: value.id as string, role: "reviewer", reportPath: value.reportPath as string, evidenceDirectory: value.evidenceDirectory as string, state: value.state as string, preparedAt: value.preparedAt as string }) : { diagnostics: hasRecovery ? [diagnostic("invalid-task", "Reviewer recovery requires a recognized dispatch identity.", `${path}.recovery`)] : [] };
-	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics, ...replacement.diagnostics, ...snapshot.diagnostics, ...subjectResult.diagnostics, ...independence.diagnostics, ...evidence.diagnostics, ...reportRepair.diagnostics, ...integrity.diagnostics, ...recovery.diagnostics];
-	if (typeof value.specificationHash !== "string" || value.specificationHash !== specificationHash(task)) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt specificationHash must match its Task contract.", `${path}.specificationHash`));
+	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics, ...replacement.diagnostics, ...snapshot.diagnostics, ...subjectResult.diagnostics, ...independence.diagnostics, ...evidence.diagnostics, ...reportRepair.diagnostics, ...integrity.diagnostics, ...recovery.diagnostics, ...revisionCancellation.diagnostics];
+	if (typeof value.specificationHash !== "string" || !allowedSpecificationHashes.has(value.specificationHash)) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt specificationHash must match a retained Task specification.", `${path}.specificationHash`));
 	if (base.kind !== "git") diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt requires the Builder Git integration base in this slice.", path));
 	if (!absolutePathValue(value.assignmentPath) || !absolutePathValue(value.reportPath) || !absolutePathValue(value.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt paths must be absolute.", path));
-	if (dispatch.value && ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !["prompted", "reconciled-active"].includes(dispatch.value.phase) || value.state === "superseded" && !["agent-intended", "assignment-intended", "prompt-intended", "prompted", "reconciled-active"].includes(dispatch.value.phase) || (value.state === "active" || value.state === "reported") && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt || (value.state === "active" || value.state === "reported") && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt || (value.state === "prepared" && ["prompted", "reconciled-active"].includes(dispatch.value.phase)))) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt state and dispatch phase disagree.", path));
+	if (dispatch.value && ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !["prompted", "reconciled-active"].includes(dispatch.value.phase) || (value.state === "superseded" || value.state === "cancelled") && !["agent-intended", "assignment-intended", "prompt-intended", "prompted", "reconciled-active", "pane-intended", "replacement-pane-intended"].includes(dispatch.value.phase) || (value.state === "active" || value.state === "reported" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt || (value.state === "active" || value.state === "reported" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt || (value.state === "prepared" && ["prompted", "reconciled-active"].includes(dispatch.value.phase)))) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt state and dispatch phase disagree.", path));
 	if (dispatch.value && value.state === "ended-error" && ["prompted", "reconciled-active"].includes(dispatch.value.phase) && (!hasActivatedAt || !canonicalTimestamp(value.activatedAt))) diagnostics.push(diagnostic("invalid-task", "An active-time ended-error Reviewer Attempt must retain its activation timestamp.", path));
 	if (reportRepair.value && (!["prompted", "reconciled-active"].includes(dispatch.value?.phase ?? "") || (value.state !== "active" && !(value.state === "reported" && reportRepair.value.phase === "requested")))) diagnostics.push(diagnostic("invalid-task", "Reviewer report repair must remain bound to the same prompted Reviewer; only a requested repair may be retained after valid finalization.", `${path}.reportRepair`));
 	if (value.state === "reported" && evidence.value?.phase !== "finalized") diagnostics.push(diagnostic("invalid-task", "Reported Reviewer Attempts require finalized evidence.", `${path}.evidence`));
 	if (value.state === "ended-error" && !recovery.value?.infrastructure) diagnostics.push(diagnostic("invalid-task", "Ended-error Reviewer Attempts require a typed infrastructure outcome.", `${path}.recovery`));
+	if (value.state === "cancelled" && cancellationPreviousState !== "prepared" && !hasActivatedAt) diagnostics.push(diagnostic("invalid-task", "A cancelled active Reviewer Attempt must retain its activation timestamp.", path));
+	if (value.state !== "cancelled" && hasRevisionCancellation) diagnostics.push(diagnostic("invalid-task", "Revision cancellation is only legal on cancelled Attempts.", `${path}.revisionCancellation`));
 	if (recovery.value?.infrastructure && evidence.value?.phase === "finalized") diagnostics.push(diagnostic("invalid-task", "Infrastructure outcomes cannot coexist with finalized Reviewer evidence.", `${path}.recovery`));
 	if (value.state === "reported" && integrity.value?.kind !== "preserved" && integrity.value?.kind !== "violated") diagnostics.push(diagnostic("invalid-task", "Reported Reviewer Attempts require an integrity result.", `${path}.integrity`));
 	if (hasRepair && !["prompted", "reconciled-active"].includes(dispatch.value?.phase ?? "")) diagnostics.push(diagnostic("invalid-task", "Reviewer reportRepair is legal only after an actual Reviewer dispatch.", `${path}.reportRepair`));
-	if (diagnostics.length > 0 || !model.value || !dispatch.value || (hasReplacement && !replacement.value) || !snapshot.value || !subjectResult.value || !independence.value || (hasEvidence && !evidence.value) || (hasRepair && !reportRepair.value) || (hasIntegrity && !integrity.value) || (hasRecovery && !recovery.value) || !isRecord(value.worktree) || typeof value.worktree.path !== "string") return { diagnostics };
-	return { value: { id: value.id as string, role: "reviewer", state: value.state as ReviewerAttemptRecord["state"], preparedAt: value.preparedAt as string, ...(value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || (value.state === "superseded" && hasActivatedAt) || (value.state === "ended-error" && hasActivatedAt) ? { activatedAt: value.activatedAt as string } : {}), actualModel: model.value, specificationHash: value.specificationHash as string, assignmentPath: value.assignmentPath as string, reportPath: value.reportPath as string, evidenceDirectory: value.evidenceDirectory as string, subject: subjectResult.value, independence: independence.value, worktree: { path: value.worktree.path, baseline: snapshot.value }, dispatch: dispatch.value, ...(replacement.value ? { replacement: replacement.value } : {}), ...(recovery.value ? { recovery: recovery.value } : {}), ...(reportRepair.value ? { reportRepair: reportRepair.value } : {}), ...(integrity.value ? { integrity: integrity.value } : {}), ...(evidence.value ? { evidence: evidence.value } : {}) }, diagnostics: [] };
+	if (diagnostics.length > 0 || !model.value || !dispatch.value || (hasReplacement && !replacement.value) || !snapshot.value || !subjectResult.value || !independence.value || (hasEvidence && !evidence.value) || (hasRepair && !reportRepair.value) || (hasIntegrity && !integrity.value) || (hasRecovery && !recovery.value) || (hasRevisionCancellation && !revisionCancellation.value) || !isRecord(value.worktree) || typeof value.worktree.path !== "string") return { diagnostics };
+	return { value: { id: value.id as string, role: "reviewer", state: value.state as ReviewerAttemptRecord["state"], preparedAt: value.preparedAt as string, ...(value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || (value.state === "superseded" && hasActivatedAt) || (value.state === "ended-error" && hasActivatedAt) || (value.state === "cancelled" && hasActivatedAt) ? { activatedAt: value.activatedAt as string } : {}), actualModel: model.value, ...(hasSpecificationVersion ? { specificationVersion: value.specificationVersion as number } : {}), specificationHash: value.specificationHash as string, assignmentPath: value.assignmentPath as string, reportPath: value.reportPath as string, evidenceDirectory: value.evidenceDirectory as string, subject: subjectResult.value, independence: independence.value, worktree: { path: value.worktree.path, baseline: snapshot.value }, dispatch: dispatch.value, ...(replacement.value ? { replacement: replacement.value } : {}), ...(recovery.value ? { recovery: recovery.value } : {}), ...(reportRepair.value ? { reportRepair: reportRepair.value } : {}), ...(integrity.value ? { integrity: integrity.value } : {}), ...(evidence.value ? { evidence: evidence.value } : {}), ...(revisionCancellation.value ? { revisionCancellation: revisionCancellation.value } : {}) }, diagnostics: [] };
 }
 
 function validateReviewerIndependence(value: unknown, path: string): { value?: ReviewerIndependence; diagnostics: RunDiagnostic[] } {
@@ -1810,47 +1917,54 @@ function validateReviewerIntegrity(value: unknown, path: string): { value?: Revi
 	return { diagnostics: [diagnostic("invalid-task", "Reviewer integrity has invalid exact fields.", path)] };
 }
 
-function validateAttempt(value: unknown, path: string, task: TaskContract, base: IntegrationBase): { value?: AttemptRecord; diagnostics: RunDiagnostic[] } {
+function validateAttempt(value: unknown, path: string, task: TaskContract, base: IntegrationBase, allowedSpecificationHashes: ReadonlySet<string> = new Set([specificationHash(task)])): { value?: AttemptRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) return { diagnostics: [diagnostic("invalid-task", "Attempt must be an object.", path)] };
 	const hasActivatedAt = Object.prototype.hasOwnProperty.call(value, "activatedAt");
 	const hasEvidence = Object.prototype.hasOwnProperty.call(value, "evidence");
 	const hasRecovery = Object.prototype.hasOwnProperty.call(value, "recovery");
 	const hasReplacement = Object.prototype.hasOwnProperty.call(value, "replacement");
-	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch", ...(hasReplacement ? ["replacement"] : []), ...(hasRecovery ? ["recovery"] : []), ...(hasEvidence ? ["evidence"] : [])];
-	if (!exactKeys(value, keys) || !safeIdentifier(value.id) || value.role !== "builder" || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || (value.state === "superseded" && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && !hasEvidence)) {
+	const hasSpecificationVersion = Object.prototype.hasOwnProperty.call(value, "specificationVersion");
+	const hasRevisionCancellation = Object.prototype.hasOwnProperty.call(value, "revisionCancellation");
+	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", ...(hasSpecificationVersion ? ["specificationVersion"] : []), "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch", ...(hasReplacement ? ["replacement"] : []), ...(hasRecovery ? ["recovery"] : []), ...(hasEvidence ? ["evidence"] : []), ...(hasRevisionCancellation ? ["revisionCancellation"] : [])];
+	if (!exactKeys(value, keys) || !safeIdentifier(value.id) || value.role !== "builder" || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded", "cancelled"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || ((value.state === "superseded" || value.state === "cancelled") && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && !hasEvidence) || (value.state === "cancelled" && !hasRevisionCancellation) || (hasSpecificationVersion && (!Number.isSafeInteger(value.specificationVersion) || (value.specificationVersion as number) < 1))) {
 		return { diagnostics: [diagnostic("invalid-task", "Attempt has invalid lifecycle fields.", path)] };
 	}
 	const model = modelChoiceValue(value.actualModel, `${path}.actualModel`);
 	const dispatch = validateDispatch(value.dispatch, `${path}.dispatch`);
 	const replacement = hasReplacement ? validateAttemptReplacement(value.replacement, `${path}.replacement`, value.id as string) : { diagnostics: [] };
 	const evidence = hasEvidence ? validateEvidenceRecord(value.evidence, `${path}.evidence`) : { diagnostics: [] };
+	const revisionCancellation = hasRevisionCancellation ? validateRevisionAttemptCancellation(value.revisionCancellation, `${path}.revisionCancellation`) : { diagnostics: [] };
+	const cancellationPreviousState = revisionCancellation.value?.previousState;
 	const recovery = hasRecovery && dispatch.value ? validateAttemptRecovery(value.recovery, `${path}.recovery`, dispatch.value, { id: value.id as string, role: "builder", reportPath: value.reportPath as string, evidenceDirectory: value.evidenceDirectory as string, state: value.state as string, preparedAt: value.preparedAt as string }) : { diagnostics: hasRecovery ? [diagnostic("invalid-task", "Builder recovery requires a recognized dispatch identity.", `${path}.recovery`)] : [] };
-	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics, ...replacement.diagnostics, ...evidence.diagnostics, ...recovery.diagnostics];
-	if (typeof value.specificationHash !== "string" || value.specificationHash !== specificationHash(task)) diagnostics.push(diagnostic("invalid-task", "Attempt specificationHash must match its Task contract.", `${path}.specificationHash`));
+	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics, ...replacement.diagnostics, ...evidence.diagnostics, ...recovery.diagnostics, ...revisionCancellation.diagnostics];
+	if (typeof value.specificationHash !== "string" || !allowedSpecificationHashes.has(value.specificationHash)) diagnostics.push(diagnostic("invalid-task", "Attempt specificationHash must match a retained Task specification.", `${path}.specificationHash`));
 	if (typeof value.baseRevision !== "string" || base.kind !== "git" || !/^[0-9a-f]{40}$/.test(value.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Attempt baseRevision must be a full lowercase revision for the Git integration base.", `${path}.baseRevision`));
 	if (!absolutePathValue(value.assignmentPath) || !absolutePathValue(value.reportPath) || !absolutePathValue(value.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Attempt evidence paths must be absolute and safe.", path));
 	if (dispatch.value) {
 		if ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !["prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Active, awaiting-report, or reported Attempts require a proven dispatch.", path));
-		if (value.state === "superseded" && !["worktree-intended", "replacement-pane-intended", "agent-intended", "assignment-intended", "prompt-intended", "prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Superseded Attempts require a retained dispatch identity.", path));
-		if ((value.state === "active" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error") && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Active, reported, or superseded Attempts require a matching prompted activation timestamp.", path));
-		if ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error") && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Reconciled Attempts require a matching reconciliation timestamp.", path));
+		if ((value.state === "superseded" || value.state === "cancelled") && !["worktree-intended", "replacement-pane-intended", "agent-intended", "assignment-intended", "prompt-intended", "prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Historical terminal Attempts require a retained dispatch identity.", path));
+		if ((value.state === "active" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Active, reported, or historical prompted Attempts require a matching activation timestamp.", path));
+		if ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Reconciled Attempts require a matching reconciliation timestamp.", path));
 		if (value.state === "prepared" && ["prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Prepared Attempts cannot have a proven dispatch.", path));
 		if (value.state === "ended-error" && ["prompted", "reconciled-active"].includes(dispatch.value.phase) && (!hasActivatedAt || !canonicalTimestamp(value.activatedAt))) diagnostics.push(diagnostic("invalid-task", "An active-time ended-error Attempt must retain its activation timestamp.", path));
 	}
 	if (value.state === "reported" && evidence.value?.phase !== "finalized") diagnostics.push(diagnostic("invalid-task", "Reported Attempts require finalized Builder evidence.", `${path}.evidence`));
 	if (value.state === "ended-error" && !recovery.value?.infrastructure) diagnostics.push(diagnostic("invalid-task", "Ended-error Attempts require a typed infrastructure outcome.", `${path}.recovery`));
+	if (value.state === "cancelled" && cancellationPreviousState !== "prepared" && !hasActivatedAt) diagnostics.push(diagnostic("invalid-task", "A cancelled active Attempt must retain its activation timestamp.", path));
+	if (value.state !== "cancelled" && hasRevisionCancellation) diagnostics.push(diagnostic("invalid-task", "Revision cancellation is only legal on cancelled Attempts.", `${path}.revisionCancellation`));
 	if (recovery.value?.infrastructure && evidence.value?.phase === "finalized") diagnostics.push(diagnostic("invalid-task", "Infrastructure outcomes cannot coexist with finalized Builder evidence.", `${path}.recovery`));
 	if (value.state === "active" && evidence.value?.phase === "finalized") diagnostics.push(diagnostic("invalid-task", "Active Attempts cannot contain finalized Builder evidence.", `${path}.evidence`));
 	if (evidence.value?.phase === "finalized" && evidence.value.status === "completed" && task.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") && evidence.value.producedRevision === null) diagnostics.push(diagnostic("invalid-task", "Completed code-changing Attempts require a produced revision in finalized evidence.", `${path}.evidence.producedRevision`));
-	if (diagnostics.length > 0 || !model.value || !dispatch.value || (hasReplacement && !replacement.value) || (hasEvidence && !evidence.value) || (hasRecovery && !recovery.value) || typeof value.id !== "string" || typeof value.preparedAt !== "string" || typeof value.specificationHash !== "string" || typeof value.baseRevision !== "string" || typeof value.assignmentPath !== "string" || typeof value.reportPath !== "string" || typeof value.evidenceDirectory !== "string") return { diagnostics };
+	if (diagnostics.length > 0 || !model.value || !dispatch.value || (hasReplacement && !replacement.value) || (hasEvidence && !evidence.value) || (hasRecovery && !recovery.value) || (hasRevisionCancellation && !revisionCancellation.value) || typeof value.id !== "string" || typeof value.preparedAt !== "string" || typeof value.specificationHash !== "string" || typeof value.baseRevision !== "string" || typeof value.assignmentPath !== "string" || typeof value.reportPath !== "string" || typeof value.evidenceDirectory !== "string") return { diagnostics };
 	return {
 		value: {
 			id: value.id,
 			role: "builder",
 			state: value.state as BuilderAttemptRecord["state"],
 			preparedAt: value.preparedAt,
-			...(value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || (value.state === "superseded" && hasActivatedAt) || (value.state === "ended-error" && hasActivatedAt) ? { activatedAt: value.activatedAt as string } : {}),
+			...(value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || (value.state === "superseded" && hasActivatedAt) || (value.state === "ended-error" && hasActivatedAt) || (value.state === "cancelled" && hasActivatedAt) ? { activatedAt: value.activatedAt as string } : {}),
 			actualModel: model.value,
+			...(hasSpecificationVersion ? { specificationVersion: value.specificationVersion as number } : {}),
 			specificationHash: value.specificationHash,
 			baseRevision: value.baseRevision,
 			assignmentPath: value.assignmentPath,
@@ -1858,8 +1972,9 @@ function validateAttempt(value: unknown, path: string, task: TaskContract, base:
 			evidenceDirectory: value.evidenceDirectory,
 				dispatch: dispatch.value,
 				...(replacement.value ? { replacement: replacement.value } : {}),
-				...(recovery.value ? { recovery: recovery.value } : {}),
+			...(recovery.value ? { recovery: recovery.value } : {}),
 			...(evidence.value ? { evidence: evidence.value } : {}),
+			...(revisionCancellation.value ? { revisionCancellation: revisionCancellation.value } : {}),
 		},
 		diagnostics: [],
 	};
@@ -1958,6 +2073,7 @@ function cloneAttempt(attempt: AttemptRecord): AttemptRecord {
 				...(attempt.reportRepair ? { reportRepair: attempt.reportRepair.phase === "blocked" ? { ...attempt.reportRepair, diagnostics: [...attempt.reportRepair.diagnostics], secondDiagnostics: [...attempt.reportRepair.secondDiagnostics] } : { ...attempt.reportRepair, diagnostics: [...attempt.reportRepair.diagnostics] } } : {}),
 			...(attempt.integrity ? { integrity: attempt.integrity.kind === "preserved" ? { kind: "preserved", after: { ...attempt.integrity.after, dirtyPaths: [...attempt.integrity.after.dirtyPaths], operationMarkers: [...attempt.integrity.after.operationMarkers] } } : { ...attempt.integrity, before: { ...attempt.integrity.before, dirtyPaths: [...attempt.integrity.before.dirtyPaths], operationMarkers: [...attempt.integrity.before.operationMarkers] }, after: { ...attempt.integrity.after, dirtyPaths: [...attempt.integrity.after.dirtyPaths], operationMarkers: [...attempt.integrity.after.operationMarkers] } } } : {}),
 			...(attempt.evidence ? { evidence: { ...attempt.evidence, subject: attempt.evidence.subject.kind === "git" ? { ...attempt.evidence.subject, commits: [...attempt.evidence.subject.commits] } : { ...attempt.evidence.subject, artifacts: attempt.evidence.subject.artifacts.map((artifact) => ({ ...artifact })) } } } : {}),
+			...(attempt.revisionCancellation ? { revisionCancellation: cloneRevisionAttemptCancellation(attempt.revisionCancellation) } : {}),
 		};
 	}
 	return {
@@ -1967,6 +2083,21 @@ function cloneAttempt(attempt: AttemptRecord): AttemptRecord {
 		...(attempt.replacement ? { replacement: { ...attempt.replacement } } : {}),
 		...(attempt.recovery ? { recovery: cloneRecovery(attempt.recovery) } : {}),
 		...(attempt.evidence ? { evidence: cloneEvidence(attempt.evidence) } : {}),
+		...(attempt.revisionCancellation ? { revisionCancellation: cloneRevisionAttemptCancellation(attempt.revisionCancellation) } : {}),
+	};
+}
+
+function cloneRevisionAttemptCancellation(cancellation: RevisionAttemptCancellation): RevisionAttemptCancellation {
+	return {
+		reason: cancellation.reason,
+		cancelledAt: cancellation.cancelledAt,
+		previousState: cancellation.previousState,
+		oldSpecificationVersion: cancellation.oldSpecificationVersion,
+		oldSpecificationHash: cancellation.oldSpecificationHash,
+		replacementSpecificationVersion: cancellation.replacementSpecificationVersion,
+		replacementSpecificationHash: cancellation.replacementSpecificationHash,
+		owningRunRevision: cancellation.owningRunRevision,
+		stop: cancellation.stop.phase === "not-required" ? { ...cancellation.stop } : { ...cancellation.stop, agent: { ...cancellation.stop.agent } },
 	};
 }
 
@@ -2065,6 +2196,37 @@ function cloneFinalVerificationReworkRecord(record: FinalVerificationReworkRecor
 		priorReviewerAttemptId: record.priorReviewerAttemptId,
 		replacementBuilderAttemptId: record.replacementBuilderAttemptId,
 		observedAt: record.observedAt,
+	};
+}
+
+function cloneRevisionTaskSpecification(specification: RevisionTaskSpecification): RevisionTaskSpecification {
+	return { specificationVersion: specification.specificationVersion, specificationHash: specification.specificationHash, contract: cloneContract(specification.contract) };
+}
+
+function cloneRevisionTaskDelta(delta: RunRevisionTaskDelta): RunRevisionTaskDelta {
+	return {
+		taskId: delta.taskId,
+		before: cloneRevisionTaskSpecification(delta.before),
+		after: cloneRevisionTaskSpecification(delta.after),
+		priorReworkCycles: delta.priorReworkCycles,
+		cancelledAttemptIds: [...delta.cancelledAttemptIds],
+		invalidatedReviewerAttempts: delta.invalidatedReviewerAttempts.map((reviewer) => ({ ...reviewer })),
+		...(delta.priorApproval ? { priorApproval: cloneApproval(delta.priorApproval) } : {}),
+		...(delta.priorIntegration ? { priorIntegration: cloneIntegration(delta.priorIntegration) } : {}),
+		...(delta.priorIntegrationRecoveries ? { priorIntegrationRecoveries: delta.priorIntegrationRecoveries.map(cloneIntegrationReworkRecord) } : {}),
+		...(delta.priorFinalVerificationReworks ? { priorFinalVerificationReworks: delta.priorFinalVerificationReworks.map(cloneFinalVerificationReworkRecord) } : {}),
+	};
+}
+
+function cloneRunRevision(revision: RunRevisionRecord): RunRevisionRecord {
+	return {
+		revision: revision.revision,
+		confirmedAt: revision.confirmedAt,
+		controllerSessionId: revision.controllerSessionId,
+		basisJournalRevision: revision.basisJournalRevision,
+		taskDeltas: revision.taskDeltas.map(cloneRevisionTaskDelta),
+		...(revision.modelPlanDelta ? { modelPlanDelta: { before: cloneModelPlans(revision.modelPlanDelta.before), after: cloneModelPlans(revision.modelPlanDelta.after) } } : {}),
+		...(revision.invalidatedFinalVerification ? { invalidatedFinalVerification: { execution: cloneVerificationExecution(revision.invalidatedFinalVerification.execution), invalidatedAt: revision.invalidatedFinalVerification.invalidatedAt, reason: revision.invalidatedFinalVerification.reason } } : {}),
 	};
 }
 
@@ -2322,12 +2484,12 @@ function validateTaskApproval(value: unknown, path: string): { value?: TaskAppro
 		const snapshot = validateReviewSnapshot(value.worktreeSnapshot, `${path}.worktreeSnapshot`);
 		return subject.value && snapshot.value && subject.diagnostics.length === 0 && snapshot.diagnostics.length === 0 ? { value: { phase: "valid", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved" }, diagnostics: [] } : { diagnostics: [...subject.diagnostics, ...snapshot.diagnostics] };
 	}
-	if (value.phase !== "invalidated" || !exactKeys(value, [...baseKeys, "invalidatedAt", "reason", "diagnostic", ...(Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? ["observedSnapshot"] : [])]) || !canonicalTimestamp(value.approvedAt) || !canonicalTimestamp(value.invalidatedAt) || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || value.verdict !== "approved" || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !["head-changed", "dirty-state-changed", "subject-changed", "evidence-changed", "approval-invalid", "target-advanced", "final-verification-failed"].includes(value.reason as string) || !boundedText(value.diagnostic, 2_000)) return { diagnostics: [diagnostic("invalid-task", "Invalidated approval has invalid exact fields.", path)] };
+	if (value.phase !== "invalidated" || !exactKeys(value, [...baseKeys, "invalidatedAt", "reason", "diagnostic", ...(Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? ["observedSnapshot"] : [])]) || !canonicalTimestamp(value.approvedAt) || !canonicalTimestamp(value.invalidatedAt) || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || value.verdict !== "approved" || !absolutePathValue(value.reviewerManifestPath) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !["head-changed", "dirty-state-changed", "subject-changed", "evidence-changed", "approval-invalid", "target-advanced", "final-verification-failed", "task-specification-revised"].includes(value.reason as string) || !boundedText(value.diagnostic, 2_000)) return { diagnostics: [diagnostic("invalid-task", "Invalidated approval has invalid exact fields.", path)] };
 	const subject = validateReviewSubject(value.subject, `${path}.subject`);
 	const snapshot = validateReviewSnapshot(value.worktreeSnapshot, `${path}.worktreeSnapshot`);
 	const observed = Object.prototype.hasOwnProperty.call(value, "observedSnapshot") ? validateReviewSnapshot(value.observedSnapshot, `${path}.observedSnapshot`) : { diagnostics: [] };
 	if (!subject.value || !snapshot.value || subject.diagnostics.length > 0 || snapshot.diagnostics.length > 0 || observed.diagnostics.length > 0) return { diagnostics: [...subject.diagnostics, ...snapshot.diagnostics, ...observed.diagnostics] };
-	return { value: { phase: "invalidated", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved", invalidatedAt: value.invalidatedAt, reason: value.reason as "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced" | "final-verification-failed", diagnostic: value.diagnostic, ...(observed.value ? { observedSnapshot: observed.value } : {}) }, diagnostics: [] };
+	return { value: { phase: "invalidated", approvedAt: value.approvedAt, builderAttemptId: value.builderAttemptId, reviewerAttemptId: value.reviewerAttemptId, subject: subject.value, reviewerManifestPath: value.reviewerManifestPath, reviewerManifestSha256: value.reviewerManifestSha256, worktreeSnapshot: snapshot.value, verdict: "approved", invalidatedAt: value.invalidatedAt, reason: value.reason as "head-changed" | "dirty-state-changed" | "subject-changed" | "evidence-changed" | "approval-invalid" | "target-advanced" | "final-verification-failed" | "task-specification-revised", diagnostic: value.diagnostic, ...(observed.value ? { observedSnapshot: observed.value } : {}) }, diagnostics: [] };
 }
 
 function validateIntegrationObservation(value: unknown, path: string): { value?: IntegrationCheckoutObservation; diagnostics: RunDiagnostic[] } {
@@ -2664,8 +2826,11 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 		const expectedId = `attempt-${String(index + 1).padStart(2, "0")}`;
 		if (attempt.id !== expectedId) diagnostics.push(diagnostic("invalid-task", "Attempt IDs must be contiguous and derived from sequence position.", `${path}.attempts[${index}].id`));
 		const predecessor = attempts[index - 1];
+		const attemptVersion = attempt.specificationVersion ?? 1;
+		const predecessorVersion = predecessor?.specificationVersion ?? 1;
+		const startsNewSpecificationLineage = index > 0 && attemptVersion > predecessorVersion;
 		const isReplacement = attempt.replacement !== undefined;
-		if (!isReplacement && attempt.role !== (index === 0 ? "builder" : predecessor?.role === "builder" ? "reviewer" : "builder")) diagnostics.push(diagnostic("invalid-task", "Attempt roles must alternate except for an exact linked silent-agent replacement.", `${path}.attempts[${index}].role`));
+		if (!isReplacement && attempt.role !== (index === 0 || startsNewSpecificationLineage ? "builder" : predecessor?.role === "builder" ? "reviewer" : "builder")) diagnostics.push(diagnostic("invalid-task", "Attempt roles must alternate except for an exact linked silent-agent replacement or a new specification lineage.", `${path}.attempts[${index}].role`));
 			if (isReplacement) {
 				const predecessorSilence = predecessor?.recovery?.silence;
 				const replacementSilence = predecessorSilence && (predecessorSilence.phase === "replacement-intended" || predecessorSilence.phase === "replacement-ambiguous") ? predecessorSilence : undefined;
@@ -2694,8 +2859,8 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 					}
 				}
 				if (attempt.replacement) {
-					const expectedOrdinal = attempts.slice(0, index).filter((candidate) => candidate.replacement !== undefined).length + 1;
-					if (attempt.replacement.retryOrdinal !== expectedOrdinal) diagnostics.push(diagnostic("invalid-task", "Replacement ordinal must equal the global replacement link position in Task order.", `${path}.attempts[${index}].replacement.retryOrdinal`));
+					const expectedOrdinal = attempts.slice(0, index).filter((candidate) => (candidate.specificationVersion ?? 1) === attemptVersion && candidate.replacement !== undefined).length + 1;
+					if (attempt.replacement.retryOrdinal !== expectedOrdinal) diagnostics.push(diagnostic("invalid-task", "Replacement ordinal must equal the replacement link position within its Task specification lineage.", `${path}.attempts[${index}].replacement.retryOrdinal`));
 				}
 				const precedingBuilder = (candidateIndex: number): BuilderAttemptRecord | undefined => {
 					for (let priorIndex = candidateIndex - 1; priorIndex >= 0; priorIndex -= 1) {
@@ -2742,7 +2907,8 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 					if (attemptFacts.worktreePath !== predecessorFacts.worktreePath || attemptFacts.branch !== predecessorFacts.branch || !sourcePaneMatches || !reviewerFactsMatch) diagnostics.push(diagnostic("invalid-task", "Replacement must retain the predecessor identity, subject, worktree, and branch facts.", `${path}.attempts[${index}]`));
 		}
 		if (index === 0 && attempt.role === "builder" && isReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "The first Builder Attempt must use the initial dispatch variant.", `${path}.attempts[${index}].dispatch`));
-		if (index > 0 && attempt.role === "builder" && !isReplacement && !isReworkDispatch(attempt.dispatch) && !isIntegrationReworkDispatch(attempt.dispatch) && !isFinalVerificationReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "Later non-replacement Builder Attempts must use a recorded rework dispatch variant.", `${path}.attempts[${index}].dispatch`));
+		if (index > 0 && attempt.role === "builder" && !isReplacement && !startsNewSpecificationLineage && !isReworkDispatch(attempt.dispatch) && !isIntegrationReworkDispatch(attempt.dispatch) && !isFinalVerificationReworkDispatch(attempt.dispatch)) diagnostics.push(diagnostic("invalid-task", "Later non-replacement Builder Attempts must use a recorded rework dispatch variant.", `${path}.attempts[${index}].dispatch`));
+		if (startsNewSpecificationLineage && attempt.role !== "builder") diagnostics.push(diagnostic("invalid-task", "A new Task specification lineage must begin with a Builder Attempt.", `${path}.attempts[${index}].role`));
 		if (attempt.role === "reviewer" && index > 0 && !isReplacement) {
 			const preceding = attempts[index - 1];
 			if (preceding?.role !== "builder" || preceding.state === "prepared" || preceding.evidence?.phase !== "finalized" || !reviewSubjectBindsBuilder(attempt.subject, preceding)) diagnostics.push(diagnostic("invalid-task", "Each Reviewer must bind the immediately preceding finalized Builder subject.", `${path}.attempts[${index}]`));
@@ -2759,7 +2925,7 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 			const priorDispatch = priorBuilder?.role === "builder" ? priorBuilder.dispatch : undefined;
 			const sameBuilder = (priorDispatch?.phase === "prompted" || priorDispatch?.phase === "reconciled-active") && (attempt.dispatch.phase === "assignment-intended" || attempt.dispatch.phase === "prompt-intended" || attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active") && attempt.dispatch.branch === priorDispatch.branch && attempt.dispatch.agentName === priorDispatch.agentName && attempt.dispatch.worktreePath === priorDispatch.worktreePath && attempt.dispatch.workspaceId === priorDispatch.workspaceId && attempt.dispatch.paneId === priorDispatch.paneId && attempt.dispatch.terminalId === priorDispatch.terminalId;
 			const sameReviewEvidence = priorReviewer?.role === "reviewer" && priorReviewer.evidence?.phase === "finalized" && attempt.dispatch.reviewerManifestPath === priorReviewer.evidence.manifestPath && attempt.dispatch.reviewerManifestSha256 === priorReviewer.evidence.manifestSha256;
-				const expectedCycle = attempts.slice(0, index).filter((candidate) => candidate.role === "builder" && candidate.replacement === undefined && (isReworkDispatch(candidate.dispatch) || isIntegrationReworkDispatch(candidate.dispatch) || isFinalVerificationReworkDispatch(candidate.dispatch))).length + 1;
+				const expectedCycle = attempts.slice(0, index).filter((candidate) => (candidate.specificationVersion ?? 1) === attemptVersion && candidate.role === "builder" && candidate.replacement === undefined && (isReworkDispatch(candidate.dispatch) || isIntegrationReworkDispatch(candidate.dispatch) || isFinalVerificationReworkDispatch(candidate.dispatch))).length + 1;
 				const integrationRework = isIntegrationReworkDispatch(attempt.dispatch);
 				const priorReviewApproved = integrationRework && priorReviewer?.role === "reviewer" && priorReviewer.evidence?.phase === "finalized" && priorReviewer.evidence.verdict === "approved";
 				const priorReviewChangesRequired = !integrationRework && priorReviewer?.role === "reviewer" && priorReviewer.evidence?.phase === "finalized" && priorReviewer.evidence.verdict === "changes-required";
@@ -2781,18 +2947,22 @@ function validateAttemptSequence(attempts: AttemptRecord[], rawTask: Record<stri
 			}
 			const priorDispatch = priorBuilder?.dispatch;
 			const sameBuilder = priorDispatch && (priorDispatch.phase === "prompted" || priorDispatch.phase === "reconciled-active") && attempt.dispatch.branch === priorDispatch.branch && attempt.dispatch.agentName === priorDispatch.agentName && attempt.dispatch.worktreePath === priorDispatch.worktreePath && attempt.dispatch.workspaceId === priorDispatch.workspaceId && attempt.dispatch.paneId === priorDispatch.paneId && attempt.dispatch.terminalId === priorDispatch.terminalId;
-			const expectedCycle = attempts.slice(0, index).filter((candidate) => candidate.role === "builder" && candidate.replacement === undefined && (isReworkDispatch(candidate.dispatch) || isFinalVerificationReworkDispatch(candidate.dispatch))).length + 1;
+			const expectedCycle = attempts.slice(0, index).filter((candidate) => (candidate.specificationVersion ?? 1) === attemptVersion && candidate.role === "builder" && candidate.replacement === undefined && (isReworkDispatch(candidate.dispatch) || isFinalVerificationReworkDispatch(candidate.dispatch))).length + 1;
 			if (!priorBuilder || priorReviewer?.role !== "reviewer" || priorReviewer.state !== "reported" || priorReviewer.evidence?.phase !== "finalized" || priorReviewer.evidence.verdict !== "approved" || attempt.dispatch.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.priorReviewerAttemptId !== priorReviewer.id || attempt.dispatch.cycle !== expectedCycle || attempt.dispatch.verificationRework.priorBuilderAttemptId !== priorBuilder.id || attempt.dispatch.verificationRework.priorReviewerAttemptId !== priorReviewer.id || !sameBuilder || attempt.baseRevision !== attempt.dispatch.verificationRework.priorIntegration.observedHead) diagnostics.push(diagnostic("invalid-task", "Final-verification rework must preserve the exact approved lineage, same Builder identity, and prior integrated head.", `${path}.attempts[${index}].dispatch`));
 		}
 	}
-		const expectedRework = attempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && (isReworkDispatch(attempt.dispatch) || isIntegrationReworkDispatch(attempt.dispatch))).length;
-		const expectedFinalVerificationRework = attempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && isFinalVerificationReworkDispatch(attempt.dispatch)).length;
+	const currentVersion = typeof rawTask.specificationVersion === "number" ? rawTask.specificationVersion : 1;
+	const currentAttempts = attempts.filter((attempt) => (attempt.specificationVersion ?? 1) === currentVersion);
+	const expectedRework = currentAttempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && (isReworkDispatch(attempt.dispatch) || isIntegrationReworkDispatch(attempt.dispatch))).length;
+	const expectedFinalVerificationRework = currentAttempts.filter((attempt) => attempt.role === "builder" && !attempt.replacement && isFinalVerificationReworkDispatch(attempt.dispatch)).length;
 	if ((rawTask.reworkCycles as unknown) !== expectedRework + expectedFinalVerificationRework) diagnostics.push(diagnostic("invalid-task", "reworkCycles must equal the number of rework Builder Attempts.", `${path}.reworkCycles`));
-	if (attempts.length > 20) diagnostics.push(diagnostic("invalid-task", "A Task allows a bounded alternating history plus silent replacements.", `${path}.attempts`));
-	const replacementOrdinals = attempts.flatMap((attempt) => attempt.replacement ? [attempt.replacement.retryOrdinal] : []);
-	if (new Set(replacementOrdinals).size !== replacementOrdinals.length || replacementOrdinals.some((ordinal, index) => ordinal !== index + 1)) diagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals must be unique and derive from the ordered Attempt links.", `${path}.attempts`));
-	const exhaustedSilence = attempts.at(-1)?.recovery?.silence;
-	if (exhaustedSilence?.phase === "exhausted" && (exhaustedSilence.retryOrdinal !== replacementOrdinals.length || exhaustedSilence.retryOrdinal > 2)) diagnostics.push(diagnostic("invalid-task", "Exhausted silence state must record exactly the bounded replacement links already consumed.", `${path}.attempts`));
+	if (currentAttempts.length > 20) diagnostics.push(diagnostic("invalid-task", "A Task specification lineage allows a bounded alternating history plus silent replacements.", `${path}.attempts`));
+	const replacementOrdinalsByVersion = new Map<number, number[]>();
+	for (const attempt of attempts) if (attempt.replacement) replacementOrdinalsByVersion.set(attempt.specificationVersion ?? 1, [...(replacementOrdinalsByVersion.get(attempt.specificationVersion ?? 1) ?? []), attempt.replacement.retryOrdinal]);
+	for (const [version, replacementOrdinals] of replacementOrdinalsByVersion) if (new Set(replacementOrdinals).size !== replacementOrdinals.length || replacementOrdinals.some((ordinal, index) => ordinal !== index + 1)) diagnostics.push(diagnostic("invalid-task", `Silent replacement ordinals for specification version ${version} must be unique and contiguous.`, `${path}.attempts`));
+	const currentReplacementOrdinals = replacementOrdinalsByVersion.get(currentVersion) ?? [];
+	const exhaustedSilence = currentAttempts.at(-1)?.recovery?.silence;
+	if (exhaustedSilence?.phase === "exhausted" && (exhaustedSilence.retryOrdinal !== currentReplacementOrdinals.length || exhaustedSilence.retryOrdinal > 2)) diagnostics.push(diagnostic("invalid-task", "Exhausted silence state must record exactly the bounded replacement links already consumed.", `${path}.attempts`));
 }
 
 function reviewSubjectBindsBuilder(subject: ReviewSubject, builder: AttemptRecord): boolean {
@@ -2845,8 +3015,8 @@ function validateMonitorCheckpoint(value: unknown, path: string, run: { createdA
 	const git = value.git;
 	if (!isRecord(git) || !exactKeys(git, Object.prototype.hasOwnProperty.call(git, "diagnostic") ? ["head", "digest", "diagnostic"] : ["head", "digest"]) || (git.head !== null && (typeof git.head !== "string" || !/^[0-9a-f]{40}$/.test(git.head))) || (git.digest !== null && !monitorHash(git.digest)) || (Object.prototype.hasOwnProperty.call(git, "diagnostic") && !monitorDiagnostic(git.diagnostic))) diagnostics.push(diagnostic("invalid-run", "Monitor Git observation has invalid exact fields.", `${path}.git`));
 	const task = run.tasks.find((candidate) => candidate.contract.id === value.taskId);
-	const attempt = task?.attempts.find((candidate) => candidate.id === value.attemptId);
-	const latest = task?.attempts.at(-1);
+	const attempt = task?.attempts.find((candidate) => candidate.id === value.attemptId && attemptSpecificationVersion(candidate) === task.specificationVersion && candidate.state !== "cancelled");
+	const latest = task?.attempts.filter((candidate) => attemptSpecificationVersion(candidate) === task.specificationVersion && candidate.state !== "cancelled").at(-1);
 	const dispatch = attempt?.dispatch;
 	const actualDispatch = dispatch as AttemptRecord["dispatch"] | undefined;
 	if (!task || !attempt || !latest || latest.id !== attempt.id || attempt.role !== value.role || !["prompted", "reconciled-active"].includes(actualDispatch?.phase ?? "") || !isRecord(agent) || !actualDispatch || !("workspaceId" in actualDispatch) || !("paneId" in actualDispatch) || !("terminalId" in actualDispatch) || agent.name !== actualDispatch.agentName || agent.workspaceId !== actualDispatch.workspaceId || agent.paneId !== actualDispatch.paneId || agent.terminalId !== actualDispatch.terminalId) diagnostics.push(diagnostic("invalid-run", "Monitor checkpoint must identify the current proven Attempt and its exact recorded Herdr resource.", path));
@@ -2879,6 +3049,11 @@ function validateControllerPendingAction(value: unknown, path: string, run: { ta
 		return attempt?.role === role ? task : undefined;
 	};
 	if (value.kind === "none" && exactKeys(value, ["kind"])) return { value: { kind: "none" }, diagnostics: [] };
+	if (value.kind === "revision-stop" && exactKeys(value, ["kind", "taskId", "attemptId", "role"])) {
+		const task = taskFor(value.taskId, value.attemptId, value.role);
+		const attempt = task?.attempts.find((candidate) => candidate.id === value.attemptId);
+		if (task && attempt?.state === "cancelled" && attempt.revisionCancellation?.stop.phase === "intended") return { value: { kind: "revision-stop", taskId: value.taskId as string, attemptId: value.attemptId as string, role: value.role as "builder" | "reviewer" }, diagnostics: [] };
+	}
 	if (["reconcile-attempt", "wait-attention"].includes(value.kind) && exactKeys(value, ["kind", "taskId", "attemptId", "role"])) {
 		const task = taskFor(value.taskId, value.attemptId, value.role);
 		if (task) return { value: { kind: value.kind as "reconcile-attempt" | "wait-attention", taskId: value.taskId as string, attemptId: value.attemptId as string, role: value.role as "builder" | "reviewer" }, diagnostics: [] };
@@ -2888,6 +3063,102 @@ function validateControllerPendingAction(value: unknown, path: string, run: { ta
 	if (["integrate-task", "admit-task"].includes(value.kind) && exactKeys(value, ["kind", "taskId"]) && safeIdentifier(value.taskId) && run.tasks.some((task) => task.contract.id === value.taskId)) return { value: { kind: value.kind as "integrate-task" | "admit-task", taskId: value.taskId as string }, diagnostics: [] };
 	if ((value.kind === "final-verification" || value.kind === "completion-lifecycle") && exactKeys(value, ["kind"])) return { value: { kind: value.kind }, diagnostics: [] };
 	return { diagnostics: [diagnostic("invalid-run", "Controller pending action has unknown keys, invalid identity, or a foreign Task/Attempt.", path)] };
+}
+
+function validateRevisionTaskSpecification(value: unknown, path: string): { value?: RevisionTaskSpecification; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["specificationVersion", "specificationHash", "contract"]) || !Number.isSafeInteger(value.specificationVersion) || (value.specificationVersion as number) < 1 || typeof value.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.specificationHash)) return { diagnostics: [diagnostic("invalid-run", "Revision Task specification has invalid version or hash fields.", path)] };
+	const contract = validateContract(value.contract, `${path}.contract`, true);
+	if (!contract.value || contract.diagnostics.length > 0 || specificationHash(contract.value) !== value.specificationHash) return { diagnostics: [...contract.diagnostics, diagnostic("invalid-run", "Revision Task specification hash must match its exact contract.", `${path}.specificationHash`)] };
+	return { value: { specificationVersion: value.specificationVersion as number, specificationHash: value.specificationHash, contract: contract.value }, diagnostics: [] };
+}
+
+function validateRunRevisionRecord(value: unknown, path: string, finalVerification: Verification, journalRevision?: number): { value?: RunRevisionRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value)) return { diagnostics: [diagnostic("invalid-run", "Run revision must be an object.", path)] };
+	const hasModelPlan = Object.prototype.hasOwnProperty.call(value, "modelPlanDelta");
+	const hasFinalVerification = Object.prototype.hasOwnProperty.call(value, "invalidatedFinalVerification");
+	if (!exactKeys(value, ["revision", "confirmedAt", "controllerSessionId", "basisJournalRevision", "taskDeltas", ...(hasModelPlan ? ["modelPlanDelta"] : []), ...(hasFinalVerification ? ["invalidatedFinalVerification"] : [])]) || !Number.isSafeInteger(value.revision) || (value.revision as number) < 2 || !canonicalTimestamp(value.confirmedAt) || !trimmedString(value.controllerSessionId) || !Number.isSafeInteger(value.basisJournalRevision) || (value.basisJournalRevision as number) < 1 || (journalRevision !== undefined && (value.basisJournalRevision as number) >= journalRevision) || !Array.isArray(value.taskDeltas)) return { diagnostics: [diagnostic("invalid-run", "Run revision has invalid exact identity fields.", path)] };
+	const diagnostics: RunDiagnostic[] = [];
+	const taskDeltas: RunRevisionTaskDelta[] = [];
+	const taskIds = new Set<string>();
+	for (let index = 0; index < value.taskDeltas.length; index += 1) {
+		const deltaPath = `${path}.taskDeltas[${index}]`;
+		const raw = value.taskDeltas[index];
+		if (!isRecord(raw)) { diagnostics.push(diagnostic("invalid-run", "Revision Task delta must be an object.", deltaPath)); continue; }
+		const optional = [
+			...(Object.prototype.hasOwnProperty.call(raw, "priorApproval") ? ["priorApproval"] : []),
+			...(Object.prototype.hasOwnProperty.call(raw, "priorIntegration") ? ["priorIntegration"] : []),
+			...(Object.prototype.hasOwnProperty.call(raw, "priorIntegrationRecoveries") ? ["priorIntegrationRecoveries"] : []),
+			...(Object.prototype.hasOwnProperty.call(raw, "priorFinalVerificationReworks") ? ["priorFinalVerificationReworks"] : []),
+		];
+		if (!exactKeys(raw, ["taskId", "before", "after", "priorReworkCycles", "cancelledAttemptIds", "invalidatedReviewerAttempts", ...optional]) || !safeIdentifier(raw.taskId) || !Number.isSafeInteger(raw.priorReworkCycles) || (raw.priorReworkCycles as number) < 0 || !Array.isArray(raw.cancelledAttemptIds) || raw.cancelledAttemptIds.some((id) => !safeIdentifier(id)) || new Set(raw.cancelledAttemptIds).size !== raw.cancelledAttemptIds.length || !Array.isArray(raw.invalidatedReviewerAttempts)) { diagnostics.push(diagnostic("invalid-run", "Revision Task delta has invalid exact bounded fields.", deltaPath)); continue; }
+		const before = validateRevisionTaskSpecification(raw.before, `${deltaPath}.before`);
+		const after = validateRevisionTaskSpecification(raw.after, `${deltaPath}.after`);
+		diagnostics.push(...before.diagnostics, ...after.diagnostics);
+		const invalidatedReviewerAttempts: RevisionInvalidatedReviewer[] = [];
+		for (let reviewerIndex = 0; reviewerIndex < raw.invalidatedReviewerAttempts.length; reviewerIndex += 1) {
+			const reviewerPath = `${deltaPath}.invalidatedReviewerAttempts[${reviewerIndex}]`;
+			const reviewer = raw.invalidatedReviewerAttempts[reviewerIndex];
+			if (!isRecord(reviewer) || !exactKeys(reviewer, ["attemptId", "manifestPath", "manifestSha256"]) || !safeIdentifier(reviewer.attemptId) || !absolutePathValue(reviewer.manifestPath) || typeof reviewer.manifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(reviewer.manifestSha256)) diagnostics.push(diagnostic("invalid-run", "Invalidated Reviewer identity is invalid.", reviewerPath));
+			else invalidatedReviewerAttempts.push({ attemptId: reviewer.attemptId, manifestPath: reviewer.manifestPath, manifestSha256: reviewer.manifestSha256 });
+		}
+		const priorApproval = Object.prototype.hasOwnProperty.call(raw, "priorApproval") ? validateTaskApproval(raw.priorApproval, `${deltaPath}.priorApproval`) : { diagnostics: [] };
+		const priorIntegration = Object.prototype.hasOwnProperty.call(raw, "priorIntegration") ? validateTaskIntegration(raw.priorIntegration, `${deltaPath}.priorIntegration`) : { diagnostics: [] };
+		diagnostics.push(...priorApproval.diagnostics, ...priorIntegration.diagnostics);
+		const priorIntegrationRecoveries: IntegrationReworkRecord[] = [];
+		if (Object.prototype.hasOwnProperty.call(raw, "priorIntegrationRecoveries")) {
+			if (!Array.isArray(raw.priorIntegrationRecoveries)) diagnostics.push(diagnostic("invalid-run", "priorIntegrationRecoveries must be an array.", `${deltaPath}.priorIntegrationRecoveries`));
+			else for (let recoveryIndex = 0; recoveryIndex < raw.priorIntegrationRecoveries.length; recoveryIndex += 1) {
+				const result = validateIntegrationReworkRecord(raw.priorIntegrationRecoveries[recoveryIndex], `${deltaPath}.priorIntegrationRecoveries[${recoveryIndex}]`);
+				if (result.value) priorIntegrationRecoveries.push(result.value);
+				diagnostics.push(...result.diagnostics);
+			}
+		}
+		const priorFinalVerificationReworks: FinalVerificationReworkRecord[] = [];
+		if (Object.prototype.hasOwnProperty.call(raw, "priorFinalVerificationReworks")) {
+			if (!Array.isArray(raw.priorFinalVerificationReworks)) diagnostics.push(diagnostic("invalid-run", "priorFinalVerificationReworks must be an array.", `${deltaPath}.priorFinalVerificationReworks`));
+			else for (let reworkIndex = 0; reworkIndex < raw.priorFinalVerificationReworks.length; reworkIndex += 1) {
+				const result = validateFinalVerificationReworkRecord(raw.priorFinalVerificationReworks[reworkIndex], `${deltaPath}.priorFinalVerificationReworks[${reworkIndex}]`);
+				if (result.value) priorFinalVerificationReworks.push(result.value);
+				diagnostics.push(...result.diagnostics);
+			}
+		}
+		if (raw.taskId && taskIds.has(raw.taskId)) diagnostics.push(diagnostic("invalid-run", "Revision Task IDs must be unique within one revision.", `${deltaPath}.taskId`));
+		if (raw.taskId) taskIds.add(raw.taskId);
+		if (before.value && after.value && (after.value.specificationVersion !== before.value.specificationVersion + 1 || before.value.contract.id !== raw.taskId || after.value.contract.id !== raw.taskId)) diagnostics.push(diagnostic("invalid-run", "Revision Task versions must advance contiguously and retain the Task ID.", deltaPath));
+		if (before.value && after.value && priorApproval.value && priorApproval.value.phase !== "valid" && priorApproval.value.phase !== "invalidated") diagnostics.push(diagnostic("invalid-run", "Revision prior Approval is invalid.", `${deltaPath}.priorApproval`));
+		if (before.value && after.value && (before.value.specificationVersion < 1 || after.value.specificationVersion < 2)) diagnostics.push(diagnostic("invalid-run", "A revision delta must produce a post-revision Task specification.", deltaPath));
+		if (before.value && after.value && (before.value.specificationHash === after.value.specificationHash && JSON.stringify(before.value.contract) === JSON.stringify(after.value.contract))) diagnostics.push(diagnostic("invalid-run", "A Task revision delta must change its contract or version.", deltaPath));
+		if (before.value && after.value) taskDeltas.push({ taskId: raw.taskId, before: before.value, after: after.value, priorReworkCycles: raw.priorReworkCycles as number, cancelledAttemptIds: [...raw.cancelledAttemptIds] as string[], invalidatedReviewerAttempts, ...(priorApproval.value ? { priorApproval: priorApproval.value } : {}), ...(priorIntegration.value ? { priorIntegration: priorIntegration.value } : {}), ...(Object.prototype.hasOwnProperty.call(raw, "priorIntegrationRecoveries") ? { priorIntegrationRecoveries } : {}), ...(Object.prototype.hasOwnProperty.call(raw, "priorFinalVerificationReworks") ? { priorFinalVerificationReworks } : {}) });
+	}
+	let modelPlanDelta: RunRevisionModelPlanDelta | undefined;
+	if (hasModelPlan) {
+		const rawPlan = value.modelPlanDelta;
+		if (!isRecord(rawPlan) || !exactKeys(rawPlan, ["before", "after"])) diagnostics.push(diagnostic("invalid-run", "Revision Model Plan delta must contain exactly before and after.", `${path}.modelPlanDelta`));
+		else {
+			const before = validateProjectModelPlans(rawPlan.before, `${path}.modelPlanDelta.before`);
+			const after = validateProjectModelPlans(rawPlan.after, `${path}.modelPlanDelta.after`);
+			diagnostics.push(...before.diagnostics.map((item) => diagnostic("invalid-config", item.message, item.path)), ...after.diagnostics.map((item) => diagnostic("invalid-config", item.message, item.path)));
+			if (before.value && after.value && JSON.stringify(before.value) === JSON.stringify(after.value)) diagnostics.push(diagnostic("invalid-run", "A Model Plan revision delta must change the plan.", `${path}.modelPlanDelta`));
+			if (before.value && after.value) modelPlanDelta = { before: cloneModelPlans(before.value), after: cloneModelPlans(after.value) };
+		}
+	}
+	let invalidatedFinalVerification: RunRevisionFinalVerification | undefined;
+	if (hasFinalVerification) {
+		const rawFinal = value.invalidatedFinalVerification;
+		if (!isRecord(rawFinal) || !exactKeys(rawFinal, ["execution", "invalidatedAt", "reason"]) || rawFinal.reason !== "task-specification-revised" || !canonicalTimestamp(rawFinal.invalidatedAt)) diagnostics.push(diagnostic("invalid-run", "Invalidated final verification has invalid exact fields.", `${path}.invalidatedFinalVerification`));
+		else {
+			const execution = validateFinalVerificationExecution(rawFinal.execution, `${path}.invalidatedFinalVerification.execution`, finalVerification);
+			diagnostics.push(...execution.diagnostics);
+			if (execution.value && execution.value.phase !== "passed" && execution.value.phase !== "failed") diagnostics.push(diagnostic("invalid-run", "Only terminal final verification may be moved into revision history.", `${path}.invalidatedFinalVerification.execution`));
+			if (execution.value) invalidatedFinalVerification = { execution: execution.value, invalidatedAt: rawFinal.invalidatedAt, reason: "task-specification-revised" };
+		}
+	}
+	if (taskDeltas.length === 0 && !modelPlanDelta) diagnostics.push(diagnostic("invalid-run", "A Run revision must contain a Task or Model Plan delta.", path));
+	return diagnostics.length > 0 ? { diagnostics } : { value: { revision: value.revision as number, confirmedAt: value.confirmedAt as string, controllerSessionId: value.controllerSessionId as string, basisJournalRevision: value.basisJournalRevision as number, taskDeltas, ...(modelPlanDelta ? { modelPlanDelta } : {}), ...(invalidatedFinalVerification ? { invalidatedFinalVerification } : {}) }, diagnostics: [] };
+}
+
+function attemptSpecificationVersion(attempt: AttemptRecord): number {
+	return attempt.specificationVersion ?? 1;
 }
 
 function validateControllerLease(value: unknown, path: string, run: { id: string; controllerSessionId: string; createdAt: string; updatedAt: string; journalRevision: number; tasks: TaskRecord[] }): { value?: ControllerLease; diagnostics: RunDiagnostic[] } {
@@ -2943,8 +3214,9 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	const hasMonitor = Object.prototype.hasOwnProperty.call(value, "monitor");
 	const hasMonitors = Object.prototype.hasOwnProperty.call(value, "monitors");
 	const hasControllerLease = Object.prototype.hasOwnProperty.call(value, "controllerLease");
+	const hasRevisions = Object.prototype.hasOwnProperty.call(value, "revisions");
 	if (hasMonitor && hasMonitors) return { diagnostics: [diagnostic("invalid-run", "Run cannot contain both legacy monitor and multi-Task monitors.", path)] };
-	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", ...(hasControllerLease ? ["controllerLease"] : []), "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : []), ...(hasMonitors ? ["monitors"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
+	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", ...(hasControllerLease ? ["controllerLease"] : []), "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasRevisions ? ["revisions"] : []), ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : []), ...(hasMonitors ? ["monitors"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	const diagnostics: RunDiagnostic[] = [];
 	if (!safeIdentifier(value.id) || !String(value.id).startsWith("run-")) diagnostics.push(diagnostic("invalid-run", "Run id must be a filesystem-safe run identifier.", `${path}.id`));
 	if (value.status !== "active" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "Run status must be active, completing, or completed.", `${path}.status`));
@@ -2957,6 +3229,38 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	const rawTasks = Array.isArray(value.tasks) ? value.tasks : undefined;
 	if (!rawTasks || rawTasks.length === 0) diagnostics.push(diagnostic("invalid-run", "Run requires at least one ordered Task.", `${path}.tasks`));
 	const plans = validateProjectModelPlans(value.modelPlan, `${path}.modelPlan`);
+	const rawRevisions = hasRevisions && Array.isArray(value.revisions) ? value.revisions : [];
+	if (hasRevisions && !Array.isArray(value.revisions)) diagnostics.push(diagnostic("invalid-run", "revisions must be an ordered array.", `${path}.revisions`));
+	if (hasRevisions && Array.isArray(value.revisions) && value.revisions.length === 0) diagnostics.push(diagnostic("invalid-run", "revisions must retain at least one confirmed revision.", `${path}.revisions`));
+	const retainedSpecificationHashes = (taskId: string): Set<string> => {
+		const hashes = new Set<string>();
+		for (const rawRevision of rawRevisions) {
+			if (!isRecord(rawRevision) || !Array.isArray(rawRevision.taskDeltas)) continue;
+			for (const rawDelta of rawRevision.taskDeltas) {
+				if (!isRecord(rawDelta) || rawDelta.taskId !== taskId) continue;
+				for (const key of ["before", "after"]) {
+					const specification = rawDelta[key];
+					if (isRecord(specification) && typeof specification.specificationHash === "string") hashes.add(specification.specificationHash);
+				}
+			}
+		}
+		return hashes;
+	};
+	const specificationVersions = (taskId: string, currentVersion: number, currentHash: string): Map<number, string> => {
+		const versions = new Map<number, string>([[currentVersion, currentHash]]);
+		for (const rawRevision of rawRevisions) {
+			if (!isRecord(rawRevision) || !Array.isArray(rawRevision.taskDeltas)) continue;
+			for (const rawDelta of rawRevision.taskDeltas) {
+				if (!isRecord(rawDelta) || rawDelta.taskId !== taskId) continue;
+				for (const key of ["before", "after"]) {
+					const specification = rawDelta[key];
+					if (!isRecord(specification) || !Number.isSafeInteger(specification.specificationVersion) || typeof specification.specificationHash !== "string") continue;
+					versions.set(specification.specificationVersion as number, specification.specificationHash);
+				}
+			}
+		}
+		return versions;
+	};
 	const tasks: TaskRecord[] = [];
 	const taskIds = new Set<string>();
 	for (let index = 0; index < (rawTasks?.length ?? 0); index += 1) {
@@ -3012,24 +3316,36 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 				: { diagnostics: [diagnostic("invalid-task", "finalVerificationReworks must be an ordered array.", `${taskPath}.finalVerificationReworks`)] }
 			: { diagnostics: [] };
 		taskDiagnostics.push(...finalVerificationReworksResult.diagnostics);
-		if (task.specificationVersion !== 1) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationVersion must be 1.", `${taskPath}.specificationVersion`));
+		if (!Number.isSafeInteger(task.specificationVersion) || (task.specificationVersion as number) < 1) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationVersion must be a positive safe integer.", `${taskPath}.specificationVersion`));
 		if (typeof task.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(task.specificationHash) || (contractResult.value && specificationHash(contractResult.value) !== task.specificationHash)) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationHash does not match its exact contract.", `${taskPath}.specificationHash`));
 		const settingsLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.reworkCycleLimit) ? value.effectiveSettings.reworkCycleLimit as number : 5;
 		if (!["pending", "building", "reviewing", "reworking", "approved", "integrating", "completed"].includes(task.phase as string) || !["none", "blocked", "waiting-external", "suspected-stall", "recovering", "needs-user"].includes(task.attention as string) || !Array.isArray(task.attempts) || !Number.isSafeInteger(task.reworkCycles) || (task.reworkCycles as number) < 0 || (task.reworkCycles as number) > 5 || (task.reworkCycles as number) > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Task has an invalid phase, attention, Attempt sequence, or bounded rework counter.", taskPath));
 		if (hasAttentionDiagnostic && (!boundedText(task.attentionDiagnostic, 2_000) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionDiagnostic must be bounded and accompany durable attention.", `${taskPath}.attentionDiagnostic`));
-		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted", "review-approval-required", "integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "final-verification-ownership-unclear", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed", "reconciliation-blocked-question", "reconciliation-report-missing", "reconciliation-live-unclear", "reconciliation-agent-missing", "silence-passive-inspection", "external-process-live", "external-process-grace", "silence-effect-ambiguous", "silence-recovery-exhausted", "transient-infrastructure-recovery", "transient-stop-ambiguous", "transient-fallback-unavailable", "transient-retries-exhausted"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
+		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted", "review-approval-required", "integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "final-verification-ownership-unclear", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed", "reconciliation-blocked-question", "reconciliation-report-missing", "reconciliation-live-unclear", "reconciliation-agent-missing", "silence-passive-inspection", "external-process-live", "external-process-grace", "silence-effect-ambiguous", "silence-recovery-exhausted", "transient-infrastructure-recovery", "transient-stop-ambiguous", "transient-fallback-unavailable", "transient-retries-exhausted", "revision-stop-ambiguous"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
 		const attempts: AttemptRecord[] = [];
 		if (Array.isArray(task.attempts)) {
-			if (task.attempts.length > 20) taskDiagnostics.push(diagnostic("invalid-task", "A Task allows at most the initial pair plus five rework/review cycles and bounded silent replacements.", `${taskPath}.attempts`));
+			const taskSpecificationVersions = specificationVersions(contractResult.value?.id ?? "", Number(task.specificationVersion), typeof task.specificationHash === "string" ? task.specificationHash : "");
+			let sawExplicitSpecificationVersion = false;
+			if (task.attempts.length > 20 && task.specificationVersion === 1) taskDiagnostics.push(diagnostic("invalid-task", "A Task allows at most the initial pair plus five rework/review cycles and bounded silent replacements.", `${taskPath}.attempts`));
 			for (let attemptIndex = 0; attemptIndex < task.attempts.length; attemptIndex += 1) {
 				const rawAttempt = task.attempts[attemptIndex];
+				const hasAttemptSpecificationVersion = isRecord(rawAttempt) && Object.prototype.hasOwnProperty.call(rawAttempt, "specificationVersion");
 				const attemptResult = contractResult.value && base.value
 					? isRecord(rawAttempt) && rawAttempt.role === "reviewer"
-						? validateReviewerAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value)
-						: validateAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value)
+						? validateReviewerAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value, new Set([specificationHash(contractResult.value), ...retainedSpecificationHashes(contractResult.value.id)]))
+						: validateAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value, new Set([specificationHash(contractResult.value), ...retainedSpecificationHashes(contractResult.value.id)]))
 					: { diagnostics: [diagnostic("invalid-task", "Attempt cannot be validated without a valid Task and integration base.", `${taskPath}.attempts[${attemptIndex}]`)] };
 				if (attemptResult.value) attempts.push(attemptResult.value);
 				taskDiagnostics.push(...attemptResult.diagnostics);
+				if (hasAttemptSpecificationVersion) sawExplicitSpecificationVersion = true;
+				if (attemptResult.value && isRecord(rawAttempt)) {
+					if (hasAttemptSpecificationVersion) {
+						const expectedHash = taskSpecificationVersions.get(attemptResult.value.specificationVersion ?? 1);
+						if (!expectedHash || expectedHash !== attemptResult.value.specificationHash) taskDiagnostics.push(diagnostic("invalid-task", "Attempt specificationVersion must bind a retained exact Task specification hash.", `${taskPath}.attempts[${attemptIndex}].specificationVersion`));
+					} else if ((task.specificationVersion as number) > 1 && (sawExplicitSpecificationVersion || taskSpecificationVersions.get(1) !== attemptResult.value.specificationHash)) {
+						taskDiagnostics.push(diagnostic("invalid-task", "Attempts created after a Task revision must record specificationVersion.", `${taskPath}.attempts[${attemptIndex}].specificationVersion`));
+					}
+				}
 			}
 		}
 		validateAttemptSequence(attempts, task as Record<string, unknown>, contractResult.value, plans.value, taskPath, taskDiagnostics);
@@ -3053,16 +3369,17 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		if (finalVerificationReworkAttempts.length !== finalVerificationReworks.length) taskDiagnostics.push(diagnostic("invalid-task", "Every final-verification rework Builder Attempt must have exactly one retained failure record.", `${taskPath}.finalVerificationReworks`));
 		const transientLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.transientRetryLimit) ? value.effectiveSettings.transientRetryLimit as number : 2;
 		if (attempts.some((attempt) => attempt.replacement !== undefined && attempt.replacement.retryOrdinal > transientLimit)) taskDiagnostics.push(diagnostic("invalid-task", "Silent replacement ordinals cannot exceed the frozen transient retry limit.", `${taskPath}.attempts`));
-		const currentSilence = attempts.at(-1)?.recovery?.silence;
+		const currentSilence = attempts.filter((attempt) => (attempt.specificationVersion ?? 1) === task.specificationVersion).at(-1)?.recovery?.silence;
 		const expectedExhaustedOrdinal = transientLimit >= 2 ? 2 : transientLimit === 1 ? 1 : 0;
 		if (currentSilence?.phase === "exhausted" && currentSilence.retryOrdinal !== expectedExhaustedOrdinal) taskDiagnostics.push(diagnostic("invalid-task", "Exhausted silence state must record the bounded ordinal implied by the frozen transient retry limit.", `${taskPath}.attempts`));
-		const latest = attempts[attempts.length - 1];
+		const currentAttempts = attempts.filter((attempt) => (attempt.specificationVersion ?? 1) === task.specificationVersion);
+		const latest = currentAttempts[currentAttempts.length - 1];
 		const latestReviewer = latest?.role === "reviewer" ? latest : undefined;
 		const latestBuilder = latest?.role === "builder" ? latest : undefined;
-		if (task.phase === "pending" && attempts.length !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Pending Tasks must not have Attempts.", taskPath));
+		if (task.phase === "pending" && currentAttempts.length !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Pending Tasks must not have current specification Attempts.", taskPath));
 		if (task.phase === "building" && (!latestBuilder || (latestBuilder.state === "superseded" || (latestBuilder.state === "ended-error" && task.attention !== "needs-user" && task.attention !== "recovering")))) taskDiagnostics.push(diagnostic("invalid-task", "Building Tasks require one current Builder Attempt.", taskPath));
-		if (task.phase === "reworking" && (attempts.length < 3 || !latestBuilder || (latestBuilder.replacement === undefined && latestBuilder.state !== "ended-error" && !isReworkDispatch(latestBuilder.dispatch) && !isIntegrationReworkDispatch(latestBuilder.dispatch) && !isFinalVerificationReworkDispatch(latestBuilder.dispatch)))) taskDiagnostics.push(diagnostic("invalid-task", "Reworking Tasks require a latest reserved rework or transient ended-error Builder Attempt.", taskPath));
-		if (task.phase === "reviewing" && !latestReviewer && !(attempts.length === 1 && attempts[0]?.role === "builder" && task.attention === "needs-user")) taskDiagnostics.push(diagnostic("invalid-task", "Reviewing Tasks require a latest Reviewer Attempt unless Review is durably paused before dispatch.", taskPath));
+		if (task.phase === "reworking" && (currentAttempts.length < 3 || !latestBuilder || (latestBuilder.replacement === undefined && latestBuilder.state !== "ended-error" && !isReworkDispatch(latestBuilder.dispatch) && !isIntegrationReworkDispatch(latestBuilder.dispatch) && !isFinalVerificationReworkDispatch(latestBuilder.dispatch)))) taskDiagnostics.push(diagnostic("invalid-task", "Reworking Tasks require a latest reserved rework or transient ended-error Builder Attempt.", taskPath));
+		if (task.phase === "reviewing" && !latestReviewer && !(currentAttempts.length === 1 && currentAttempts[0]?.role === "builder" && task.attention === "needs-user")) taskDiagnostics.push(diagnostic("invalid-task", "Reviewing Tasks require a latest Reviewer Attempt unless Review is durably paused before dispatch.", taskPath));
 		if (task.phase === "reviewing" && latestReviewer && latestReviewer.state === "reported" && task.attention === "needs-user" && latestReviewer.integrity?.kind !== "violated" && latestReviewer.evidence?.phase !== "finalized") taskDiagnostics.push(diagnostic("invalid-task", "A reported Reviewer with needs-user attention requires finalized evidence or a recorded integrity violation.", taskPath));
 		if (task.phase === "reviewing" && latestReviewer && task.attention === "needs-user" && latestReviewer.evidence?.phase === "finalized" && latestReviewer.evidence.verdict === "changes-required") {
 			if (!boundedText(task.attentionDiagnostic, 2_000)) taskDiagnostics.push(diagnostic("invalid-task", "A paused changes-required Review requires a bounded durable diagnostic.", `${taskPath}.attentionDiagnostic`));
@@ -3119,7 +3436,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
 		if (contractResult.value) taskIds.add(contractResult.value.id);
 		if (taskDiagnostics.length > 0 || !contractResult.value || typeof task.specificationHash !== "string") diagnostics.push(...taskDiagnostics);
-		else tasks.push({ specificationVersion: 1, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, ...(hasAttentionDiagnostic ? { attentionDiagnostic: task.attentionDiagnostic as string } : {}), ...(hasAttentionReason ? { attentionReason: task.attentionReason as TaskAttentionReason } : {}), attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}), ...(integration.value ? { integration: integration.value } : {}), ...(hasIntegrationRecoveries ? { integrationRecoveries } : {}), ...(hasFinalVerificationReworks ? { finalVerificationReworks } : {}) });
+		else tasks.push({ specificationVersion: task.specificationVersion as number, specificationHash: task.specificationHash, contract: contractResult.value, phase: task.phase as TaskPhase, attention: task.attention as TaskAttention, ...(hasAttentionDiagnostic ? { attentionDiagnostic: task.attentionDiagnostic as string } : {}), ...(hasAttentionReason ? { attentionReason: task.attentionReason as TaskAttentionReason } : {}), attempts, reworkCycles: task.reworkCycles as number, ...(approval.value ? { approval: approval.value } : {}), ...(integration.value ? { integration: integration.value } : {}), ...(hasIntegrationRecoveries ? { integrationRecoveries } : {}), ...(hasFinalVerificationReworks ? { finalVerificationReworks } : {}) });
 	}
 	if (!plans.value || plans.diagnostics.length > 0) diagnostics.push(...plans.diagnostics.map((item: ConfigDiagnostic) => diagnostic("invalid-config", item.message, item.path)));
 	const settings = validateRecoveryDefaults(value.effectiveSettings, `${path}.effectiveSettings`);
@@ -3200,6 +3517,96 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	diagnostics.push(...finalVerification.diagnostics);
 	const finalVerificationExecution = hasFinalVerificationExecution && finalVerification.value ? validateFinalVerificationExecution(value.finalVerificationExecution, `${path}.finalVerificationExecution`, finalVerification.value) : { diagnostics: [] };
 	diagnostics.push(...finalVerificationExecution.diagnostics);
+	const revisions: RunRevisionRecord[] = [];
+	if (hasRevisions && Array.isArray(value.revisions) && finalVerification.value) {
+		for (let revisionIndex = 0; revisionIndex < value.revisions.length; revisionIndex += 1) {
+			const result = validateRunRevisionRecord(value.revisions[revisionIndex], `${path}.revisions[${revisionIndex}]`, finalVerification.value, options.journalRevision);
+			if (result.value) revisions.push(result.value);
+			diagnostics.push(...result.diagnostics);
+		}
+		for (let revisionIndex = 0; revisionIndex < revisions.length; revisionIndex += 1) {
+			const revision = revisions[revisionIndex]!;
+			if (revision.revision !== revisionIndex + 2) diagnostics.push(diagnostic("invalid-run", "Run revision numbers must be contiguous starting at 2.", `${path}.revisions[${revisionIndex}].revision`));
+			if (revisionIndex > 0 && revision.basisJournalRevision <= revisions[revisionIndex - 1]!.basisJournalRevision) diagnostics.push(diagnostic("invalid-run", "Run revision basis Journal revisions must advance in order.", `${path}.revisions[${revisionIndex}].basisJournalRevision`));
+			if (revision.invalidatedFinalVerification && revision.taskDeltas.length === 0) diagnostics.push(diagnostic("invalid-run", "Final-verification invalidation requires a Task specification revision.", `${path}.revisions[${revisionIndex}].invalidatedFinalVerification`));
+			for (const delta of revision.taskDeltas) {
+				const priorRevision = revisions.slice(0, revisionIndex).flatMap((candidate) => candidate.taskDeltas).reverse().find((candidate) => candidate.taskId === delta.taskId);
+				if (priorRevision && (delta.before.specificationVersion !== priorRevision.after.specificationVersion || delta.before.specificationHash !== priorRevision.after.specificationHash || JSON.stringify(delta.before.contract) !== JSON.stringify(priorRevision.after.contract))) diagnostics.push(diagnostic("invalid-run", "Revision Task history must continue from the immediately preceding specification.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				if (!priorRevision && delta.before.specificationVersion !== 1) diagnostics.push(diagnostic("invalid-run", "The first retained Task revision must begin at specification version 1.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				const task = tasks.find((candidate) => candidate.contract.id === delta.taskId);
+				if (!task || task.specificationVersion < delta.after.specificationVersion || task.contract.id !== delta.after.contract.id) diagnostics.push(diagnostic("invalid-run", "Revision Task delta must belong to an existing current Task lineage.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				if (task && delta.after.specificationVersion === task.specificationVersion && (delta.after.specificationHash !== task.specificationHash || JSON.stringify(delta.after.contract) !== JSON.stringify(task.contract))) diagnostics.push(diagnostic("invalid-run", "The current Task must match the last retained revision specification.", `${path}.tasks.${delta.taskId}`));
+				if (task) for (const attemptId of delta.cancelledAttemptIds) {
+					const attempt = task.attempts.find((candidate) => candidate.id === attemptId);
+					if (!attempt || attempt.state !== "cancelled" || attemptSpecificationVersion(attempt) !== delta.before.specificationVersion || !attempt.revisionCancellation || attempt.revisionCancellation.owningRunRevision !== revision.revision || attempt.revisionCancellation.oldSpecificationVersion !== delta.before.specificationVersion || attempt.revisionCancellation.oldSpecificationHash !== delta.before.specificationHash || attempt.revisionCancellation.replacementSpecificationVersion !== delta.after.specificationVersion || attempt.revisionCancellation.replacementSpecificationHash !== delta.after.specificationHash) diagnostics.push(diagnostic("invalid-run", "Revision cancellation must bind its Task delta, old/new versions and hashes, and owning revision.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				}
+				if (task) {
+					const expectedCancelledAttemptIds = task.attempts.filter((attempt) => attempt.revisionCancellation?.owningRunRevision === revision.revision).map((attempt) => attempt.id);
+					if (JSON.stringify(expectedCancelledAttemptIds) !== JSON.stringify(delta.cancelledAttemptIds)) diagnostics.push(diagnostic("invalid-run", "Revision cancellation IDs must exactly enumerate the cancelled Attempts owned by this Task revision.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				}
+				if (task) for (const invalidated of delta.invalidatedReviewerAttempts) {
+					const reviewer = task.attempts.find((candidate): candidate is ReviewerAttemptRecord => candidate.id === invalidated.attemptId && candidate.role === "reviewer");
+					if (!reviewer || attemptSpecificationVersion(reviewer) !== delta.before.specificationVersion || reviewer.evidence?.phase !== "finalized" || reviewer.evidence.manifestPath !== invalidated.manifestPath || reviewer.evidence.manifestSha256 !== invalidated.manifestSha256) diagnostics.push(diagnostic("invalid-run", "Invalidated Reviewer history must bind a finalized Reviewer manifest from the superseded Task specification.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				}
+				if (task) {
+					const expectedInvalidatedReviewers = task.attempts.filter((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer" && attemptSpecificationVersion(attempt) === delta.before.specificationVersion && attempt.evidence?.phase === "finalized").map((reviewer) => ({ attemptId: reviewer.id, manifestPath: reviewer.evidence!.manifestPath, manifestSha256: reviewer.evidence!.manifestSha256 }));
+					if (JSON.stringify(expectedInvalidatedReviewers) !== JSON.stringify(delta.invalidatedReviewerAttempts)) diagnostics.push(diagnostic("invalid-run", "Revision Reviewer invalidations must retain every finalized Reviewer identity from the superseded specification.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				}
+			if (task) {
+				const oldAttempts = task.attempts.filter((attempt) => attemptSpecificationVersion(attempt) === delta.before.specificationVersion);
+				const currentAttemptForId = (attemptId: string, role: "builder" | "reviewer"): AttemptRecord | undefined => task.attempts.find((attempt) => attempt.id === attemptId && attempt.role === role && attemptSpecificationVersion(attempt) === task.specificationVersion);
+				const oldAttempt = (attemptId: string, role: "builder" | "reviewer"): AttemptRecord | undefined => oldAttempts.find((attempt) => attempt.id === attemptId && attempt.role === role);
+				const expectedPriorReworkCycles = oldAttempts.filter((attempt) => attempt.role === "builder" && attempt.replacement === undefined && (isReworkDispatch(attempt.dispatch) || isIntegrationReworkDispatch(attempt.dispatch) || isFinalVerificationReworkDispatch(attempt.dispatch))).length;
+				if (delta.priorReworkCycles !== expectedPriorReworkCycles) diagnostics.push(diagnostic("invalid-run", "Revision history must retain the superseded Task's exact rework counter.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				if (delta.after.specificationVersion === task.specificationVersion && task.approval?.phase === "valid" && (!currentAttemptForId(task.approval.builderAttemptId, "builder") || !currentAttemptForId(task.approval.reviewerAttemptId, "reviewer"))) diagnostics.push(diagnostic("invalid-run", "A current valid Approval after revision must bind only current-specification Attempts.", `${path}.tasks.${delta.taskId}.approval`));
+				if (delta.after.specificationVersion === task.specificationVersion && task.integration && (!currentAttemptForId(task.integration.builderAttemptId, "builder") || !currentAttemptForId(task.integration.reviewerAttemptId, "reviewer"))) diagnostics.push(diagnostic("invalid-run", "Current integration after revision must bind only current-specification Attempts; archived integration belongs in revision history.", `${path}.tasks.${delta.taskId}.integration`));
+				for (const recovery of task.integrationRecoveries ?? []) if (delta.after.specificationVersion === task.specificationVersion && (!currentAttemptForId(recovery.builderAttemptId, "builder") || !currentAttemptForId(recovery.reviewerAttemptId, "reviewer") || !currentAttemptForId(recovery.replacementBuilderAttemptId, "builder"))) diagnostics.push(diagnostic("invalid-run", "Current integration-recovery history after revision must bind only current-specification Attempts.", `${path}.tasks.${delta.taskId}.integrationRecoveries`));
+				for (const rework of task.finalVerificationReworks ?? []) if (delta.after.specificationVersion === task.specificationVersion && (!currentAttemptForId(rework.priorBuilderAttemptId, "builder") || !currentAttemptForId(rework.priorReviewerAttemptId, "reviewer") || !currentAttemptForId(rework.replacementBuilderAttemptId, "builder"))) diagnostics.push(diagnostic("invalid-run", "Current final-verification rework history after revision must bind only current-specification Attempts.", `${path}.tasks.${delta.taskId}.finalVerificationReworks`));
+				if (delta.priorApproval) {
+						const builder = oldAttempt(delta.priorApproval.builderAttemptId, "builder");
+						const reviewer = oldAttempt(delta.priorApproval.reviewerAttemptId, "reviewer");
+						if (!builder || !reviewer) diagnostics.push(diagnostic("invalid-run", "Revision Approval history must reference Builder and Reviewer Attempts from the superseded specification.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+						if (delta.after.specificationVersion === task.specificationVersion && delta.priorApproval.phase === "valid" && (!task.approval || task.approval.phase !== "invalidated" || task.approval.reason !== "task-specification-revised" || task.approval.approvedAt !== delta.priorApproval.approvedAt || task.approval.builderAttemptId !== delta.priorApproval.builderAttemptId || task.approval.reviewerAttemptId !== delta.priorApproval.reviewerAttemptId || JSON.stringify(task.approval.subject) !== JSON.stringify(delta.priorApproval.subject) || task.approval.reviewerManifestPath !== delta.priorApproval.reviewerManifestPath || task.approval.reviewerManifestSha256 !== delta.priorApproval.reviewerManifestSha256 || JSON.stringify(task.approval.worktreeSnapshot) !== JSON.stringify(delta.priorApproval.worktreeSnapshot) || task.approval.verdict !== delta.priorApproval.verdict)) diagnostics.push(diagnostic("invalid-run", "Revision Approval history must match the current task-specification invalidation.", `${path}.tasks.${delta.taskId}.approval`));
+					} else if (delta.after.specificationVersion === task.specificationVersion && task.approval?.phase === "invalidated" && task.approval.reason === "task-specification-revised") diagnostics.push(diagnostic("invalid-run", "A task-specification Approval invalidation requires its prior Approval in revision history.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+					if (delta.priorIntegration) {
+						const builder = oldAttempt(delta.priorIntegration.builderAttemptId, "builder");
+						const reviewer = oldAttempt(delta.priorIntegration.reviewerAttemptId, "reviewer");
+						const subject = reviewer?.role === "reviewer" && reviewer.subject.kind === "git" ? reviewer.subject : undefined;
+						if (!builder || !reviewer || builder.evidence?.phase !== "finalized" || reviewer.evidence?.phase !== "finalized" || !subject || delta.priorIntegration.builderManifestSha256 !== builder.evidence.manifestSha256 || delta.priorIntegration.reviewerManifestSha256 !== reviewer.evidence.manifestSha256 || delta.priorIntegration.approvedBaseRevision !== subject.baseRevision || delta.priorIntegration.approvedHeadRevision !== subject.headRevision || JSON.stringify(delta.priorIntegration.approvedCommits) !== JSON.stringify(subject.commits) || delta.priorIntegration.action.argv[3] !== subject.headRevision) diagnostics.push(diagnostic("invalid-run", "Revision integration history must bind the superseded Builder, Reviewer, subject, and manifests exactly.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+					}
+					if (delta.priorIntegrationRecoveries) for (const recovery of delta.priorIntegrationRecoveries) {
+						const builder = oldAttempt(recovery.builderAttemptId, "builder");
+						const reviewer = oldAttempt(recovery.reviewerAttemptId, "reviewer");
+						const replacement = oldAttempt(recovery.replacementBuilderAttemptId, "builder");
+						if (!builder || builder.role !== "builder" || !reviewer || reviewer.role !== "reviewer" || !replacement || replacement.role !== "builder" || builder.evidence?.phase !== "finalized" || reviewer.evidence?.phase !== "finalized" || recovery.builderManifestSha256 !== builder.evidence.manifestSha256 || recovery.reviewerManifestSha256 !== reviewer.evidence.manifestSha256 || !isIntegrationReworkDispatch(replacement.dispatch)) diagnostics.push(diagnostic("invalid-run", "Revision integration-recovery history must reference the superseded specification's exact Attempts and evidence.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+					}
+					if (delta.priorFinalVerificationReworks) for (const rework of delta.priorFinalVerificationReworks) {
+						const builder = oldAttempt(rework.priorBuilderAttemptId, "builder");
+						const reviewer = oldAttempt(rework.priorReviewerAttemptId, "reviewer");
+						const replacement = oldAttempt(rework.replacementBuilderAttemptId, "builder");
+						if (!builder || builder.role !== "builder" || !reviewer || reviewer.role !== "reviewer" || !replacement || replacement.role !== "builder" || !isFinalVerificationReworkDispatch(replacement.dispatch) || rework.priorIntegration.builderAttemptId !== rework.priorBuilderAttemptId || rework.priorIntegration.reviewerAttemptId !== rework.priorReviewerAttemptId) diagnostics.push(diagnostic("invalid-run", "Revision final-verification rework history must reference the superseded specification's exact Attempts.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+					}
+					if (!delta.priorIntegration && (delta.priorIntegrationRecoveries?.length || delta.priorFinalVerificationReworks?.length)) diagnostics.push(diagnostic("invalid-run", "Revision rework history requires its superseded integration identity.", `${path}.revisions[${revisionIndex}].taskDeltas`));
+				}
+			}
+		}
+		const modelPlanRevisions = revisions.filter((candidate) => candidate.modelPlanDelta);
+		for (let modelIndex = 1; modelIndex < modelPlanRevisions.length; modelIndex += 1) {
+			const previous = modelPlanRevisions[modelIndex - 1]!.modelPlanDelta!;
+			const current = modelPlanRevisions[modelIndex]!.modelPlanDelta!;
+			if (JSON.stringify(previous.after) !== JSON.stringify(current.before)) diagnostics.push(diagnostic("invalid-run", "Revision Model Plan history must continue from the immediately preceding plan.", `${path}.revisions`));
+		}
+		const latestModelPlan = modelPlanRevisions.at(-1)?.modelPlanDelta;
+		if (latestModelPlan && plans.value && JSON.stringify(plans.value) !== JSON.stringify(latestModelPlan.after)) diagnostics.push(diagnostic("invalid-run", "The current Run Model Plan must match its latest retained revision.", `${path}.modelPlan`));
+		if (revisions.some((revision) => revision.invalidatedFinalVerification) && finalVerificationExecution.value) diagnostics.push(diagnostic("invalid-run", "A terminal final verification moved into revision history cannot remain current.", `${path}.finalVerificationExecution`));
+		const latestRevisionByTask = new Map<string, RunRevisionTaskDelta>();
+		for (const revision of revisions) for (const delta of revision.taskDeltas) latestRevisionByTask.set(delta.taskId, delta);
+		for (const task of tasks) {
+			const latestRevision = latestRevisionByTask.get(task.contract.id);
+			if (latestRevision && (task.specificationVersion !== latestRevision.after.specificationVersion || task.specificationHash !== latestRevision.after.specificationHash || JSON.stringify(task.contract) !== JSON.stringify(latestRevision.after.contract))) diagnostics.push(diagnostic("invalid-run", "The current Task must match its latest retained revision specification.", `${path}.tasks.${task.contract.id}`));
+			if (!latestRevision && task.specificationVersion !== 1) diagnostics.push(diagnostic("invalid-run", "A Task with no retained revision history must remain at specification version 1.", `${path}.tasks.${task.contract.id}.specificationVersion`));
+		}
+	}
 	const completion = hasCompletion ? validateCompletion(value.completion, `${path}.completion`) : { diagnostics: [] };
 	diagnostics.push(...completion.diagnostics);
 	const monitor = hasMonitor ? validateMonitorCheckpoint(value.monitor, `${path}.monitor`, { createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, tasks }) : { diagnostics: [] };
@@ -3309,6 +3716,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			modelPlan: cloneModelPlans(plans.value),
 			effectiveSettings: cloneRecoveryDefaults(settings.value),
 			finalVerification: finalVerification.value,
+			...(revisions.length > 0 ? { revisions } : {}),
 			...(finalVerificationExecution.value ? { finalVerificationExecution: finalVerificationExecution.value } : {}),
 			...(completion.value ? { completion: completion.value } : {}),
 			...(monitor.value ? { monitor: monitor.value } : {}),
@@ -3580,6 +3988,7 @@ export function cloneRunJournal(journal: RunJournal): RunJournal {
 			modelPlan: cloneModelPlans(journal.run.modelPlan),
 			effectiveSettings: cloneRecoveryDefaults(journal.run.effectiveSettings),
 			finalVerification: cloneVerification(journal.run.finalVerification),
+			...(journal.run.revisions ? { revisions: journal.run.revisions.map(cloneRunRevision) } : {}),
 			...(journal.run.finalVerificationExecution ? { finalVerificationExecution: cloneVerificationExecution(journal.run.finalVerificationExecution) } : {}),
 			...(journal.run.completion ? { completion: cloneCompletion(journal.run.completion) } : {}),
 			...(journal.run.monitor ? { monitor: cloneMonitorCheckpoint(journal.run.monitor) } : {}),
@@ -3716,6 +4125,41 @@ export function validateRunDraft(draft: unknown, fallbackSettings: RecoveryDefau
 	}
 }
 
+/** Validate a revision draft without consulting volatile adapters or mutating the Journal. */
+export function validateRunRevisionDraft(draft: unknown, journal: RunJournal): { value?: RunRevisionDraft; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(draft) || !exactKeys(draft, ["tasks", "modelPlan"]) || !Array.isArray(draft.tasks)) return { diagnostics: [diagnostic("invalid-contract", "Revision drafts must contain exactly the ordered tasks and Model Plan.", "revision")] };
+	const diagnostics: RunDiagnostic[] = [];
+	const tasks: RunRevisionDraftTask[] = [];
+	if (draft.tasks.length !== journal.run.tasks.length) diagnostics.push(diagnostic("invalid-contract", "Revision drafts cannot add or remove Tasks.", "revision.tasks"));
+	for (let index = 0; index < draft.tasks.length; index += 1) {
+		const item = draft.tasks[index];
+		const taskPath = `revision.tasks[${index}]`;
+		if (!isRecord(item) || !exactKeys(item, ["id", "contract"]) || typeof item.id !== "string") {
+			diagnostics.push(diagnostic("invalid-contract", "Revision Task drafts must contain exactly id and contract.", taskPath));
+			continue;
+		}
+		const current = journal.run.tasks[index];
+		const contract = validateContract(item.contract, `${taskPath}.contract`, true);
+		diagnostics.push(...contract.diagnostics);
+		if (!current || item.id !== current.contract.id || contract.value?.id !== current.contract.id) diagnostics.push(diagnostic("invalid-contract", "Revision drafts must preserve immutable Task IDs and array order.", `${taskPath}.id`));
+		if (current && contract.value && (current.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") !== contract.value.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"))) diagnostics.push(diagnostic("invalid-contract", "Revision drafts cannot change a Task between code-changing and non-code classification.", `${taskPath}.contract.expectedArtifacts`));
+		if (contract.value) tasks.push({ id: contract.value.id, contract: contract.value });
+	}
+	const modelPlan = validateProjectModelPlans(draft.modelPlan, "revision.modelPlan");
+	if (!modelPlan.value || modelPlan.diagnostics.length > 0) diagnostics.push(...modelPlan.diagnostics.map((item) => diagnostic("invalid-config", item.message, item.path)));
+	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+		const current = journal.run.tasks[index]!;
+		const proposed = tasks[index];
+		if (!proposed) continue;
+		const changed = JSON.stringify(current.contract) !== JSON.stringify(proposed.contract);
+		if (changed && current.integration?.phase === "integrated" && journal.run.tasks.slice(index + 1).some((later) => later.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") && later.integration?.phase === "integrated")) diagnostics.push(diagnostic("invalid-contract", "An integrated code Task may be revised only when it is the last integrated code Task.", `revision.tasks[${index}]`));
+	}
+	if (diagnostics.length > 0 || !modelPlan.value || tasks.length !== journal.run.tasks.length) return { diagnostics };
+	const normalized: RunRevisionDraft = { tasks, modelPlan: cloneModelPlans(modelPlan.value) };
+	if (tasks.every((task, index) => JSON.stringify(task.contract) === JSON.stringify(journal.run.tasks[index]!.contract)) && JSON.stringify(normalized.modelPlan) === JSON.stringify(journal.run.modelPlan)) diagnostics.push(diagnostic("invalid-contract", "Revision draft does not change any Task or Model Plan field.", "revision"));
+	return diagnostics.length > 0 ? { diagnostics } : { value: normalized, diagnostics: [] };
+}
+
 export function createActivityEntry(timestamp: Date, runId: string): ActivityEntry {
 	return { timestamp: timestamp.toISOString(), runId, event: "run-started", message: "Run Journal created; all Tasks are pending." };
 }
@@ -3770,6 +4214,55 @@ export function buildRunConfirmationSummary(input: {
 		activityLogPath: input.activityLogPath,
 		markdown,
 	};
+}
+
+export function buildRunRevisionConfirmationSummary(input: {
+	journal: RunJournal;
+	draft: RunRevisionDraft;
+	taskDeltas?: RunRevisionTaskDelta[];
+	modelPlanDelta?: RunRevisionModelPlanDelta;
+	basisJournalRevision?: number;
+}): RunRevisionConfirmationSummary {
+	const taskDeltas: RunRevisionTaskDelta[] = input.taskDeltas ?? input.journal.run.tasks.flatMap((task, index): RunRevisionTaskDelta[] => {
+		const proposed = input.draft.tasks[index];
+		if (!proposed || JSON.stringify(task.contract) === JSON.stringify(proposed.contract)) return [];
+		return [{
+			taskId: task.contract.id,
+			before: { specificationVersion: task.specificationVersion, specificationHash: task.specificationHash, contract: cloneContract(task.contract) },
+			after: { specificationVersion: task.specificationVersion + 1, specificationHash: specificationHash(proposed.contract), contract: cloneContract(proposed.contract) },
+			priorReworkCycles: task.reworkCycles,
+			cancelledAttemptIds: [],
+			invalidatedReviewerAttempts: [],
+		}];
+	});
+	const modelPlanDelta = input.modelPlanDelta ?? (JSON.stringify(input.journal.run.modelPlan) === JSON.stringify(input.draft.modelPlan) ? undefined : { before: cloneModelPlans(input.journal.run.modelPlan), after: cloneModelPlans(input.draft.modelPlan) });
+	const run = input.journal.run;
+	const lines = [`Run ${run.id} revision ${input.journal.run.revisions?.length ? (input.journal.run.revisions.length + 2) : 2}`, `Basis Journal revision: ${input.basisJournalRevision ?? input.journal.journalRevision}`, "", "Task deltas:"];
+	for (const delta of taskDeltas) {
+		const task = run.tasks.find((candidate) => candidate.contract.id === delta.taskId);
+		const cancelledReviewers = task?.attempts.filter((attempt) => attempt.role === "reviewer" && delta.cancelledAttemptIds.includes(attempt.id)).map((attempt) => `${attempt.id} cancelled (no finalized Review manifest was retained)`) ?? [];
+		const reviewInvalidations = [...delta.invalidatedReviewerAttempts.map((reviewer) => `${reviewer.attemptId} (${reviewer.manifestSha256})`), ...cancelledReviewers];
+		lines.push(`- ${delta.taskId}: specification ${delta.before.specificationVersion} -> ${delta.after.specificationVersion}`, `  hash: ${delta.before.specificationHash} -> ${delta.after.specificationHash}`);
+		const contractFields: Array<[string, string, string]> = [
+			["requiredOutcome", delta.before.contract.requiredOutcome, delta.after.contract.requiredOutcome],
+			["allowedScope", delta.before.contract.allowedScope.join(", "), delta.after.contract.allowedScope.join(", ")],
+			["expectedArtifacts", JSON.stringify(delta.before.contract.expectedArtifacts), JSON.stringify(delta.after.contract.expectedArtifacts)],
+			["verification", JSON.stringify(delta.before.contract.verification), JSON.stringify(delta.after.contract.verification)],
+			["reviewRequired", String(delta.before.contract.reviewRequired), String(delta.after.contract.reviewRequired)],
+		];
+		for (const [field, before, after] of contractFields) if (before !== after) lines.push(`  ${field}: ${before} -> ${after}`);
+		lines.push(`  cancelled Attempts: ${delta.cancelledAttemptIds.length > 0 ? delta.cancelledAttemptIds.join(", ") : "none"}`, `  Review invalidations: ${reviewInvalidations.length > 0 ? reviewInvalidations.join(", ") : "none"}`);
+		if (delta.priorApproval) lines.push(`  Approval invalidation: ${delta.priorApproval.phase} -> task-specification-revised`);
+		if (delta.priorIntegration) lines.push(`  Integration invalidation: ${delta.priorIntegration.phase} at ${delta.priorIntegration.phase === "integrated" ? delta.priorIntegration.observedHead : delta.priorIntegration.targetRevision}`);
+		if (delta.priorFinalVerificationReworks?.length) lines.push(`  Final-verification rework history invalidated: ${delta.priorFinalVerificationReworks.length} record(s)`);
+	}
+	const changedTaskIds = new Set(taskDeltas.map((delta) => delta.taskId));
+	for (const task of run.tasks) if (!changedTaskIds.has(task.contract.id)) lines.push(`- ${task.contract.id} preserved exactly (contract, version/hash, Attempts, evidence, Approval, integration, monitors).`);
+	if (modelPlanDelta) lines.push("", `Builder Model Plan: ${JSON.stringify(modelPlanDelta.before.builder)} -> ${JSON.stringify(modelPlanDelta.after.builder)}`, `Reviewer Model Plan: ${JSON.stringify(modelPlanDelta.before.reviewer)} -> ${JSON.stringify(modelPlanDelta.after.reviewer)}`);
+	else lines.push("", "Model Plan: unchanged");
+	if (run.finalVerificationExecution && taskDeltas.length > 0 && (run.finalVerificationExecution.phase === "passed" || run.finalVerificationExecution.phase === "failed")) lines.push("", `Final verification invalidation: terminal ${run.finalVerificationExecution.phase} execution will be retained in revision history.`);
+	lines.push("", "No Assignment, report, manifest, log, worktree, or evidence bytes are deleted or rewritten.");
+	return { runId: run.id, basisJournalRevision: input.basisJournalRevision ?? input.journal.journalRevision, tasks: taskDeltas.map(cloneRevisionTaskDelta), ...(modelPlanDelta ? { modelPlanDelta: { before: cloneModelPlans(modelPlanDelta.before), after: cloneModelPlans(modelPlanDelta.after) } } : {}), markdown: lines.join("\n") };
 }
 
 function formatModelPlan(plan: ProjectModelPlans["builder"]): string {

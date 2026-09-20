@@ -21,6 +21,7 @@ import type { AssignmentCreateResult, AssignmentPaths } from "./assignment-store
 import {
 	buildInitialRunJournal,
 	buildRunConfirmationSummary,
+	buildRunRevisionConfirmationSummary,
 	createRunIdentity,
 	isCodeChanging,
 	advanceRunJournal,
@@ -34,11 +35,23 @@ import {
 	evaluateCompletionGate,
 	COMPLETION_GATE_PREDICATES,
 	validateRunDraft,
+	validateRunRevisionDraft,
+	specificationHash,
+	cloneRunJournal,
 	type IntegrationBase,
 	type RunConfirmationSummary,
 	type RunDraft,
 	type RunDraftInput,
 	type RunDraftResult,
+	type RunRevisionDraft,
+	type RunRevisionDraftInput,
+	type RunRevisionDraftResult,
+	type RunRevisionConfirmationSummary,
+	type RunRevisionTaskDelta,
+	type RunRevisionModelPlanDelta,
+	type RevisionAttemptCancellation,
+	type RecoveryStop,
+	type RunRevisionRecord,
 	type RunJournal,
 	type AttemptRecord,
 	type BuilderAttemptRecord,
@@ -172,6 +185,22 @@ function hasAssignmentIdentity(attempt: AttemptRecord): attempt is AssignmentAtt
 	return attempt.dispatch.phase === "prompt-intended" || hasProvenAgentIdentity(attempt);
 }
 
+function attemptSpecificationVersion(attempt: AttemptRecord): number {
+	return attempt.specificationVersion ?? 1;
+}
+
+function currentAttempts(task: TaskRecord): AttemptRecord[] {
+	return task.attempts.filter((attempt) => attemptSpecificationVersion(attempt) === task.specificationVersion && attempt.state !== "cancelled");
+}
+
+function currentAttempt(task: TaskRecord): AttemptRecord | undefined {
+	return currentAttempts(task).at(-1);
+}
+
+function currentAttemptForTask(task: TaskRecord): AttemptRecord | undefined {
+	return currentAttempt(task);
+}
+
 function attemptIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
 	if (!hasProvenAgentIdentity(attempt)) return undefined;
 	const dispatch = attempt.dispatch;
@@ -251,6 +280,9 @@ export interface StewardUiAdapter {
 	presentConfigurationResult(result: ConfigureResult): void;
 	draftRun(input: RunDraftInput): Promise<RunDraftResult>;
 	confirmRun(summary: RunConfirmationSummary): Promise<boolean>;
+	draftRunRevision?(input: RunRevisionDraftInput): Promise<RunRevisionDraftResult>;
+	confirmRunRevision?(summary: RunRevisionConfirmationSummary): Promise<boolean>;
+	presentRevisionResult?(result: RevisionResult): void;
 	confirmSameFamilyReview?(input: { builderModel: import("./config.ts").ModelChoice; reviewerModel: import("./config.ts").ModelChoice; subject: ReviewSubject; provider: string }): Promise<boolean>;
 	presentStartResult(result: StartResult): void;
 	presentResumeResult?(result: ResumeResult): void;
@@ -531,7 +563,7 @@ export interface ActiveAttemptStatusView {
 	taskPhase: "building" | "reworking" | "reviewing" | "approved";
 	attemptId: string;
 	role: "builder";
-	attemptState: "prepared" | "active" | "awaiting-report" | "reported" | "ended-error" | "superseded";
+	attemptState: "prepared" | "active" | "awaiting-report" | "reported" | "ended-error" | "superseded" | "cancelled";
 	assignmentPath?: string;
 	assignmentHash?: string;
 	actualModel?: import("./config.ts").ModelChoice;
@@ -579,6 +611,13 @@ export type StartResult =
 	| { kind: "started-with-warning"; journal: RunJournal; message: string }
 	| { kind: "storage-error"; message: string };
 
+export type RevisionResult =
+	| { kind: "cancelled"; message: string }
+	| { kind: "refused"; message: string }
+	| { kind: "missing" | "invalid" | "foreign-session" | "stale"; message: string; recordedSessionId?: string; currentSessionId?: string }
+	| { kind: "revised"; journal: RunJournal; message: string }
+	| { kind: "ambiguous"; journal: RunJournal; message: string };
+
 /** The ticket-01 and ticket-02 orchestration operations. */
 export interface Steward {
 	status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView>;
@@ -589,6 +628,7 @@ export interface Steward {
 	recordCompactionFailure(repositoryRoot: string, controllerSessionId: string, details: CompactionFailureDetails): Promise<{ kind: "recorded" | "ignored" | "degraded"; message: string }>;
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
 	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
+	revise(repositoryRoot: string, controllerSessionId: string): Promise<RevisionResult>;
 	waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult>;
 	observeMonitorProgress(repositoryRoot: string, controllerSessionId: string, trigger: MonitorTrigger): Promise<MonitorPassResult>;
 	advanceNext(repositoryRoot: string, controllerSessionId: string, options: MonitorAdvanceOptions): Promise<MonitorPassResult>;
@@ -676,8 +716,8 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 	if (journal.run.status === "completing" || journal.run.tasks.some((candidate) => candidate.phase === "integrating" || candidate.phase === "completed")) return presentCompletionStatus(journal, note);
 	if (journal.run.tasks.some((candidate) => candidate.phase === "approved")) return presentApprovedStatus(journal, note);
 	if (journal.run.tasks.some((candidate) => candidate.phase === "reviewing")) return presentReviewStatus(journal, note);
-	const task = journal.run.tasks.find((candidate) => (candidate.phase === "building" || candidate.phase === "reworking") && candidate.attempts.at(-1)?.role === "builder");
-	const attempt = task?.attempts.at(-1);
+	const task = journal.run.tasks.find((candidate) => (candidate.phase === "building" || candidate.phase === "reworking") && currentAttempt(candidate)?.role === "builder");
+	const attempt = task ? currentAttempt(task) : undefined;
 	if (!task || !attempt) {
 		return {
 			kind: "present",
@@ -755,13 +795,13 @@ function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatu
 	const queue = selectIntegrationQueueHead(journal.run);
 	const nextIntegration = queue.kind === "ready" || queue.kind === "waiting" ? queue.taskId : "none";
 	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(journal.run.finalVerificationExecution ? finalVerificationStatusLines(journal.run.finalVerificationExecution) : []), ...journal.run.tasks.map((task, index) => {
-		const attempt = task.attempts.at(-1);
+		const attempt = currentAttempt(task);
 		const integration = task.integration?.phase ?? (task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? "queued" : "n/a");
 		const reason = task.attention !== "none" ? `/${task.attention}${task.attentionReason ? `:${task.attentionReason}` : ""}` : "";
 		return `Task ${index + 1} ${task.contract.id}: ${task.phase}${reason} · ${attempt ? `${attempt.role}/${attempt.id}/${attempt.state}` : "no-attempt"} · integration ${integration}${task.integration?.phase === "ambiguous" ? ` · observed ${task.integration.observed.branch ?? "detached"}@${task.integration.observed.head ?? "unknown"}` : task.integration?.phase === "integrated" ? ` · applied @${task.integration.observedHead}` : ""}`;
 	}), `Tasks ${integrated}/${codeTasks.length} integrated | Active ${active}/${journal.run.effectiveSettings.maximumActiveTasks} | Approved waiting ${approved} | Attention ${attention} | Next integration ${nextIntegration}`];
 	const detail = journal.run.tasks.find((task) => activePhases.has(task.phase) || task.attention !== "none");
-	const detailAttempt = detail?.attempts.at(-1);
+	const detailAttempt = detail ? currentAttempt(detail) : undefined;
 	if (detail && detailAttempt) {
 		lines.push(`Assignment: ${detailAttempt.assignmentPath}${"assignmentSha256" in detailAttempt.dispatch ? ` (${detailAttempt.dispatch.assignmentSha256})` : ""}`);
 		lines.push(...integrationStatusLines(detail));
@@ -775,7 +815,10 @@ function pendingControllerAction(journal: RunJournal): ControllerPendingAction {
 	const finalExecution = journal.run.finalVerificationExecution;
 	if (finalExecution && isRecoverableFinalVerificationExecution(finalExecution) && (finalExecution.phase === "executing" || finalExecution.phase === "failed")) return { kind: "final-verification" };
 	for (const task of journal.run.tasks) {
-		const attempt = task.attempts.at(-1);
+		const cancelled = task.attempts.find((candidate) => candidate.state === "cancelled" && (candidate.revisionCancellation?.stop.phase === "intended" || candidate.revisionCancellation?.stop.phase === "ambiguous"));
+		if (cancelled?.state === "cancelled" && cancelled.revisionCancellation?.stop.phase === "intended") return { kind: "revision-stop", taskId: task.contract.id, attemptId: cancelled.id, role: cancelled.role };
+		if (cancelled?.state === "cancelled" && cancelled.revisionCancellation?.stop.phase === "ambiguous") return { kind: "wait-attention", taskId: task.contract.id, attemptId: cancelled.id, role: cancelled.role };
+		const attempt = currentAttempt(task);
 		if (attempt && ["prepared", "active", "awaiting-report"].includes(attempt.state) && (attempt.dispatch.phase === "prompt-intended" || attempt.dispatch.phase === "prompted" || attempt.dispatch.phase === "reconciled-active")) return { kind: "reconcile-attempt", taskId: task.contract.id, attemptId: attempt.id, role: attempt.role };
 		if (attempt?.role === "builder" && attempt.state === "reported" && attempt.evidence?.phase !== "finalized") return { kind: "validate-builder-evidence", taskId: task.contract.id, attemptId: attempt.id, role: "builder" };
 		if (task.phase === "reviewing" && attempt?.role === "reviewer" && attempt.state === "reported") return { kind: attempt.evidence?.phase === "finalized" ? "advance-review" : "validate-approval", taskId: task.contract.id, attemptId: attempt.id, role: "reviewer" };
@@ -922,7 +965,7 @@ function buildEvidenceManifest(input: {
 
 function activeBuilders(journal: RunJournal): Array<{ task: TaskRecord; index: number; attempt: BuilderAttemptRecord }> {
 	return journal.run.tasks.flatMap((task, index) => {
-		const attempt = task.attempts[task.attempts.length - 1];
+		const attempt = currentAttempt(task);
 		const reportEligible = attempt?.state === "active" || attempt?.state === "awaiting-report" || (attempt?.state === "prepared" && attempt.dispatch.phase === "prompt-intended");
 		return (task.phase === "building" || task.phase === "reworking") && attempt?.role === "builder" && reportEligible && ["prompt-intended", "prompted", "reconciled-active"].includes(attempt.dispatch.phase) ? [{ task, index, attempt }] : [];
 	});
@@ -1094,8 +1137,8 @@ function reviewTaskCandidate(journal: RunJournal, minimumIndex = 0): { task: Tas
 	for (let index = minimumIndex; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
 		if (!task || !task.contract.reviewRequired) continue;
-		const latest = task.attempts[task.attempts.length - 1];
-		const pausedBeforeReviewer = task.attention === "needs-user" && task.attempts.length === 1;
+		const latest = currentAttempt(task);
+		const pausedBeforeReviewer = task.attention === "needs-user" && currentAttempts(task).length === 1;
 		if ((task.attention !== "none" && !pausedBeforeReviewer) || (task.phase !== "reviewing" && task.phase !== "reworking" && task.phase !== "building") || latest?.role !== "builder") continue;
 		const builder = latest;
 		if (builder.state === "reported" && builder.evidence?.phase === "finalized" && builder.evidence.status === "completed") return { task, index, builder };
@@ -1104,7 +1147,7 @@ function reviewTaskCandidate(journal: RunJournal, minimumIndex = 0): { task: Tas
 }
 
 function reviewerForTask(task: TaskRecord): ReviewerAttemptRecord | undefined {
-	const latest = task.attempts[task.attempts.length - 1];
+	const latest = currentAttempt(task);
 	return latest?.role === "reviewer" ? latest : undefined;
 }
 
@@ -1113,7 +1156,7 @@ function reviewerTaskCandidate(journal: RunJournal, minimumIndex = 0): { task: T
 		const task = journal.run.tasks[index];
 		if (!task || !task.contract.reviewRequired || task.phase !== "reviewing" || task.attention !== "none") continue;
 		const reviewer = reviewerForTask(task);
-		const preceding = task.attempts[task.attempts.length - 2];
+		const preceding = currentAttempts(task).at(-2);
 		if (!reviewer || !preceding || preceding.role !== "builder") continue;
 		if (preceding.state === "reported" && preceding.evidence?.phase === "finalized" && preceding.evidence.status === "completed") return { task, index, builder: preceding, reviewer };
 	}
@@ -1121,7 +1164,7 @@ function reviewerTaskCandidate(journal: RunJournal, minimumIndex = 0): { task: T
 }
 
 function latestReviewerAttempt(task: TaskRecord): ReviewerAttemptRecord | undefined {
-	return [...task.attempts].reverse().find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+	return [...currentAttempts(task)].reverse().find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
 }
 
 function reviewSnapshotFor(value: import("./run.ts").ReviewWorktreeSnapshot): import("./run.ts").ReviewWorktreeSnapshot {
@@ -1147,7 +1190,7 @@ async function pauseReview(repositoryRoot: string, candidate: { task: TaskRecord
 			task.phase = "reviewing";
 			task.attention = "needs-user";
 			task.attentionDiagnostic = note.slice(0, 2_000);
-			const latest = task.attempts.at(-1);
+			const latest = currentAttempt(task);
 			if (latest?.role === "reviewer" && latest.evidence?.phase === "finalized" && latest.evidence.verdict === "changes-required") {
 				const reason: TaskAttentionReason = note.includes("frozen rework limit") ? "rework-exhausted" : note.startsWith("Rework") || note.startsWith("Automatic same-Builder") ? "rework-preflight" : "protected-evidence";
 				task.attentionReason = reason;
@@ -1210,7 +1253,7 @@ async function retainReviewerRepairFailure(repositoryRoot: string, journal: RunJ
 		try {
 			blocked = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 				const task = next.run.tasks[candidate.index];
-				const attempt = task?.attempts[task.attempts.length - 1];
+				const attempt = task ? currentAttempt(task) : undefined;
 				if (!task || !attempt || attempt.role !== "reviewer") throw new Error("Reviewer Attempt disappeared while blocking report repair.");
 				if (reviewer.reportRepair?.phase !== "requested") throw new Error("Reviewer repair is not in requested state.");
 				attempt.reportRepair = { ...reviewer.reportRepair, phase: "blocked", secondFailure: failure, secondDiagnostics: diagnostics, secondObservedReportSha256: observedReportSha256, blockedAt: transitionTimestamp(journal, dependencies.clock.now()) };
@@ -1226,7 +1269,7 @@ async function retainReviewerRepairFailure(repositoryRoot: string, journal: RunJ
 	try {
 		intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const task = next.run.tasks[candidate.index];
-			const attempt = task?.attempts[task.attempts.length - 1];
+				const attempt = task ? currentAttempt(task) : undefined;
 			if (!task || !attempt || attempt.role !== "reviewer") throw new Error("Reviewer Attempt disappeared before repair intent.");
 			attempt.reportRepair = { phase: "request-intended", failure, diagnostics, observedReportSha256, intendedAt: transitionTimestamp(journal, dependencies.clock.now()) };
 		});
@@ -1252,7 +1295,7 @@ async function retainReviewerRepairFailure(repositoryRoot: string, journal: RunJ
 	try {
 		requested = advanceRunJournal(persistedIntent, dependencies.clock.now(), (next) => {
 			const task = next.run.tasks[candidate.index];
-			const attempt = task?.attempts[task.attempts.length - 1];
+				const attempt = task ? currentAttempt(task) : undefined;
 			if (!task || !attempt || attempt.role !== "reviewer" || attempt.reportRepair?.phase !== "request-intended") throw new Error("Reviewer repair intent disappeared after prompt.");
 			attempt.reportRepair = { ...attempt.reportRepair, phase: "requested", requestedAt: transitionTimestamp(persistedIntent, dependencies.clock.now()) };
 		});
@@ -1357,7 +1400,7 @@ async function validateActiveReviewerReport(repositoryRoot: string, journal: Run
 	if (!persisted) return { journal: persistedIntent, note: "Reviewer evidence was finalized but the reported Journal state could not be persisted; no resend will be attempted." };
 	await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: persisted.run.updatedAt, runId: persisted.run.id, event: "reviewer-evidence-finalized", message: `Reviewer Attempt ${reviewer.id} finalized with explicit ${parsed.value.verdict} verdict; Task remains reviewing.` }).catch(() => undefined);
 	const updatedTask = persisted.run.tasks[candidate.index];
-	const updatedReviewer = updatedTask?.attempts[updatedTask.attempts.length - 1];
+	const updatedReviewer = updatedTask ? currentAttempt(updatedTask) : undefined;
 	return updatedTask && updatedReviewer?.role === "reviewer" && advanceVerdict ? interpretReviewerVerdict(repositoryRoot, persisted, { ...candidate, task: updatedTask }, updatedReviewer, dependencies) : { journal: persisted, note: "Reviewer evidence finalized; explicit verdict recorded while Task remains reviewing.", action: "finalize-reviewer-evidence" };
 }
 
@@ -1422,6 +1465,7 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 		state: "prepared",
 		preparedAt: transitionTimestamp(journal, dependencies.clock.now()),
 		actualModel: { ...reviewerModel },
+		...(journal.run.revisions ? { specificationVersion: candidate.task.specificationVersion } : {}),
 		specificationHash: candidate.task.specificationHash,
 		assignmentPath: paths.assignmentPath,
 		reportPath: paths.reportPath,
@@ -1640,7 +1684,7 @@ function currentMonitorAttempt(journal: RunJournal): { task: TaskRecord; index: 
 	const candidates: Array<{ task: TaskRecord; index: number; attempt: AttemptRecord }> = [];
 	for (let index = 0; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
-		const attempt = task?.attempts.at(-1);
+		const attempt = task ? currentAttempt(task) : undefined;
 			if (!task || !attempt || (task.phase !== "building" && task.phase !== "reworking" && task.phase !== "reviewing" && task.phase !== "approved" && task.phase !== "integrating" && task.phase !== "completed") || (attempt.dispatch.phase !== "prompted" && attempt.dispatch.phase !== "reconciled-active")) continue;
 		candidates.push({ task, index, attempt });
 	}
@@ -1651,7 +1695,7 @@ function currentMonitorAttempts(journal: RunJournal): Array<{ task: TaskRecord; 
 	const candidates: Array<{ task: TaskRecord; index: number; attempt: AttemptRecord }> = [];
 	for (let index = 0; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
-		const attempt = task?.attempts.at(-1);
+		const attempt = task ? currentAttempt(task) : undefined;
 		if (!task || !attempt || !["building", "reworking", "reviewing", "approved", "integrating", "completed"].includes(task.phase) || (attempt.dispatch.phase !== "prompted" && attempt.dispatch.phase !== "reconciled-active")) continue;
 		candidates.push({ task, index, attempt });
 	}
@@ -1706,7 +1750,7 @@ function monitorFooter(journal: RunJournal, condition: MonitorCondition, diagnos
 	const attention = journal.run.tasks.filter((candidate) => candidate.attention !== "none").length;
 	const phase = task?.phase ?? journal.run.status;
 	const suffix = diagnostic ? ` · ${diagnostic.slice(0, 160)}` : "";
-	const attempt = task?.attempts.at(-1);
+	const attempt = task ? currentAttempt(task) : undefined;
 	const silence = task && attempt?.recovery?.silence;
 	const silenceSuffix = silence ? ` · silence ${silence.phase} · ${task.attempts.filter((candidate) => candidate.replacement !== undefined).length}/${journal.run.effectiveSettings.transientRetryLimit} · next ${new Date(nextSilenceDeadline(journal, attempt, Date.parse(journal.run.updatedAt))).toISOString()}` : "";
 	const transientCount = task?.attempts.filter((candidate) => candidate.replacement !== undefined).length ?? 0;
@@ -2304,7 +2348,7 @@ async function dispatchFinalVerificationRework(repositoryRoot: string, journalIn
 	const cycle = task.reworkCycles + 1;
 	const reworkDispatch: FinalVerificationReworkDispatchRecord = { phase: "assignment-intended", branch: dispatch.branch, agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, cycle, priorBuilderAttemptId, priorReviewerAttemptId, verificationRework: facts };
 	const assignmentPaths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, task.contract.id, replacementBuilderAttemptId);
-	const prepared: BuilderAttemptRecord = { id: replacementBuilderAttemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...builder.actualModel }, specificationHash: task.specificationHash, baseRevision: priorIntegration.observedHead, assignmentPath: assignmentPaths.assignmentPath, reportPath: assignmentPaths.reportPath, evidenceDirectory: assignmentPaths.evidenceDirectory, dispatch: reworkDispatch };
+	const prepared: BuilderAttemptRecord = { id: replacementBuilderAttemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...builder.actualModel }, ...(journal.run.revisions ? { specificationVersion: task.specificationVersion } : {}), specificationHash: task.specificationHash, baseRevision: priorIntegration.observedHead, assignmentPath: assignmentPaths.assignmentPath, reportPath: assignmentPaths.reportPath, evidenceDirectory: assignmentPaths.evidenceDirectory, dispatch: reworkDispatch };
 	let reserved: RunJournal;
 	try {
 		reserved = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
@@ -2327,7 +2371,7 @@ async function dispatchFinalVerificationRework(repositoryRoot: string, journalIn
 	if (!persistedReserved) return { journal, note: "Final-verification rework reservation could not be persisted; no Assignment or prompt effect was attempted." };
 	let currentJournal = persistedReserved;
 	const currentTask = currentJournal.run.tasks[0];
-	const currentAttempt = currentTask?.attempts.at(-1);
+	const currentAttempt = currentTask ? currentAttemptForTask(currentTask) : undefined;
 	if (!currentTask || !currentAttempt || currentAttempt.role !== "builder") return { journal: currentJournal, note: "Reserved final-verification rework Attempt disappeared; no external effect was attempted." };
 	let assignment: BuilderAssignmentDocument;
 	try { assignment = buildBuilderAssignment({ run: currentJournal.run, task: currentTask, attempt: currentAttempt, worktreePath: dispatch.worktreePath, branch: dispatch.branch, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, agentName: dispatch.agentName }); }
@@ -2848,7 +2892,7 @@ async function dispatchIntegrationReworkBuilder(
 	if (reviewerEvidence.phase !== "finalized") return { journal, note: "The old Reviewer manifest is not finalized; no integration-rework Attempt was created." };
 	const dispatch: IntegrationReworkDispatchRecord = { phase: "assignment-intended", branch: previousDispatch.branch, agentName: previousDispatch.agentName, worktreePath: previousDispatch.worktreePath, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, cycle, priorBuilderAttemptId: candidate.builder.id, priorReviewerAttemptId: candidate.reviewer.id, reviewedSubject: cloneReviewSubject(candidate.reviewer.subject), reviewerManifestPath: reviewerEvidence.manifestPath, reviewerManifestSha256: reviewerEvidence.manifestSha256, integrationRecovery: recoveryFacts };
 	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, candidate.task.contract.id, attemptId);
-	const prepared: BuilderAttemptRecord = { id: attemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...candidate.builder.actualModel }, specificationHash: candidate.task.specificationHash, baseRevision: result.observation.head, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch };
+	const prepared: BuilderAttemptRecord = { id: attemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...candidate.builder.actualModel }, ...(journal.run.revisions ? { specificationVersion: candidate.task.specificationVersion } : {}), specificationHash: candidate.task.specificationHash, baseRevision: result.observation.head, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch };
 	const observed = { ...result.observation, dirtyPaths: [...result.observation.dirtyPaths], operationMarkers: [...result.observation.operationMarkers] };
 	let reserved: RunJournal;
 	try {
@@ -2875,7 +2919,7 @@ async function dispatchIntegrationReworkBuilder(
 	if (!persistedReserved) return { journal, note: "Integration-rework reservation could not be persisted; no Assignment or prompt effect was attempted." };
 	journal = persistedReserved;
 	const task = journal.run.tasks[candidate.index];
-	const attempt = task?.attempts.at(-1);
+	const attempt = task ? currentAttempt(task) : undefined;
 	if (!task || !attempt || attempt.role !== "builder") return { journal, note: "Reserved integration-rework Attempt disappeared; no external effect was attempted." };
 	let assignment: BuilderAssignmentDocument;
 	try { assignment = buildBuilderAssignment({ run: journal.run, task, attempt, worktreePath: previousDispatch.worktreePath, branch: previousDispatch.branch, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, agentName: previousDispatch.agentName }); }
@@ -2888,7 +2932,7 @@ async function dispatchIntegrationReworkBuilder(
 	try {
 		promptIntent = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const currentTask = next.run.tasks[candidate.index];
-			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			const current = currentTask ? currentAttempt(currentTask) : undefined;
 			if (!current || current.role !== "builder" || !isIntegrationReworkDispatchForSteward(current.dispatch)) throw new Error("Reserved integration-rework Attempt disappeared before prompt intent.");
 			current.dispatch = { ...current.dispatch, phase: "prompt-intended", assignmentSha256: assignmentHash };
 		});
@@ -2903,7 +2947,7 @@ async function dispatchIntegrationReworkBuilder(
 	try {
 		active = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const currentTask = next.run.tasks[candidate.index];
-			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			const current = currentTask ? currentAttempt(currentTask) : undefined;
 			if (!current || current.role !== "builder" || current.dispatch.phase !== "prompt-intended" || !("integrationRecovery" in current.dispatch)) throw new Error("Integration-rework prompt intent disappeared after prompt.");
 			current.state = "active";
 			current.activatedAt = transitionTimestamp(journal, dependencies.clock.now());
@@ -2931,7 +2975,7 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 	const dispatch: ReworkDispatchRecord = { phase: "assignment-intended", branch: previousDispatch.branch, agentName: previousDispatch.agentName, worktreePath: previousDispatch.worktreePath, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, cycle, priorBuilderAttemptId: candidate.builder.id, priorReviewerAttemptId: reviewer.id, reviewedSubject: cloneReviewSubject(reviewer.subject), reviewerManifestPath: reviewer.evidence?.phase === "finalized" ? reviewer.evidence.manifestPath : "", reviewerManifestSha256: reviewer.evidence?.phase === "finalized" ? reviewer.evidence.manifestSha256 : "", findings: findings.map((finding) => ({ ...finding })) };
 	if (!dispatch.reviewerManifestPath || !dispatch.reviewerManifestSha256) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Rework findings are not bound to a protected Reviewer manifest; no Attempt was reserved.");
 	const paths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, candidate.task.contract.id, attemptId);
-	const prepared: BuilderAttemptRecord = { id: attemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...candidate.builder.actualModel }, specificationHash: candidate.task.specificationHash, baseRevision: candidate.builder.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch };
+	const prepared: BuilderAttemptRecord = { id: attemptId, role: "builder", state: "prepared", preparedAt: transitionTimestamp(journal, dependencies.clock.now()), actualModel: { ...candidate.builder.actualModel }, ...(journal.run.revisions ? { specificationVersion: candidate.task.specificationVersion } : {}), specificationHash: candidate.task.specificationHash, baseRevision: candidate.builder.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch };
 	let reserved: RunJournal;
 	try {
 		reserved = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
@@ -2950,7 +2994,7 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 	if (!persistedReserved) return { journal, note: "Rework cycle reservation could not be persisted; no Assignment or prompt effect was attempted." };
 	journal = persistedReserved;
 	const task = journal.run.tasks[candidate.index];
-	const attempt = task?.attempts[task.attempts.length - 1];
+	const attempt = task ? currentAttempt(task) : undefined;
 	if (!task || !attempt || attempt.role !== "builder") return { journal, note: "Reserved rework Attempt disappeared; no external effect was attempted." };
 	let assignment: BuilderAssignmentDocument;
 	try { assignment = buildBuilderAssignment({ run: journal.run, task, attempt, worktreePath: previousDispatch.worktreePath, branch: previousDispatch.branch, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId, agentName: previousDispatch.agentName }); }
@@ -2963,7 +3007,7 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 	try {
 		promptIntent = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const currentTask = next.run.tasks[candidate.index];
-			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			const current = currentTask ? currentAttempt(currentTask) : undefined;
 			if (!current || current.role !== "builder" || !("cycle" in current.dispatch)) throw new Error("Reserved rework Attempt disappeared before prompt intent.");
 			current.dispatch = { ...current.dispatch, phase: "prompt-intended", assignmentSha256: assignmentHash };
 		});
@@ -2975,9 +3019,9 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 	try { prompted = await dependencies.herdr.promptBuilder({ repositoryRoot, name: previousDispatch.agentName, assignmentPrompt: formatBuilderPrompt(assignment) }); } catch (error: unknown) { return { journal, note: `Same Builder rework prompt failed; prompt-intended state is retained without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}` }; }
 	if (prompted.kind === "failed") {
 		const currentTask = journal.run.tasks[candidate.index];
-		const currentAttempt = currentTask?.attempts.at(-1);
-		if (currentTask && currentAttempt) {
-			const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: journal.run.controllerSessionId, journal, taskIndex: candidate.index, task: currentTask, attempt: currentAttempt, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity: { name: previousDispatch.agentName, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId }, requireExactMissing: true });
+		const latestAttempt = currentTask ? currentAttempt(currentTask) : undefined;
+		if (currentTask && latestAttempt) {
+			const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: journal.run.controllerSessionId, journal, taskIndex: candidate.index, task: currentTask, attempt: latestAttempt, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity: { name: previousDispatch.agentName, workspaceId: previousDispatch.workspaceId, paneId: previousDispatch.paneId, terminalId: previousDispatch.terminalId }, requireExactMissing: true });
 			if (transition) return reviewDecisionFromTransient(transition);
 		}
 	}
@@ -2986,7 +3030,7 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 	try {
 		active = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 			const currentTask = next.run.tasks[candidate.index];
-			const current = currentTask?.attempts[currentTask.attempts.length - 1];
+			const current = currentTask ? currentAttempt(currentTask) : undefined;
 			if (!current || current.role !== "builder" || current.dispatch.phase !== "prompt-intended") throw new Error("Rework prompt intent disappeared after prompt.");
 			current.state = "active";
 			current.activatedAt = transitionTimestamp(journal, dependencies.clock.now());
@@ -3053,7 +3097,8 @@ async function dispatchInitialBuilder(input: {
 	if (modelDiagnostics.length > 0) return pending(`Builder Model Plan is no longer available; dispatch is pending. ${modelDiagnostics.map((item) => item.message).join(" ")}`);
 
 	const task = selected.task;
-	const attemptId = "attempt-01";
+	const attemptId = `attempt-${String(task.attempts.length + 1).padStart(2, "0")}`;
+	const attemptFor = (candidateTask: TaskRecord | undefined): AttemptRecord | undefined => candidateTask?.attempts.find((attempt) => attempt.id === attemptId);
 	const assignmentPaths = dependencies.runJournal.resolveAssignmentPaths(repositoryRoot, journal.run.id, task.contract.id, attemptId);
 	let branch = `steward/${journal.run.id}/${task.contract.id}/${attemptId}`;
 	try {
@@ -3069,12 +3114,13 @@ async function dispatchInitialBuilder(input: {
 	let agentName = `steward-b-${compactUuid(dependencies.clock)}-${task.contract.id.replace(/[^0-9]/g, "").padStart(2, "0")}-01`;
 	if (!safeHerdrName(agentName)) return pending("Steward could not derive a valid Herdr Builder name; dispatch is pending.");
 	const model = { ...journal.run.modelPlan.builder.primary };
-	const initialAttempt: AttemptRecord = {
+	const initialAttempt: BuilderAttemptRecord = {
 		id: attemptId,
 		role: "builder",
 		state: "prepared",
 		preparedAt: transitionTimestamp(journal, dependencies.clock.now()),
 		actualModel: model,
+		...(journal.run.revisions ? { specificationVersion: task.specificationVersion } : {}),
 		specificationHash: task.specificationHash,
 		baseRevision,
 		assignmentPath: assignmentPaths.assignmentPath,
@@ -3088,7 +3134,7 @@ async function dispatchInitialBuilder(input: {
 			const candidateTask = candidate.run.tasks[selected.index];
 			if (!candidateTask) throw new Error("Selected Task disappeared before dispatch.");
 			candidateTask.phase = "building";
-			candidateTask.attempts = [initialAttempt];
+			candidateTask.attempts = [...candidateTask.attempts, initialAttempt];
 			clearTaskMonitor(candidate.run, candidateTask.contract.id);
 		});
 	} catch (error: unknown) {
@@ -3102,7 +3148,7 @@ async function dispatchInitialBuilder(input: {
 		const result = await dependencies.herdr.createBuilderWorktree({ repositoryRoot, branch, baseRevision, label: agentName });
 		if (result.kind === "failed") {
 			const currentTask = journal.run.tasks[selected.index];
-			const currentAttempt = currentTask?.attempts[0];
+			const currentAttempt = attemptFor(currentTask);
 			if (currentTask && currentAttempt) {
 				const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: currentTask, attempt: currentAttempt, dependencies, stage: result.stage, code: result.code, diagnostic: result.message });
 				if (transition) { journal = transition.journal; return pending(transition.note); }
@@ -3127,7 +3173,7 @@ async function dispatchInitialBuilder(input: {
 		try {
 			intended = advanceRunJournal(journal, dependencies.clock.now(), (candidate) => {
 				const candidateTask = candidate.run.tasks[selected.index];
-				const candidateAttempt = candidateTask?.attempts[0];
+				const candidateAttempt = attemptFor(candidateTask);
 				if (!candidateTask || !candidateAttempt) throw new Error("Prepared Builder Attempt disappeared before agent start.");
 				candidateAttempt.dispatch = { phase: "agent-intended", branch, agentName, worktreePath: worktree.path, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId };
 			});
@@ -3143,7 +3189,7 @@ async function dispatchInitialBuilder(input: {
 			return pending(`Builder agent start failed; dispatch is pending. ${error instanceof Error ? error.message : "Herdr agent start failed."}`);
 		}
 		if (started.kind === "failed") {
-			const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: journal.run.tasks[selected.index] ?? task, attempt: journal.run.tasks[selected.index]?.attempts[0] ?? initialAttempt, dependencies, stage: started.stage, code: started.code, diagnostic: started.message, identity: { name: agentName, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId }, requireExactMissing: true });
+			const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: journal.run.tasks[selected.index] ?? task, attempt: attemptFor(journal.run.tasks[selected.index]) ?? initialAttempt, dependencies, stage: started.stage, code: started.code, diagnostic: started.message, identity: { name: agentName, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId }, requireExactMissing: true });
 			if (transition) { journal = transition.journal; return pending(transition.note); }
 		}
 		if (started.kind === "name-collision") {
@@ -3159,7 +3205,7 @@ async function dispatchInitialBuilder(input: {
 	if (!actualStart) return pending("Builder agent start did not produce an accepted identity; dispatch is pending.");
 	await note("builder-started", `Started Builder ${agentName} in worktree ${worktree.path}.`);
 
-		const agentIntent = journal.run.tasks[selected.index]?.attempts[0];
+		const agentIntent = attemptFor(journal.run.tasks[selected.index]);
 		if (!agentIntent) return pending("Prepared Builder Attempt disappeared after agent start; dispatch is pending.");
 		if (agentIntent.role !== "builder") return pending("Prepared Builder Attempt role changed; dispatch is pending.");
 	let assignment: BuilderAssignmentDocument;
@@ -3180,7 +3226,7 @@ async function dispatchInitialBuilder(input: {
 	try {
 		promptIntent = advanceRunJournal(journal, dependencies.clock.now(), (candidate) => {
 			const candidateTask = candidate.run.tasks[selected.index];
-			const candidateAttempt = candidateTask?.attempts[0];
+			const candidateAttempt = attemptFor(candidateTask);
 			if (!candidateTask || !candidateAttempt) throw new Error("Prepared Builder Attempt disappeared before prompt intent.");
 			candidateAttempt.dispatch = { phase: "prompt-intended", branch: worktree.branch, agentName, worktreePath: worktree.path, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId, assignmentSha256: assignmentHash };
 		});
@@ -3195,7 +3241,7 @@ async function dispatchInitialBuilder(input: {
 		return pending(`Builder prompt failed; dispatch is pending without a resend. ${error instanceof Error ? error.message : "Herdr prompt failed."}`);
 	}
 	if (prompted.kind === "failed") {
-		const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: journal.run.tasks[selected.index] ?? task, attempt: journal.run.tasks[selected.index]?.attempts[0] ?? agentIntent, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity: { name: agentName, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId }, requireExactMissing: true });
+		const transition = await recoverTypedHerdrFailure({ repositoryRoot, controllerSessionId: input.controllerSessionId, journal, taskIndex: selected.index, task: journal.run.tasks[selected.index] ?? task, attempt: attemptFor(journal.run.tasks[selected.index]) ?? agentIntent, dependencies, stage: prompted.stage, code: prompted.code, diagnostic: prompted.message, identity: { name: agentName, workspaceId: worktree.workspaceId, paneId: worktree.paneId, terminalId: worktree.terminalId }, requireExactMissing: true });
 		if (transition) { journal = transition.journal; return pending(transition.note); }
 	}
 	if (prompted.kind !== "prompted" || prompted.name !== agentName || prompted.workspaceId !== worktree.workspaceId || prompted.paneId !== worktree.paneId || prompted.terminalId !== worktree.terminalId || !validIdentity(prompted.tabId)) return pending("Herdr returned a malformed or contradictory Builder prompt envelope; dispatch is pending without a resend.");
@@ -3204,7 +3250,7 @@ async function dispatchInitialBuilder(input: {
 	try {
 		active = advanceRunJournal(journal, dependencies.clock.now(), (candidate) => {
 			const candidateTask = candidate.run.tasks[selected.index];
-			const candidateAttempt = candidateTask?.attempts[0];
+			const candidateAttempt = attemptFor(candidateTask);
 			if (!candidateTask || !candidateAttempt) throw new Error("Prepared Builder Attempt disappeared before activation.");
 			candidateAttempt.state = "active";
 			candidateAttempt.activatedAt = promptedAt;
@@ -3234,7 +3280,7 @@ function reconciliationCandidate(journal: RunJournal, minimumIndex = 0): { index
 	const candidates: Array<{ index: number; task: TaskRecord; attempt: AttemptRecord }> = [];
 	for (let index = minimumIndex; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index]!;
-		const attempt = task.attempts.at(-1);
+		const attempt = currentAttempt(task);
 		const transientContinuation = attempt?.state === "ended-error" && task.attention === "recovering" && attempt.recovery?.infrastructure !== undefined;
 		if (!attempt || !["building", "reworking", "reviewing"].includes(task.phase) || (!["prepared", "active", "awaiting-report"].includes(attempt.state) && !transientContinuation)) continue;
 		if (attempt.role === "builder" && task.phase !== "building" && task.phase !== "reworking") continue;
@@ -3472,7 +3518,7 @@ async function applyTransientInfrastructureRecovery(input: {
 		if (!exact) return { kind: "changed", journal, note: "Graceful stop acknowledgement was not proven for the exact recorded identity; the durable ambiguity state forbids a replacement effect." };
 	}
 
-	const links = task.attempts.flatMap((candidate) => candidate.replacement ? [{ kind: candidate.replacement.kind, retryOrdinal: candidate.replacement.retryOrdinal, replacesAttemptId: candidate.replacement.replacesAttemptId, actualModel: candidate.actualModel }] : []);
+	const links = task.attempts.filter((candidate) => attemptSpecificationVersion(candidate) === task.specificationVersion).flatMap((candidate) => candidate.replacement ? [{ kind: candidate.replacement.kind, retryOrdinal: candidate.replacement.retryOrdinal, replacesAttemptId: candidate.replacement.replacesAttemptId, actualModel: candidate.actualModel }] : []);
 	const ordinal = replacementRetryOrdinal(links, journal.run.effectiveSettings.transientRetryLimit);
 	const finishNeedsUser = async (reason: "transient-fallback-unavailable" | "transient-retries-exhausted" | "transient-stop-ambiguous", diagnostic: string): Promise<TransientTransition> => {
 		const changed = await persist((nextTask, nextAttempt) => {
@@ -3529,8 +3575,8 @@ async function applyTransientInfrastructureRecovery(input: {
 		nextAttempt.state = "superseded";
 		nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, preservation: preserved, infrastructure: outcome };
 		const successor: AttemptRecord = attempt.role === "builder"
-			? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, specificationHash: attempt.specificationHash, baseRevision: attempt.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
-			: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, specificationHash: attempt.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: attempt.subject, independence: successorIndependence!, worktree: { path: attempt.worktree.path, baseline: { ...attempt.worktree.baseline, dirtyPaths: [...attempt.worktree.baseline.dirtyPaths], operationMarkers: [...attempt.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
+			? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, ...(nextJournal.run.revisions ? { specificationVersion: nextTask.specificationVersion } : {}), specificationHash: attempt.specificationHash, baseRevision: attempt.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
+			: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, ...(nextJournal.run.revisions ? { specificationVersion: nextTask.specificationVersion } : {}), specificationHash: attempt.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: attempt.subject, independence: successorIndependence!, worktree: { path: attempt.worktree.path, baseline: { ...attempt.worktree.baseline, dirtyPaths: [...attempt.worktree.baseline.dirtyPaths], operationMarkers: [...attempt.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
 			nextTask.attempts.push(successor);
 			clearTaskMonitor(nextJournal.run, nextTask.contract.id);
 			nextTask.attention = "none";
@@ -4251,7 +4297,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 	async function inspectTakeoverFacts(repositoryRoot: string, journal: RunJournal): Promise<unknown[]> {
 		const facts: unknown[] = [];
 		for (const task of journal.run.tasks) {
-			const attempt = task.attempts.at(-1);
+			const attempt = currentAttempt(task);
 			if (!attempt || !["building", "reviewing", "reworking"].includes(task.phase)) {
 				facts.push({ taskId: task.contract.id, phase: task.phase, attention: task.attention });
 				continue;
@@ -4370,7 +4416,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			let currentJournal = loaded.journal;
 			let note = "";
 			const hasRecoverySignal = currentJournal.run.tasks.some((candidateTask) => {
-				const latest = candidateTask.attempts.at(-1);
+				const latest = currentAttempt(candidateTask);
 				return latest !== undefined && (latest.state === "prepared" || latest.state === "awaiting-report" || latest.dispatch.phase === "prompt-intended" || latest.dispatch.phase === "reconciled-active" || latest.recovery !== undefined);
 			});
 			const reconciliation = optionalManagedAgentInspector(herdr) || hasRecoverySignal
@@ -4402,8 +4448,8 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			const completion = await advanceApprovedCompletion(repositoryRoot, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
 			currentJournal = completion.journal;
 			if (completion.note) note = note ? `${note} ${completion.note}` : completion.note;
-			const latestTask = currentJournal.run.tasks.find((candidate) => candidate.phase === "building" && candidate.attempts.at(-1)?.role === "builder");
-			const latestAttempt = latestTask?.attempts.at(-1);
+			const latestTask = currentJournal.run.tasks.find((candidate) => candidate.phase === "building" && currentAttempt(candidate)?.role === "builder");
+			const latestAttempt = latestTask ? currentAttempt(latestTask) : undefined;
 			if (latestTask?.phase === "building" && latestAttempt?.role === "builder" && latestAttempt.state === "reported" && latestAttempt.evidence?.phase === "finalized" && note.startsWith("Review dispatch pending")) note = `Builder Attempt ${latestAttempt.id} report was validated and finalized.`;
 			statusView = completion.completed ? presentCompletedStatus(currentJournal, completion.note) : presentStatusForJournal(currentJournal, note);
 		} else if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && !controllerIdentityMatches(loaded.journal, controllerSessionId)) {
@@ -4703,6 +4749,199 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return presentStart({ kind: "started-and-dispatched", journal: dispatch.journal, message: dispatch.message });
 	}
 
+	function presentRevision(result: RevisionResult): RevisionResult {
+		ui.presentRevisionResult?.(result);
+		return result;
+	}
+
+	function revisionStopForAttempt(attempt: AttemptRecord, timestamp: string): RecoveryStop {
+		const identity = attemptIdentity(attempt);
+		return identity ? { phase: "intended", intendedAt: timestamp, agent: identity } : { phase: "not-required", reason: "never-started" };
+	}
+
+	function revisionPreview(journal: RunJournal, draft: RunRevisionDraft): { taskDeltas: RunRevisionTaskDelta[]; modelPlanDelta?: RunRevisionModelPlanDelta } {
+		const taskDeltas: RunRevisionTaskDelta[] = [];
+		for (let index = 0; index < journal.run.tasks.length; index += 1) {
+			const task = journal.run.tasks[index]!;
+			const proposed = draft.tasks[index]!;
+			if (JSON.stringify(task.contract) === JSON.stringify(proposed.contract)) continue;
+			const currentAttempts = task.attempts.filter((attempt) => attemptSpecificationVersion(attempt) === task.specificationVersion);
+			const cancelledAttemptIds = currentAttempts.filter((attempt) => ["prepared", "active", "awaiting-report"].includes(attempt.state)).map((attempt) => attempt.id);
+			const invalidatedReviewerAttempts = currentAttempts.filter((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer" && attempt.evidence?.phase === "finalized").map((attempt) => ({ attemptId: attempt.id, manifestPath: attempt.evidence!.manifestPath, manifestSha256: attempt.evidence!.manifestSha256 }));
+			const prior = cloneRunJournal(journal).run.tasks[index]!;
+			taskDeltas.push({
+				taskId: task.contract.id,
+				before: { specificationVersion: task.specificationVersion, specificationHash: task.specificationHash, contract: prior.contract },
+				after: { specificationVersion: task.specificationVersion + 1, specificationHash: specificationHash(proposed.contract), contract: JSON.parse(JSON.stringify(proposed.contract)) as TaskRecord["contract"] },
+				priorReworkCycles: task.reworkCycles,
+				cancelledAttemptIds,
+				invalidatedReviewerAttempts,
+				...(prior.approval ? { priorApproval: prior.approval } : {}),
+				...(prior.integration ? { priorIntegration: prior.integration } : {}),
+				...(prior.integrationRecoveries ? { priorIntegrationRecoveries: prior.integrationRecoveries } : {}),
+				...(prior.finalVerificationReworks ? { priorFinalVerificationReworks: prior.finalVerificationReworks } : {}),
+			});
+		}
+		const modelPlanDelta = JSON.stringify(journal.run.modelPlan) === JSON.stringify(draft.modelPlan) ? undefined : { before: cloneModelPlans(journal.run.modelPlan), after: cloneModelPlans(draft.modelPlan) };
+		return { taskDeltas, ...(modelPlanDelta ? { modelPlanDelta } : {}) };
+	}
+
+	async function persistRevisionStop(repositoryRoot: string, journal: RunJournal, taskId: string, attemptId: string, stop: RecoveryStop, diagnosticText?: string): Promise<RunJournal | undefined> {
+		try {
+			const candidate = advanceRunJournal(journal, clock.now(), (next) => {
+				const task = next.run.tasks.find((item) => item.contract.id === taskId);
+				const attempt = task?.attempts.find((item) => item.id === attemptId);
+				if (!task || !attempt || attempt.state !== "cancelled" || !attempt.revisionCancellation) throw new Error("Revision stop target disappeared.");
+				attempt.revisionCancellation.stop = stop;
+				if (stop.phase === "ambiguous") {
+					task.attention = "needs-user";
+					task.attentionReason = "revision-stop-ambiguous";
+					task.attentionDiagnostic = (diagnosticText ?? stop.diagnostic).slice(0, 2_000);
+				}
+			});
+			const replaced = await runJournal.replaceActive(repositoryRoot, candidate);
+			return replaced.kind === "replaced" ? replaced.journal : undefined;
+		} catch { return undefined; }
+	}
+
+	async function reconcileRevisionStops(repositoryRoot: string, journal: RunJournal, controllerSessionId: string, directStop = false): Promise<{ journal: RunJournal; note: string; ambiguous: boolean }> {
+		let current = journal;
+		for (const task of current.run.tasks) for (const attempt of task.attempts) {
+			const cancellation = attempt.revisionCancellation;
+			if (attempt.state !== "cancelled" || !cancellation) continue;
+			if (cancellation.stop.phase === "ambiguous") return { journal: current, note: "A prior revision stop remains ambiguous; the revised Task is blocked and no new Builder was admitted.", ambiguous: true };
+			if (cancellation.stop.phase !== "intended") continue;
+			const identity = cancellation.stop.agent;
+			if (current.run.controllerSessionId !== controllerSessionId) return { journal: current, note: "Controller ownership changed while reconciling a revision stop; no effect was attempted.", ambiguous: true };
+			if (!directStop) {
+				let inspection: ManagedAgentInspection | undefined;
+				try { inspection = herdr.inspectManagedAgent ? await herdr.inspectManagedAgent(identity) : undefined; } catch (error: unknown) { inspection = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Managed Agent inspection failed." }; }
+				if (inspection?.kind === "missing") {
+					const acknowledged: RecoveryStop = { phase: "acknowledged", intendedAt: cancellation.stop.intendedAt, acknowledgedAt: transitionTimestamp(current, clock.now()), agent: identity };
+					const persisted = await persistRevisionStop(repositoryRoot, current, task.contract.id, attempt.id, acknowledged);
+					if (!persisted) return { journal: current, note: "Revision stop acknowledgement lost its Journal race; resume will reconcile before admission.", ambiguous: true };
+					current = persisted;
+					continue;
+				}
+				if (inspection?.kind !== "observed" || !exactIdentity(inspection.identity, identity)) {
+					const diagnosticText = inspection?.kind === "unclear" ? inspection.diagnostic : "The exact revision-stop Agent identity was not observable.";
+					const ambiguous: RecoveryStop = { phase: "ambiguous", intendedAt: cancellation.stop.intendedAt, observedAt: transitionTimestamp(current, clock.now()), agent: identity, diagnostic: diagnosticText.slice(0, 2_000) };
+					const persisted = await persistRevisionStop(repositoryRoot, current, task.contract.id, attempt.id, ambiguous, diagnosticText);
+					return { journal: persisted ?? current, note: "Revision stop is ambiguous; the revised Task remains blocked and no new Builder was admitted.", ambiguous: true };
+				}
+			}
+			if (!herdr.stopAgentGracefully) {
+				const ambiguous: RecoveryStop = { phase: "ambiguous", intendedAt: cancellation.stop.intendedAt, observedAt: transitionTimestamp(current, clock.now()), agent: identity, diagnostic: "Graceful Agent stop adapter is unavailable." };
+				const persisted = await persistRevisionStop(repositoryRoot, current, task.contract.id, attempt.id, ambiguous, ambiguous.diagnostic);
+				return { journal: persisted ?? current, note: "Revision stop is ambiguous because graceful stop is unavailable; no new Builder was admitted.", ambiguous: true };
+			}
+			let stopped: HerdrStopResult;
+			try { stopped = await herdr.stopAgentGracefully({ repositoryRoot, name: identity.name, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId }); } catch (error: unknown) { stopped = { kind: "ambiguous", message: error instanceof Error ? error.message : "Graceful Agent stop failed." }; }
+			if (stopped.kind !== "acknowledged" || stopped.name !== identity.name || stopped.workspaceId !== identity.workspaceId || stopped.paneId !== identity.paneId || stopped.terminalId !== identity.terminalId) {
+				const diagnosticText = stopped.kind === "acknowledged" ? "Graceful stop returned a foreign Agent identity." : stopped.message;
+				const ambiguous: RecoveryStop = { phase: "ambiguous", intendedAt: cancellation.stop.intendedAt, observedAt: transitionTimestamp(current, clock.now()), agent: identity, diagnostic: diagnosticText.slice(0, 2_000) };
+				const persisted = await persistRevisionStop(repositoryRoot, current, task.contract.id, attempt.id, ambiguous, diagnosticText);
+				return { journal: persisted ?? current, note: "Revision stop is ambiguous; the revised Task remains blocked and no new Builder was admitted.", ambiguous: true };
+			}
+			const acknowledged: RecoveryStop = { phase: "acknowledged", intendedAt: cancellation.stop.intendedAt, acknowledgedAt: transitionTimestamp(current, clock.now()), agent: identity };
+			const persisted = await persistRevisionStop(repositoryRoot, current, task.contract.id, attempt.id, acknowledged);
+			if (!persisted) return { journal: current, note: "Revision stop acknowledgement lost its Journal race; resume will reconcile before admission.", ambiguous: true };
+			current = persisted;
+		}
+		return { journal: current, note: "All revision stop intents are durably acknowledged.", ambiguous: false };
+	}
+
+	async function revise(repositoryRoot: string, controllerSessionId: string): Promise<RevisionResult> {
+		let loaded: ActiveRunLoadResult;
+		try { loaded = await runJournal.loadActive(repositoryRoot); } catch (error: unknown) { return presentRevision({ kind: "invalid", message: `Revision could not inspect the active Run; no mutation occurred. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
+		if (loaded.kind === "missing") return presentRevision({ kind: "missing", message: "No active Steward Run exists; revision performed no mutation." });
+		if (loaded.kind === "invalid") return presentRevision({ kind: "invalid", message: `Active Steward Run is invalid at ${loaded.paths.activePath}; revision performed no mutation.` });
+		const basis = loaded.journal;
+		if (basis.run.status !== "active" || basis.run.completion?.phase === "archived") return presentRevision({ kind: "refused", message: "Only an active, non-completing Steward Run can be revised; no mutation occurred." });
+		const finalExecution = basis.run.finalVerificationExecution;
+		if (finalExecution && ((isRecoverableFinalVerificationExecution(finalExecution) && (finalExecution.phase === "executing" || finalExecution.phase === "ambiguous")) || (!isRecoverableFinalVerificationExecution(finalExecution) && finalExecution.phase === "intended"))) return presentRevision({ kind: "refused", message: "Revision is refused while final verification is intended, executing, or ambiguous; no mutation occurred." });
+		if (!controllerIdentityMatches(basis, controllerSessionId)) return presentRevision({ kind: "foreign-session", recordedSessionId: basis.run.controllerSessionId, currentSessionId: controllerSessionId, message: `The active Run belongs to Controller Session ${basis.run.controllerSessionId}; revision performed no mutation. Use /steward resume --takeover explicitly.` });
+		if (!ui.draftRunRevision || !ui.confirmRunRevision) return presentRevision({ kind: "refused", message: "Revision UI is unavailable; no mutation occurred." });
+		const draftInput: RunRevisionDraftInput = {
+			runId: basis.run.id,
+			tasks: basis.run.tasks.map((task) => ({ id: task.contract.id, contract: JSON.parse(JSON.stringify(task.contract)) as TaskRecord["contract"] })),
+			modelPlan: cloneModelPlans(basis.run.modelPlan),
+			modelChoices: model.listModelChoices(),
+			activeJournalPath: loaded.paths.activePath,
+			activityLogPath: `${loaded.paths.activityRoot}/${basis.run.id}/activity.log`,
+		};
+		let draftResult: RunRevisionDraftResult;
+		try { draftResult = await ui.draftRunRevision(draftInput); } catch (error: unknown) { return presentRevision({ kind: "cancelled", message: `Revision draft was not collected; no mutation occurred. ${error instanceof Error ? error.message : "Interactive draft failed."}` }); }
+		if (draftResult.kind === "cancelled") return presentRevision({ kind: "cancelled", message: "Revision cancelled; the active Run and all evidence remain unchanged." });
+		const draftValidation = validateRunRevisionDraft(draftResult.draft, basis);
+		if (!draftValidation.value || draftValidation.diagnostics.length > 0) return presentRevision({ kind: "refused", message: `Revision draft is invalid; no mutation occurred. ${draftValidation.diagnostics.map((item) => item.message).join(" ")}` });
+		const draft = draftValidation.value;
+		const preview = revisionPreview(basis, draft);
+		const summary = buildRunRevisionConfirmationSummary({ journal: basis, draft, taskDeltas: preview.taskDeltas, modelPlanDelta: preview.modelPlanDelta, basisJournalRevision: basis.journalRevision });
+		let confirmed: boolean;
+		try { confirmed = await ui.confirmRunRevision(summary); } catch (error: unknown) { return presentRevision({ kind: "cancelled", message: `Revision confirmation failed; no mutation occurred. ${error instanceof Error ? error.message : "Interactive confirmation failed."}` }); }
+		if (!confirmed) return presentRevision({ kind: "cancelled", message: "Revision cancelled; the active Run and all evidence remain unchanged." });
+		let confirmedModelDiagnostics: ConfigDiagnostic[];
+		try { confirmedModelDiagnostics = await model.validateModelPlans(draft.modelPlan); } catch (error: unknown) { return presentRevision({ kind: "refused", message: `The revised Model Plan could not be validated; no mutation occurred. ${error instanceof Error ? error.message : "Model validation failed."}` }); }
+		if (confirmedModelDiagnostics.length > 0) return presentRevision({ kind: "refused", message: `The revised Model Plan is unavailable; no mutation occurred. ${confirmedModelDiagnostics.map((item) => item.message).join(" ")}` });
+		let reloaded: ActiveRunLoadResult;
+		try { reloaded = await runJournal.loadActive(repositoryRoot); } catch (error: unknown) { return presentRevision({ kind: "stale", message: `The active Run could not be rechecked after confirmation; no mutation occurred. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
+		if (reloaded.kind !== "loaded" || reloaded.journal.run.id !== basis.run.id || reloaded.journal.journalRevision !== basis.journalRevision || reloaded.journal.run.controllerSessionId !== basis.run.controllerSessionId || JSON.stringify(reloaded.journal.run.controllerLease) !== JSON.stringify(basis.run.controllerLease)) return presentRevision({ kind: "stale", message: "The active Run changed during confirmation; no revision, activity, stop, or dispatch effect was attempted." });
+		const confirmedValidation = validateRunRevisionDraft(draft, reloaded.journal);
+		if (!confirmedValidation.value || confirmedValidation.diagnostics.length > 0) return presentRevision({ kind: "stale", message: "The confirmed revision no longer matches the active Run; no mutation occurred." });
+		const revisionNumber = (reloaded.journal.run.revisions?.at(-1)?.revision ?? 1) + 1;
+		const confirmedPreview = revisionPreview(reloaded.journal, confirmedValidation.value);
+		const confirmedAt = transitionTimestamp(reloaded.journal, clock.now());
+		let candidate: RunJournal;
+		try {
+			candidate = advanceRunJournal(reloaded.journal, clock.now(), (next) => {
+				const revision: RunRevisionRecord = { revision: revisionNumber, confirmedAt, controllerSessionId, basisJournalRevision: reloaded.journal.journalRevision, taskDeltas: confirmedPreview.taskDeltas.map((delta) => ({ ...delta, cancelledAttemptIds: [...delta.cancelledAttemptIds], invalidatedReviewerAttempts: delta.invalidatedReviewerAttempts.map((reviewer) => ({ ...reviewer })) })), ...(confirmedPreview.modelPlanDelta ? { modelPlanDelta: confirmedPreview.modelPlanDelta } : {}) };
+				for (const delta of revision.taskDeltas) {
+					const task = next.run.tasks.find((item) => item.contract.id === delta.taskId);
+					if (!task) throw new Error("Revision Task disappeared before CAS.");
+					const oldVersion = task.specificationVersion;
+					for (const attempt of task.attempts) {
+						if (attemptSpecificationVersion(attempt) !== oldVersion || !["prepared", "active", "awaiting-report"].includes(attempt.state)) continue;
+						const previousState = attempt.state as "prepared" | "active" | "awaiting-report";
+						const stop = revisionStopForAttempt(attempt, confirmedAt);
+						attempt.state = "cancelled";
+						attempt.revisionCancellation = { reason: "task-specification-revised", cancelledAt: confirmedAt, previousState, oldSpecificationVersion: oldVersion, oldSpecificationHash: task.specificationHash, replacementSpecificationVersion: oldVersion + 1, replacementSpecificationHash: delta.after.specificationHash, owningRunRevision: revisionNumber, stop };
+					}
+					task.contract = JSON.parse(JSON.stringify(delta.after.contract)) as TaskRecord["contract"];
+					task.specificationVersion = delta.after.specificationVersion;
+					task.specificationHash = delta.after.specificationHash;
+					task.phase = "pending";
+					task.reworkCycles = 0;
+					task.attention = "none";
+					delete task.attentionDiagnostic;
+					delete task.attentionReason;
+					if (task.approval?.phase === "valid") task.approval = { ...task.approval, phase: "invalidated", invalidatedAt: confirmedAt, reason: "task-specification-revised", diagnostic: `Task specification revised from ${delta.before.specificationHash} to ${delta.after.specificationHash}.` };
+					else delete task.approval;
+					delete task.integration;
+					delete task.integrationRecoveries;
+					delete task.finalVerificationReworks;
+				}
+				if (confirmedPreview.modelPlanDelta) next.run.modelPlan = cloneModelPlans(confirmedPreview.modelPlanDelta.after);
+				if (next.run.finalVerificationExecution && revision.taskDeltas.length > 0 && (next.run.finalVerificationExecution.phase === "passed" || next.run.finalVerificationExecution.phase === "failed")) {
+					revision.invalidatedFinalVerification = { execution: next.run.finalVerificationExecution, invalidatedAt: confirmedAt, reason: "task-specification-revised" };
+					delete next.run.finalVerificationExecution;
+				}
+				if (next.run.monitor && revision.taskDeltas.some((delta) => delta.taskId === next.run.monitor?.taskId)) delete next.run.monitor;
+				if (next.run.monitors) next.run.monitors = next.run.monitors.filter((monitor) => !revision.taskDeltas.some((delta) => delta.taskId === monitor.taskId));
+				next.run.revisions = next.run.revisions ? [...next.run.revisions, revision] : [revision];
+			});
+		} catch (error: unknown) { return presentRevision({ kind: "refused", message: `Revision candidate failed strict validation; no mutation occurred. ${error instanceof Error ? error.message : "Journal validation failed."}` }); }
+		let replaced: import("./run-journal-store.ts").ReplaceActiveResult;
+		try { replaced = await runJournal.replaceActive(repositoryRoot, candidate); } catch (error: unknown) { return presentRevision({ kind: "stale", message: `Revision CAS failed; no external effect was attempted. ${error instanceof Error ? error.message : "Storage failed."}` }); }
+		if (replaced.kind !== "replaced") return presentRevision({ kind: "stale", message: "Revision CAS lost its race; no external effect was attempted." });
+		let current = replaced.journal;
+		try { await runJournal.appendActivity(repositoryRoot, { timestamp: current.run.updatedAt, runId: current.run.id, event: "run-revised", message: `Run revision ${revisionNumber} confirmed; changed Tasks: ${confirmedPreview.taskDeltas.map((delta) => delta.taskId).join(", ") || "none"}.` }); } catch { /* authoritative Journal already records the revision */ }
+		const reconciled = await reconcileRevisionStops(repositoryRoot, current, controllerSessionId, true);
+		current = reconciled.journal;
+		if (reconciled.ambiguous) return presentRevision({ kind: "ambiguous", journal: current, message: reconciled.note });
+		return presentRevision({ kind: "revised", journal: current, message: `Run ${current.run.id} revised at specification revision ${revisionNumber}; no new Builder was dispatched in this command.` });
+	}
+
 	const monitorDependencies: StewardDependencies = { runJournal, herdr, git, process, model, clock, ui };
 
 	type SilencePass = { kind: "none" | "changed" | "degraded" | "effect"; journal: RunJournal; note: string; action?: MonitorWorkflowAction; diagnostic?: string; notification?: boolean };
@@ -4827,7 +5066,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 		const lastProgressAt = existingSilence?.lastProgressAt ?? attemptInput.recovery?.live.observedAt ?? attemptInput.activatedAt ?? attemptInput.preparedAt;
 		const phaseAt = existingSilence?.phaseAt ?? lastProgressAt;
-		const base = { now, passiveInspectionMs: journalInput.run.effectiveSettings.passiveInspectionIntervalSeconds * 1_000, secondInspectionMs: journalInput.run.effectiveSettings.secondInspectionAndNudgeIntervalSeconds * 1_000, nudgeGraceMs: journalInput.run.effectiveSettings.nudgeGracePeriodSeconds * 1_000, externalWarningMs: journalInput.run.effectiveSettings.externalCommandWarningThresholdSeconds * 1_000, lastProgressAt: new Date(lastProgressAt).getTime(), phaseAt: new Date(phaseAt).getTime(), retryOrdinal: journalInput.run.tasks[taskIndex]?.attempts.filter((item) => item.replacement).length ?? 0, retryLimit: journalInput.run.effectiveSettings.transientRetryLimit, process: "none" as const, unchanged: !sourceChanged && !processChanged };
+		const base = { now, passiveInspectionMs: journalInput.run.effectiveSettings.passiveInspectionIntervalSeconds * 1_000, secondInspectionMs: journalInput.run.effectiveSettings.secondInspectionAndNudgeIntervalSeconds * 1_000, nudgeGraceMs: journalInput.run.effectiveSettings.nudgeGracePeriodSeconds * 1_000, externalWarningMs: journalInput.run.effectiveSettings.externalCommandWarningThresholdSeconds * 1_000, lastProgressAt: new Date(lastProgressAt).getTime(), phaseAt: new Date(phaseAt).getTime(), retryOrdinal: journalInput.run.tasks[taskIndex]?.attempts.filter((item) => attemptSpecificationVersion(item) === attemptInput.specificationVersion && item.replacement).length ?? 0, retryLimit: journalInput.run.effectiveSettings.transientRetryLimit, process: "none" as const, unchanged: !sourceChanged && !processChanged };
 		const decision = decideSilenceRecovery({ ...base, phase: priorPhase === "suspected" ? "suspected" : priorPhase === "nudged" ? "nudged" : priorPhase === "interrupted" ? "interrupted" : priorPhase === "resumed" ? "resumed" : "none" });
 		if (decision.kind === "wait" || decision.kind === "inspection-incomplete") return { kind: "none", journal: journalInput, note: "Passive inspection is unchanged but no silence recovery deadline is due." };
 		if (decision.kind === "suspect") {
@@ -4915,8 +5154,8 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 					const existing = attempt.recovery;
 					attempt.recovery = { live: { ...baseLive, observedAt: nowIso }, ...(existing?.reportRequest ? { reportRequest: existing.reportRequest } : {}), ...(existing?.blockedAnswer ? { blockedAnswer: existing.blockedAnswer } : {}), preservation: preserved, silence: { phase: "replacement-intended", lastProgressAt, phaseAt, inspection: snapshot, target: identity, intendedAt: nowIso, retryOrdinal: ordinal } };
 					const nextAttempt: AttemptRecord = predecessor.role === "builder"
-						? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, specificationHash: predecessor.specificationHash, baseRevision: predecessor.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
-						: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, specificationHash: predecessor.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: predecessor.subject, independence: { ...predecessor.independence }, worktree: { path: predecessor.worktree.path, baseline: { ...predecessor.worktree.baseline, dirtyPaths: [...predecessor.worktree.baseline.dirtyPaths], operationMarkers: [...predecessor.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
+						? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, ...(nextJournal.run.revisions ? { specificationVersion: task.specificationVersion } : {}), specificationHash: predecessor.specificationHash, baseRevision: predecessor.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
+						: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, ...(nextJournal.run.revisions ? { specificationVersion: task.specificationVersion } : {}), specificationHash: predecessor.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: predecessor.subject, independence: { ...predecessor.independence }, worktree: { path: predecessor.worktree.path, baseline: { ...predecessor.worktree.baseline, dirtyPaths: [...predecessor.worktree.baseline.dirtyPaths], operationMarkers: [...predecessor.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
 					task.attempts.push(nextAttempt);
 					clearTaskMonitor(nextJournal.run, task.contract.id);
 					silenceAttention(task, "none");
@@ -5086,6 +5325,10 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		let journal = loaded.journal;
 		if (!controllerIdentityMatches(journal, controllerSessionId)) return monitorResult("none", journal, "Controller Session does not match; advancement is read-only.");
 		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; advancement is dormant.", undefined, true);
+		const revisionStops = await reconcileRevisionStops(repositoryRoot, journal, controllerSessionId);
+		if (revisionStops.ambiguous) return monitorResult("blocked", revisionStops.journal, revisionStops.note, revisionStops.note);
+		if (revisionStops.journal.journalRevision !== journal.journalRevision) return monitorResult("stop-next-agent", revisionStops.journal, revisionStops.note);
+		journal = revisionStops.journal;
 		const reconciliation = await reconcileCurrentAttempt(repositoryRoot, controllerSessionId, journal, monitorDependencies);
 		journal = reconciliation.journal;
 		if (reconciliation.kind !== "none") {
@@ -5165,7 +5408,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			if (review.action) return monitorResult(review.action, journal, review.note, review.diagnostic);
 			if (journal.journalRevision !== beforeReview) {
 				const changedTask = journal.run.tasks[minimumIndex];
-				const latest = changedTask?.attempts.at(-1);
+				const latest = changedTask ? currentAttempt(changedTask) : undefined;
 				const action: MonitorWorkflowAction = changedTask?.phase === "approved" ? "finalize-reviewer-evidence" : latest?.role === "reviewer" ? "dispatch-reviewer" : "dispatch-rework-builder";
 				return monitorResult(action, journal, review.note);
 			}
@@ -5192,5 +5435,5 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (target === "command" && journal) ui.presentStatus(presentStatusForJournal(journal, result.note), "command");
 	}
 
-	return { status, resume, takeover, restoreControllerSession, prepareCompactionContinuity, recordCompactionFailure, configure, start, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
+	return { status, resume, takeover, restoreControllerSession, prepareCompactionContinuity, recordCompactionFailure, configure, start, revise, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
 }

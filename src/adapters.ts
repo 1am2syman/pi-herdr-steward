@@ -21,7 +21,7 @@ import {
 } from "./config.ts";
 import { createConfigStore, type ConfigStoreOptions } from "./config-store.ts";
 import { createRunJournalStore } from "./run-journal-store.ts";
-import type { ExpectedArtifact, RunDraft, RunDraftInput, RunDraftResult, Verification } from "./run.ts";
+import type { ExpectedArtifact, RunDraft, RunDraftInput, RunDraftResult, RunRevisionDraft, RunRevisionDraftInput, RunRevisionDraftResult, Verification } from "./run.ts";
 import type {
 	ConfigurationEditResult,
 	ConfigurationEditorInput,
@@ -1428,6 +1428,35 @@ async function draftRun(ui: PiStatusUi & Partial<PiConfigUi>, input: RunDraftInp
 	return { kind: "drafted", draft: { declaredOutcome, tasks, modelPlan: modelPlans, effectiveSettings: { ...input.recovery }, finalVerification } };
 }
 
+async function draftRunRevision(ui: PiStatusUi & Partial<PiConfigUi>, input: RunRevisionDraftInput): Promise<RunRevisionDraftResult> {
+	const dialogs = getDialogSurface(ui);
+	const tasks: RunRevisionDraft["tasks"] = [];
+	for (const original of input.tasks) {
+		const requiredOutcome = await dialogs.input(`${original.id} required outcome`, original.contract.requiredOutcome);
+		if (requiredOutcome === undefined) return { kind: "cancelled" };
+		const allowedScopeText = await dialogs.input(`${original.id} allowed scope`, original.contract.allowedScope.join("\n"));
+		if (allowedScopeText === undefined) return { kind: "cancelled" };
+		const contract = { ...original.contract, requiredOutcome: requiredOutcome.trim() || original.contract.requiredOutcome, allowedScope: lines(allowedScopeText).length > 0 ? lines(allowedScopeText) : [...original.contract.allowedScope] };
+		tasks.push({ id: original.id, contract });
+	}
+	let modelPlan = input.modelPlan;
+	const modelChoice = await dialogs.select("Revision Model Plan", ["Keep current Model Plan", "Edit Model Plan", "Cancel"]);
+	if (!modelChoice || modelChoice === "Cancel") return { kind: "cancelled" };
+	if (modelChoice === "Edit Model Plan") {
+		const edited = await editModelPlans(dialogs, {
+			recovery: { passiveInspectionIntervalSeconds: 0, secondInspectionAndNudgeIntervalSeconds: 0, nudgeGracePeriodSeconds: 0, externalCommandWarningThresholdSeconds: 0, maximumActiveTasks: 1, transientRetryLimit: 0, reworkCycleLimit: 0 },
+			modelPlans: input.modelPlan,
+			recoveryPath: "not saved by /steward revise",
+			modelPlansPath: "not saved by /steward revise",
+			modelChoices: input.modelChoices,
+			proposal: undefined,
+		});
+		if (!edited) return { kind: "cancelled" };
+		modelPlan = edited;
+	}
+	return { kind: "drafted", draft: { tasks, modelPlan } };
+}
+
 /** Present status and configuration through Pi's informational UI primitives. */
 export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): StewardUiAdapter {
 	function presentStatus(statusView: StatusView, target: StatusTarget): void {
@@ -1453,6 +1482,10 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		ui.notify(message, result.kind === "reconciled" && result.result.condition === "ordinary" ? "info" : "warning");
 	}
 
+	function presentRevisionResult(result: import("./steward.ts").RevisionResult): void {
+		ui.notify(result.message, result.kind === "revised" ? "info" : result.kind === "ambiguous" ? "warning" : result.kind === "cancelled" ? "info" : "error");
+	}
+
 	function notifyCompletion(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void {
 		ui.notify(`Steward Run ${input.runId} completed on ${input.targetBranch} at ${input.integratedHead}. Final verification: ${input.verificationResultPath} (output: ${input.verificationLogPath}). Archive: ${input.archivePath}`, "info");
 	}
@@ -1474,6 +1507,9 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		presentConfigurationResult,
 		draftRun: (input) => draftRun(ui, input),
 		confirmRun: (summary) => ui.confirm!("Confirm Steward Run", summary.markdown),
+		draftRunRevision: (input) => draftRunRevision(ui, input),
+		confirmRunRevision: (summary) => ui.confirm!("Confirm Steward Run revision", summary.markdown),
+		presentRevisionResult,
 		confirmSameFamilyReview,
 			presentStartResult,
 			presentResumeResult,

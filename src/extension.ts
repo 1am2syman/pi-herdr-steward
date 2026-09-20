@@ -228,15 +228,16 @@ export function registerStewardExtension(
 	});
 
 	pi.registerCommand("steward", {
-		description: "Inspect, configure, start, or resume Steward Runs.",
+		description: "Inspect, configure, start, revise, or resume Steward Runs.",
 		handler: async (args, ctx) => {
 			const command = args.trim();
 			if (command === "start" && ctx.mode !== "tui") throw new Error("Steward start requires interactive TUI mode.");
 			if (command === "config" && ctx.mode !== "tui") throw new Error("Steward configuration requires interactive TUI mode.");
+			if (command === "revise" && ctx.mode !== "tui") throw new Error("Steward revise requires interactive TUI mode.");
 			if ((command === "resume" || command === "resume --takeover") && ctx.mode !== "tui") throw new Error("Steward resume requires interactive TUI mode.");
 			if (ctx.mode !== "tui") return;
-			if (!new Set(["status", "config", "start", "resume", "resume --takeover"]).has(command)) {
-				ctx.ui.notify("Usage: /steward status | /steward config | /steward start | /steward resume [--takeover]", "info");
+			if (!new Set(["status", "config", "start", "revise", "resume", "resume --takeover"]).has(command)) {
+				ctx.ui.notify("Usage: /steward status | /steward config | /steward start | /steward revise | /steward resume [--takeover]", "info");
 				return;
 			}
 			if (!runtimeBoundToSessionLifecycle || !sameRuntime(runtime, ctx)) {
@@ -259,6 +260,10 @@ export function registerStewardExtension(
 				}
 				if (command === "start") {
 					await commandSteward.start(ctx.cwd, controllerSessionId);
+					return;
+				}
+				if (command === "revise") {
+					await commandSteward.revise(ctx.cwd, controllerSessionId);
 					return;
 				}
 				if (command === "resume" || command === "resume --takeover") {
