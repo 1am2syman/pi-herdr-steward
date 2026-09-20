@@ -81,6 +81,41 @@ describe("ticket-08 local Git integration contract", () => {
 		expect(calls.some((call) => call.includes("push") || call.includes("fetch") || call.includes("pull"))).toBe(false);
 	});
 
+	it("performs one exact local no-ff merge for an approved range on a diverged target", async () => {
+		const root = await mkdtemp(join(tmpdir(), "steward-t08-git-merge-"));
+		roots.push(root);
+		await git(root, ["init", "-b", "main"]);
+		await git(root, ["config", "user.email", "test@example.invalid"]);
+		await git(root, ["config", "user.name", "Steward Test"]);
+		await writeFile(join(root, "base.txt"), "base\n");
+		await git(root, ["add", "base.txt"]);
+		await git(root, ["commit", "-m", "base"]);
+		const base = await git(root, ["rev-parse", "HEAD"]);
+		const builder = await mkdtemp(join(tmpdir(), "steward-t08-builder-merge-"));
+		roots.push(builder);
+		await git(root, ["worktree", "add", "-b", "builder/t08-merge", builder, base]);
+		await writeFile(join(builder, "change.txt"), "builder\n");
+		await git(builder, ["add", "change.txt"]);
+		await git(builder, ["commit", "-m", "builder change"]);
+		const head = await git(builder, ["rev-parse", "HEAD"]);
+		await writeFile(join(root, "target.txt"), "target\n");
+		await git(root, ["add", "target.txt"]);
+		await git(root, ["commit", "-m", "target side change"]);
+		const target = await git(root, ["rev-parse", "HEAD"]);
+		const calls: string[][] = [];
+		const adapter = createGitAdapter(runner(calls));
+		const foreignPostflight = await adapter.inspectIntegrationCheckout!({ repositoryRoot: root, targetBranch: "main", targetRevision: base, approvedBaseRevision: base, approvedHeadRevision: head, approvedCommits: [head] });
+		expect(foreignPostflight.kind).toBe("inspected");
+		if (foreignPostflight.kind === "inspected") expect(foreignPostflight.observation.rangeExact).toBe(false);
+		const outcome = await adapter.integrateApprovedRange!({ repositoryRoot: root, targetBranch: "main", targetRevision: target, approvedBaseRevision: base, approvedHeadRevision: head, approvedCommits: [head], action: { kind: "merge-commit", argv: ["merge", "--no-ff", "--no-edit", head] } });
+		expect(outcome).toMatchObject({ kind: "completed", code: 0, killed: false });
+		expect(calls.filter((call) => call[1] === "merge")).toEqual([["git", "merge", "--no-ff", "--no-edit", head]]);
+		const merged = await git(root, ["rev-parse", "HEAD"]);
+		expect(merged).not.toBe(target);
+		expect(await git(root, ["rev-list", "--parents", "-n", "1", "HEAD"])).toMatch(new RegExp(`^${merged} ${target} ${head}$`));
+		expect(calls.some((call) => call.includes("push") || call.includes("fetch") || call.includes("pull") || call.includes("rebase") || call.includes("reset"))).toBe(false);
+	});
+
 	it("reports a dirty target without invoking merge", async () => {
 		const root = await mkdtemp(join(tmpdir(), "steward-t08-git-dirty-"));
 		roots.push(root);

@@ -59,6 +59,7 @@ import {
 	type CompletionStopResource,
 	type CompletionStopFailure,
 	type CompletionGateFacts,
+	type AnyCompletionGateFacts,
 	type CompletionArchiveIntent,
 	type CompletionRecord,
 	type MonitorCheckpoint,
@@ -118,6 +119,7 @@ import type {
 	VerificationFinalizeResult,
 } from "./completion-store.ts";
 import { classifyInfrastructureFact, decideReconciliation, decideSilenceRecovery, parseTaskFactRequest, replacementRetryOrdinal, resolveTaskFactAnswer, selectTransientModel, taskFactValue, type ClassifiedInfrastructureFact, type ReconciliationDecision, type TaskFactKey, type SilenceRecoveryDecision } from "./reconciliation.ts";
+import { allRequiredTasksIntegrated, selectIntegrationQueueHead, selectTaskAdmission, type IntegrationQueueDecision, type TaskAdmissionDecision } from "./coordination.ts";
 
 export type { MonitorDigest, MonitorLifecycle, SilenceProcessObservation } from "./run.ts";
 
@@ -308,7 +310,9 @@ export type IntegrationCheckoutResult =
 	| { kind: "unavailable"; message: string };
 
 export interface IntegrationMutationInput extends IntegrationCheckoutInput {
-	action: { kind: "fast-forward"; argv: ["merge", "--ff-only", "--no-edit", string] };
+	action:
+		| { kind: "fast-forward"; argv: ["merge", "--ff-only", "--no-edit", string] }
+		| { kind: "merge-commit"; argv: ["merge", "--no-ff", "--no-edit", string] };
 }
 
 export type GitCommandOutcome =
@@ -367,7 +371,7 @@ export type ManagedWorktreeProgress =
 
 export type MonitorTrigger = "start" | "lifecycle" | "fallback" | "settled" | "turn" | "compaction" | "prompt" | "manual";
 
-export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "silence-nudge" | "silence-interrupt" | "silence-resume" | "reserve-silent-replacement" | "reserve-transient-replacement" | "none" | "approval-required" | "blocked" | "degraded";
+export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-builder" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "silence-nudge" | "silence-interrupt" | "silence-resume" | "reserve-silent-replacement" | "reserve-transient-replacement" | "none" | "approval-required" | "blocked" | "degraded";
 
 export type MonitorCondition = "completed" | "approval-required" | "blocked" | "degraded" | "ordinary";
 
@@ -559,6 +563,7 @@ function presentCompletedStatus(journal: RunJournal, note?: string): CompletedSt
 }
 
 function presentStatusForJournal(journal: RunJournal, note?: string): StatusView {
+	if (journal.run.tasks.length > 1) return presentMultiTaskStatus(journal, note);
 	if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return presentCompletedStatus(journal, note);
 	if (journal.run.status === "completing" || journal.run.tasks.some((candidate) => candidate.phase === "integrating" || candidate.phase === "completed")) return presentCompletionStatus(journal, note);
 	if (journal.run.tasks.some((candidate) => candidate.phase === "approved")) return presentApprovedStatus(journal, note);
@@ -629,6 +634,32 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 		footer: { run: "active", attentionCount: task.attention === "none" ? 0 : 1, text: `steward: ${journal.run.id} · ${task.phase} · ${task.attention === "none" ? 0 : 1} attention${attempt.recovery?.silence ? ` · silence ${attempt.recovery.silence.phase}` : ""}` },
 		activeAttempt,
 	};
+}
+
+function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatusView | CompletedStatusView {
+	if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return presentCompletedStatus(journal, note);
+	const activePhases = new Set(["building", "reviewing", "reworking"]);
+	const codeTasks = journal.run.tasks.filter((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"));
+	const integrated = codeTasks.filter((task) => task.integration?.phase === "integrated").length;
+	const active = journal.run.tasks.filter((task) => activePhases.has(task.phase)).length;
+	const approved = journal.run.tasks.filter((task) => task.phase === "approved").length;
+	const attention = journal.run.tasks.filter((task) => task.attention !== "none").length;
+	const queue = selectIntegrationQueueHead(journal.run);
+	const nextIntegration = queue.kind === "ready" || queue.kind === "waiting" ? queue.taskId : "none";
+	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...journal.run.tasks.map((task, index) => {
+		const attempt = task.attempts.at(-1);
+		const integration = task.integration?.phase ?? (task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? "queued" : "n/a");
+		const reason = task.attention !== "none" ? `/${task.attention}${task.attentionReason ? `:${task.attentionReason}` : ""}` : "";
+		return `Task ${index + 1} ${task.contract.id}: ${task.phase}${reason} · ${attempt ? `${attempt.role}/${attempt.id}/${attempt.state}` : "no-attempt"} · integration ${integration}`;
+	}), `Tasks ${integrated}/${codeTasks.length} integrated | Active ${active}/${journal.run.effectiveSettings.maximumActiveTasks} | Approved waiting ${approved} | Attention ${attention} | Next integration ${nextIntegration}`];
+	const detail = journal.run.tasks.find((task) => activePhases.has(task.phase) || task.attention !== "none");
+	const detailAttempt = detail?.attempts.at(-1);
+	if (detail && detailAttempt) {
+		lines.push(`Assignment: ${detailAttempt.assignmentPath}${"assignmentSha256" in detailAttempt.dispatch ? ` (${detailAttempt.dispatch.assignmentSha256})` : ""}`);
+		if (detailAttempt.role === "builder" && detailAttempt.evidence?.phase !== "finalized") lines.push("Completion: not inferred from Herdr activity; awaiting a validated Attempt Report.");
+	}
+	if (note) lines.push(note);
+	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount: attention, text: `steward: ${journal.run.id} · ${detail?.phase ?? journal.run.status} · ${attention} attention · ${active}/${journal.run.effectiveSettings.maximumActiveTasks} active` } };
 }
 
 function silenceStatusLines(journal: RunJournal, task: TaskRecord, attempt: AttemptRecord): string[] {
@@ -740,13 +771,16 @@ function buildEvidenceManifest(input: {
 	};
 }
 
-function activeBuilder(journal: RunJournal): { task: TaskRecord; attempt: BuilderAttemptRecord } | undefined {
-	const candidates = journal.run.tasks.flatMap((task) => {
+function activeBuilders(journal: RunJournal): Array<{ task: TaskRecord; index: number; attempt: BuilderAttemptRecord }> {
+	return journal.run.tasks.flatMap((task, index) => {
 		const attempt = task.attempts[task.attempts.length - 1];
 		const reportEligible = attempt?.state === "active" || attempt?.state === "awaiting-report" || (attempt?.state === "prepared" && attempt.dispatch.phase === "prompt-intended");
-		return (task.phase === "building" || task.phase === "reworking") && attempt?.role === "builder" && reportEligible && ["prompt-intended", "prompted", "reconciled-active"].includes(attempt.dispatch.phase) ? [{ task, attempt }] : [];
+		return (task.phase === "building" || task.phase === "reworking") && attempt?.role === "builder" && reportEligible && ["prompt-intended", "prompted", "reconciled-active"].includes(attempt.dispatch.phase) ? [{ task, index, attempt }] : [];
 	});
-	return candidates.length === 1 ? candidates[0] : undefined;
+}
+
+function activeBuilder(journal: RunJournal, minimumIndex = 0): { task: TaskRecord; index: number; attempt: BuilderAttemptRecord } | undefined {
+	return activeBuilders(journal).find((candidate) => candidate.index >= minimumIndex);
 }
 
 function rejectionSummary(codes: readonly string[], details: readonly string[]): string {
@@ -762,8 +796,8 @@ function intentEquivalent(left: BuilderEvidenceRecord | undefined, right: Builde
 	return Boolean(left?.phase === "finalization-intended" && right.phase === "finalization-intended" && left.reportSha256 === right.reportSha256 && left.manifestPath === right.manifestPath && left.manifestSha256 === right.manifestSha256);
 }
 
-async function validateActiveBuilderEvidence(repositoryRoot: string, controllerSessionId: string, loadedJournal: RunJournal, dependencies: StewardDependencies): Promise<EvidenceDecision> {
-	const selected = activeBuilder(loadedJournal);
+async function validateActiveBuilderEvidence(repositoryRoot: string, controllerSessionId: string, loadedJournal: RunJournal, dependencies: StewardDependencies, selectedInput?: { task: TaskRecord; index: number; attempt: BuilderAttemptRecord }): Promise<EvidenceDecision> {
+	const selected = selectedInput ?? activeBuilder(loadedJournal);
 	if (!selected) return { kind: "waiting", journal: loadedJournal, note: "Evidence validation is waiting for exactly one active prompted Builder Attempt." };
 	let { task, attempt } = selected;
 	const paths = evidencePathsFor(attempt);
@@ -907,8 +941,8 @@ function compactUuid(clock: StewardClockAdapter): string {
 	return value;
 }
 
-function reviewTaskCandidate(journal: RunJournal): { task: TaskRecord; index: number; builder: BuilderAttemptRecord } | undefined {
-	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+function reviewTaskCandidate(journal: RunJournal, minimumIndex = 0): { task: TaskRecord; index: number; builder: BuilderAttemptRecord } | undefined {
+	for (let index = minimumIndex; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
 		if (!task || !task.contract.reviewRequired) continue;
 		const latest = task.attempts[task.attempts.length - 1];
@@ -925,8 +959,8 @@ function reviewerForTask(task: TaskRecord): ReviewerAttemptRecord | undefined {
 	return latest?.role === "reviewer" ? latest : undefined;
 }
 
-function reviewerTaskCandidate(journal: RunJournal): { task: TaskRecord; index: number; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord } | undefined {
-	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+function reviewerTaskCandidate(journal: RunJournal, minimumIndex = 0): { task: TaskRecord; index: number; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord } | undefined {
+	for (let index = minimumIndex; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index];
 		if (!task || !task.contract.reviewRequired || task.phase !== "reviewing" || task.attention !== "none") continue;
 		const reviewer = reviewerForTask(task);
@@ -1260,7 +1294,7 @@ async function dispatchReviewer(repositoryRoot: string, controllerSessionId: str
 			delete task.attentionDiagnostic;
 			delete task.attentionReason;
 			task.attempts.push(prepared);
-			delete next.run.monitor;
+				clearTaskMonitor(next.run, task.contract.id);
 		});
 	} catch (error: unknown) { return { journal, note: `Reviewer pane intent could not be built; no pane was created. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
 	const persistedPrepared = await persistReviewJournal(repositoryRoot, preparedJournal, dependencies);
@@ -1394,8 +1428,8 @@ async function persistReviewApprovalRequired(repositoryRoot: string, journal: Ru
 	return { journal: persisted, note, action: "approval-required" };
 }
 
-async function advanceEligibleReview(repositoryRoot: string, controllerSessionId: string, journal: RunJournal, dependencies: StewardDependencies, automatic = false): Promise<ReviewDecision> {
-	const reviewerSelected = reviewerTaskCandidate(journal);
+async function advanceEligibleReview(repositoryRoot: string, controllerSessionId: string, journal: RunJournal, dependencies: StewardDependencies, automatic = false, minimumIndex = 0): Promise<ReviewDecision> {
+	const reviewerSelected = reviewerTaskCandidate(journal, minimumIndex);
 	if (reviewerSelected) {
 		if (automatic && dependencies.runJournal.inspectAttemptReport) {
 			let report: AttemptReportInspection;
@@ -1405,7 +1439,7 @@ async function advanceEligibleReview(repositoryRoot: string, controllerSessionId
 		}
 		return validateActiveReviewerReport(repositoryRoot, journal, reviewerSelected, reviewerSelected.reviewer, dependencies, !automatic);
 	}
-	const selected = reviewTaskCandidate(journal);
+	const selected = reviewTaskCandidate(journal, minimumIndex);
 	if (!selected) return { journal, note: "" };
 	if (automatic && selected.task.attentionReason === "review-approval-required") return { journal, note: selected.task.attentionDiagnostic ?? "Review awaits explicit Controller approval.", action: "approval-required" };
 	const derived = await deriveReviewSubject({ runId: journal.run.id, task: selected.task, builder: selected.builder }, dependencies);
@@ -1461,7 +1495,29 @@ function currentMonitorAttempt(journal: RunJournal): { task: TaskRecord; index: 
 			if (!task || !attempt || (task.phase !== "building" && task.phase !== "reworking" && task.phase !== "reviewing" && task.phase !== "approved" && task.phase !== "integrating" && task.phase !== "completed") || (attempt.dispatch.phase !== "prompted" && attempt.dispatch.phase !== "reconciled-active")) continue;
 		candidates.push({ task, index, attempt });
 	}
-	return candidates.length === 1 ? candidates[0] : undefined;
+	return candidates[0];
+}
+
+function currentMonitorAttempts(journal: RunJournal): Array<{ task: TaskRecord; index: number; attempt: AttemptRecord }> {
+	const candidates: Array<{ task: TaskRecord; index: number; attempt: AttemptRecord }> = [];
+	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+		const task = journal.run.tasks[index];
+		const attempt = task?.attempts.at(-1);
+		if (!task || !attempt || !["building", "reworking", "reviewing", "approved", "integrating", "completed"].includes(task.phase) || (attempt.dispatch.phase !== "prompted" && attempt.dispatch.phase !== "reconciled-active")) continue;
+		candidates.push({ task, index, attempt });
+	}
+	return candidates;
+}
+
+function clearTaskMonitor(run: RunJournal["run"], taskId: string): void {
+	if (run.tasks.length <= 1) {
+		delete run.monitor;
+		return;
+	}
+	const retained = (run.monitors ?? []).filter((monitor) => monitor.taskId !== taskId);
+	if (retained.length > 0) run.monitors = retained;
+	else delete run.monitors;
+	delete run.monitor;
 }
 
 function nextSilenceDeadline(journal: RunJournal, attempt: AttemptRecord, now: number): number {
@@ -1606,12 +1662,14 @@ async function loadCompletionEvidence(repositoryRoot: string, task: TaskRecord, 
 	return { subject: derived.value, builder, reviewer, builderManifest: builderManifest.value, reviewerManifest: reviewerManifest.value };
 }
 
-function completionIntegrationIdentity(journal: RunJournal, task: TaskRecord, evidence: { subject: ReviewSubject; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord }): TaskIntegration | undefined {
+function completionIntegrationIdentity(journal: RunJournal, task: TaskRecord, evidence: { subject: ReviewSubject; builder: BuilderAttemptRecord; reviewer: ReviewerAttemptRecord }, targetRevision?: string): TaskIntegration | undefined {
 	if (journal.run.integrationBase.kind !== "git" || evidence.subject.kind !== "git" || evidence.builder.evidence?.phase !== "finalized" || evidence.reviewer.evidence?.phase !== "finalized") return undefined;
+	const target = targetRevision ?? journal.run.integrationBase.revision;
+	const action = target === evidence.subject.baseRevision ? { kind: "fast-forward" as const, argv: ["merge", "--ff-only", "--no-edit", evidence.subject.headRevision] as ["merge", "--ff-only", "--no-edit", string] } : { kind: "merge-commit" as const, argv: ["merge", "--no-ff", "--no-edit", evidence.subject.headRevision] as ["merge", "--no-ff", "--no-edit", string] };
 	return {
 		phase: "intended",
 		targetBranch: journal.run.integrationBase.branch,
-		targetRevision: journal.run.integrationBase.revision,
+		targetRevision: target,
 		approvedBaseRevision: evidence.subject.baseRevision,
 		approvedHeadRevision: evidence.subject.headRevision,
 		approvedCommits: [...evidence.subject.commits],
@@ -1619,7 +1677,7 @@ function completionIntegrationIdentity(journal: RunJournal, task: TaskRecord, ev
 		reviewerAttemptId: evidence.reviewer.id,
 		builderManifestSha256: evidence.builder.evidence.manifestSha256,
 		reviewerManifestSha256: evidence.reviewer.evidence.manifestSha256,
-		action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", evidence.subject.headRevision] },
+		action,
 		intendedAt: "",
 	};
 }
@@ -1649,11 +1707,12 @@ function completionIntegrationInput(repositoryRoot: string, integration: Extract
 }
 
 function integrationObservationExact(input: IntegrationCheckoutInput, result: import("./steward.ts").IntegrationCheckoutResult): boolean {
-	return input.targetRevision === input.approvedBaseRevision && result.kind === "inspected" && result.observation.rangeExact && result.observation.branch === input.targetBranch && result.observation.head === input.approvedHeadRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0 && result.resolvedBaseRevision === input.approvedBaseRevision && result.resolvedHeadRevision === input.approvedHeadRevision && JSON.stringify(result.commits) === JSON.stringify(input.approvedCommits);
+	if (result.kind !== "inspected" || !result.observation.rangeExact || result.observation.branch !== input.targetBranch || result.observation.dirtyPaths.length !== 0 || result.observation.operationMarkers.length !== 0 || result.resolvedBaseRevision !== input.approvedBaseRevision || result.resolvedHeadRevision !== input.approvedHeadRevision || JSON.stringify(result.commits) !== JSON.stringify(input.approvedCommits)) return false;
+	return input.targetRevision === input.approvedBaseRevision ? result.observation.head === input.approvedHeadRevision : result.observation.head !== null && result.observation.head !== input.targetRevision && /^[0-9a-f]{40}$/.test(result.observation.head);
 }
 
 function integrationObservationUnchanged(input: IntegrationCheckoutInput, result: import("./steward.ts").IntegrationCheckoutResult): boolean {
-	return input.targetRevision === input.approvedBaseRevision && result.kind === "inspected" && result.observation.branch === input.targetBranch && result.observation.head === input.targetRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0;
+	return result.kind === "inspected" && result.observation.branch === input.targetBranch && result.observation.head === input.targetRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0;
 }
 
 async function inspectCompletionCheckout(input: IntegrationCheckoutInput, dependencies: StewardDependencies): Promise<import("./steward.ts").IntegrationCheckoutResult> {
@@ -1681,10 +1740,12 @@ function completionResourceKey(resource: CompletionAgentIdentity): string {
 	return `${resource.role}/${resource.agentName}/${resource.workspaceId}/${resource.paneId}/${resource.terminalId}`;
 }
 
-function completionGateFacts(journal: RunJournal, checkout: IntegrationCheckoutObservation, dependencies: StewardDependencies): CompletionGateFacts | undefined {
+function completionGateFacts(journal: RunJournal, checkout: IntegrationCheckoutObservation, dependencies: StewardDependencies): AnyCompletionGateFacts | undefined {
 	const result = evaluateCompletionGate(journal, checkout);
 	if (!result.passed) return undefined;
-	return { ...result.facts, evaluatedAt: transitionTimestamp(journal, dependencies.clock.now()), predicates: [...COMPLETION_GATE_PREDICATES] };
+	const evaluatedAt = transitionTimestamp(journal, dependencies.clock.now());
+	if ("kind" in result.facts) return { ...result.facts, evaluatedAt, predicates: [...result.facts.predicates] };
+	return { ...result.facts, evaluatedAt, predicates: [...COMPLETION_GATE_PREDICATES] };
 }
 
 async function collectCompletionReports(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<import("./completion-store.ts").CompletionReportSource[] | { message: string }> {
@@ -1733,10 +1794,124 @@ async function persistStopFailure(repositoryRoot: string, journal: RunJournal, t
 	return persisted ? { journal: persisted, note: `Graceful stop paused at ${resource.agentName}; no archive or completion notification was attempted.` } : { journal, note: "Graceful-stop failure could not be retained durably; no /quit resend or archive was attempted." };
 }
 
+async function advanceMultiTaskIntegration(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	let journal = journalInput;
+	const queue = selectIntegrationQueueHead(journal.run);
+	if (queue.kind !== "ready") return { journal, note: queue.kind === "waiting" ? `Task ${queue.taskId} is waiting for ordered ${queue.reason}; no later integration effect was attempted.` : "No ordered integration is ready." };
+	const task = journal.run.tasks[queue.index];
+	if (!task) return { journal, note: "Ordered integration Task disappeared; no Git effect was attempted." };
+	if (journal.run.finalVerification.kind !== "command") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "final-verification-unexecutable", "Final verification is criteria-only; no ordered integration effect was attempted.", dependencies);
+	if (!dependencies.git.inspectIntegrationCheckout || !dependencies.git.integrateApprovedRange) return { journal, note: "Integration adapters are unavailable; Approval remains queued and no Git effect was attempted." };
+	const evidence = await loadCompletionEvidence(repositoryRoot, task, journal, dependencies);
+	if ("message" in evidence) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", evidence.message, dependencies);
+	if (evidence.subject.kind !== "git" || journal.run.integrationBase.kind !== "git") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved completion requires a Git Builder subject and Git integration base; no Git effect was attempted.", dependencies);
+	const input: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: queue.targetRevision, approvedBaseRevision: evidence.subject.baseRevision, approvedHeadRevision: evidence.subject.headRevision, approvedCommits: [...evidence.subject.commits] };
+	const preflight = await inspectCompletionCheckout(input, dependencies);
+	const preflightExact = preflight.kind === "inspected" && preflight.observation.rangeExact && preflight.observation.branch === input.targetBranch && preflight.observation.head === input.targetRevision && preflight.observation.dirtyPaths.length === 0 && preflight.observation.operationMarkers.length === 0 && preflight.resolvedBaseRevision === input.approvedBaseRevision && preflight.resolvedHeadRevision === input.approvedHeadRevision && JSON.stringify(preflight.commits) === JSON.stringify(input.approvedCommits);
+	if (!preflightExact) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", preflight.kind === "inspected" ? `Integration checkout is not the clean exact ordered target (${preflight.observation.branch ?? "detached"}@${preflight.observation.head ?? "unknown"}); no Git effect was attempted.` : `Integration checkout could not be inspected: ${preflight.message}`, dependencies);
+	const identity = completionIntegrationIdentity(journal, task, evidence, queue.targetRevision);
+	if (!identity) return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "integration-preflight", "Approved integration identity could not be reconstructed from protected Git evidence.", dependencies);
+	const intendedAt = transitionTimestamp(journal, dependencies.clock.now());
+	let intended: RunJournal;
+	try { intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const nextTask = next.run.tasks[queue.index]; if (!nextTask) throw new Error("Ordered integration Task disappeared before intent."); nextTask.phase = "integrating"; nextTask.attention = "none"; delete nextTask.attentionDiagnostic; delete nextTask.attentionReason; nextTask.integration = { ...identity, phase: "intended", intendedAt }; }); }
+	catch (error: unknown) { return { journal, note: `Integration intent could not be built durably; no Git merge was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedIntent = await persistReviewJournal(repositoryRoot, intended, dependencies);
+	if (!persistedIntent) return { journal, note: "Integration intent could not be persisted; no Git merge was attempted." };
+	journal = persistedIntent;
+	let outcome: GitCommandOutcome;
+	try { outcome = await dependencies.git.integrateApprovedRange({ ...input, action: identity.action }); }
+	catch (error: unknown) { outcome = { kind: "thrown", message: error instanceof Error ? error.message : "Local Git integration failed." }; }
+	const post = await inspectCompletionCheckout(input, dependencies);
+	const exact = integrationObservationExact(input, post);
+	const unchanged = integrationObservationUnchanged(input, post);
+	let classified: TaskIntegration;
+	if (exact && post.kind === "inspected") classified = { ...identity, phase: "integrated", intendedAt, integratedAt: transitionTimestamp(journal, dependencies.clock.now()), observedHead: post.observation.head ?? input.approvedHeadRevision };
+	else if (unchanged) classified = { ...identity, phase: "failed", intendedAt, observedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: outcome.kind === "completed" ? outcome.code : null, diagnostic: outcome.kind === "completed" ? (outcome.stderr.trim() || `Git integration exited with code ${outcome.code}.`).slice(0, 2_000) : outcome.message.slice(0, 2_000) };
+	else { const observed = post.kind === "inspected" ? post.observation : emptyIntegrationObservation(); const diagnostic = post.kind === "unavailable" ? post.message : outcome.kind === "completed" ? (outcome.stderr.trim() || "Git integration left a partial or unexpected checkout state.") : outcome.message; classified = { ...identity, phase: "ambiguous", intendedAt, observedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: outcome.kind === "completed" ? outcome.code : null, diagnostic: diagnostic.slice(0, 2_000), observed }; }
+	let classifiedJournal: RunJournal;
+	try { classifiedJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const nextTask = next.run.tasks[queue.index]; if (!nextTask) throw new Error("Ordered integration Task disappeared after Git effect."); nextTask.integration = classified; nextTask.phase = "integrating"; if (classified.phase === "integrated") { nextTask.attention = "none"; delete nextTask.attentionDiagnostic; delete nextTask.attentionReason; } else { nextTask.attention = "needs-user"; nextTask.attentionReason = classified.phase === "failed" ? "integration-failed" : "integration-ambiguous"; nextTask.attentionDiagnostic = classified.diagnostic; } }); }
+	catch (error: unknown) { return { journal, note: `Git integration returned but post-state could not be retained durably; no merge retry was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedClassified = await persistReviewJournal(repositoryRoot, classifiedJournal, dependencies);
+	if (!persistedClassified) return { journal, note: "Git integration returned but post-state could not be retained durably; no merge retry was attempted." };
+	return { journal: persistedClassified, note: classified.phase === "integrated" ? `Approved range ${input.approvedHeadRevision} for ${task.contract.id} was integrated in ordered queue position ${queue.index + 1}.` : classified.diagnostic, action: "integrate-approved-range" };
+}
+
+async function advanceMultiTaskFinalization(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies, oneAction: boolean): Promise<CompletionDecision> {
+	let journal = journalInput;
+	if (!allRequiredTasksIntegrated(journal.run) || journal.run.tasks.some((task) => task.attention !== "none" || ["building", "reviewing", "reworking"].includes(task.phase))) return { journal, note: "Final verification is gated until every Task is complete, attention-free, and every ordered code integration is durable." };
+	if (journal.run.finalVerification.kind !== "command") return { journal, note: "Final verification is criteria-only; no process was launched." };
+	const codeTasks = journal.run.tasks.filter((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"));
+	const lastIntegration = codeTasks.at(-1)?.integration;
+	if (journal.run.integrationBase.kind !== "git" || !lastIntegration || lastIntegration.phase !== "integrated") return { journal, note: "The complete ordered integration head is unavailable; final verification was not attempted." };
+	const finalInput: IntegrationCheckoutInput = { repositoryRoot, targetBranch: journal.run.integrationBase.branch, targetRevision: lastIntegration.observedHead, approvedBaseRevision: lastIntegration.approvedBaseRevision, approvedHeadRevision: lastIntegration.approvedHeadRevision, approvedCommits: [...lastIntegration.approvedCommits] };
+	const inspectFinal = async (): Promise<import("./steward.ts").IntegrationCheckoutResult> => inspectCompletionCheckout(finalInput, dependencies);
+	const exactFinal = (result: import("./steward.ts").IntegrationCheckoutResult): result is Extract<import("./steward.ts").IntegrationCheckoutResult, { kind: "inspected" }> => result.kind === "inspected" && result.observation.branch === finalInput.targetBranch && result.observation.head === finalInput.targetRevision && result.observation.dirtyPaths.length === 0 && result.observation.operationMarkers.length === 0 && result.observation.rangeExact;
+	const currentExecution = journal.run.finalVerificationExecution;
+	if (!currentExecution) {
+		const fresh = await inspectFinal();
+		if (!exactFinal(fresh) || !dependencies.process.runApprovedVerification || !dependencies.runJournal.resolveCompletionPaths || !dependencies.runJournal.finalizeVerificationResult) return { journal, note: exactFinal(fresh) ? "Final-verification process/storage adapters are unavailable; no process was launched." : "The fresh final integration checkout is not exact, clean, and marker-free; no verification effect was attempted." };
+		const paths = dependencies.runJournal.resolveCompletionPaths(repositoryRoot, journal.run.id);
+		const command = journal.run.finalVerification.kind === "command" ? journal.run.finalVerification.command : "";
+		const intendedAt = transitionTimestamp(journal, dependencies.clock.now());
+		let intended: RunJournal;
+		try { intended = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.finalVerificationExecution = { phase: "intended", id: "verification-01", command, cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt }; }); }
+		catch (error: unknown) { return { journal, note: `Final-verification intent could not be persisted; no process was launched. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persistedIntent = await persistReviewJournal(repositoryRoot, intended, dependencies);
+		if (!persistedIntent) return { journal, note: "Final-verification intent could not be persisted; no process was launched." };
+		journal = persistedIntent;
+		const startedAt = transitionTimestamp(journal, dependencies.clock.now());
+		let processResult: VerificationProcessOutcome;
+		try { processResult = await dependencies.process.runApprovedVerification({ cwd: repositoryRoot, command }); }
+		catch (error: unknown) { processResult = { kind: "thrown", message: error instanceof Error ? error.message : "Final-verification process failed." }; }
+		const post = await inspectFinal();
+		let finalizedResult: VerificationFinalizeResult | undefined;
+		if (processResult.kind === "completed" && processResult.killed === false) {
+			try { finalizedResult = await dependencies.runJournal.finalizeVerificationResult({ repositoryRoot, runId: journal.run.id, command, cwd: repositoryRoot, startedAt, completedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: processResult.code, killed: false, stdout: processResult.stdout, stderr: processResult.stderr }); }
+			catch (error: unknown) { finalizedResult = { kind: "storage-error", paths, message: error instanceof Error ? error.message : "Final-verification result storage failed." }; }
+		}
+		const completedResult = finalizedResult && (finalizedResult.kind === "created" || finalizedResult.kind === "existing-match") ? finalizedResult : undefined;
+		const stored = Boolean(completedResult);
+		const passed = processResult.kind === "completed" && processResult.killed === false && processResult.code === 0 && stored && exactFinal(post);
+		const failed = processResult.kind === "completed" && processResult.killed === false && processResult.code !== 0 && stored && post.kind === "inspected";
+		const execution: FinalVerificationExecution = passed || failed ? { phase: passed ? "passed" : "failed", id: "verification-01", command, cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt, startedAt, completedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: processResult.kind === "completed" ? processResult.code : 1, killed: false, logSha256: completedResult!.logSha256, resultSha256: completedResult!.resultSha256, checkout: (post as Extract<typeof post, { kind: "inspected" }>).observation } : { phase: "ambiguous", id: "verification-01", command, cwd: repositoryRoot, logPath: paths.verificationLogPath, resultPath: paths.verificationResultPath, intendedAt, observedAt: transitionTimestamp(journal, dependencies.clock.now()), exitCode: processResult.kind === "completed" ? processResult.code : null, killed: processResult.kind === "completed" ? processResult.killed : null, diagnostic: processResult.kind === "thrown" ? processResult.message : "Final verification did not produce a conclusive result.", ...(completedResult ? { logSha256: completedResult.logSha256, resultSha256: completedResult.resultSha256 } : {}), ...(post.kind === "inspected" ? { checkout: post.observation } : {}) };
+		let recorded: RunJournal;
+		try { recorded = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.finalVerificationExecution = execution; }); }
+		catch (error: unknown) { return { journal, note: `Final-verification result could not be retained durably; no process rerun was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+		const persisted = await persistReviewJournal(repositoryRoot, recorded, dependencies);
+		if (!persisted) return { journal, note: "Final-verification result could not be retained durably; no process rerun was attempted." };
+		journal = persisted;
+		if (!passed) return { journal, note: "Final verification did not pass conclusively; completion remains gated.", action: "run-final-verification" };
+		if (oneAction) return { journal, note: "Final verification completed and was durably classified; the Completion Gate is queued for a later pass.", action: "run-final-verification" };
+	}
+	const execution = journal.run.finalVerificationExecution;
+	if (!execution || execution.phase !== "passed") return { journal, note: "Final verification has not produced a conclusive passing result; no rerun was attempted." };
+	const fresh = await inspectFinal();
+	if (!exactFinal(fresh)) return { journal, note: "The persisted verification result no longer has a fresh exact clean target checkout; the Completion Gate was not evaluated." };
+	const gate = completionGateFacts(journal, fresh.observation, dependencies);
+	if (!gate) {
+		const result = evaluateCompletionGate(journal, fresh.observation);
+		return { journal, note: `Completion Gate failed: ${result.passed ? "unknown" : result.failures.join(" ")}` };
+	}
+	let gateJournal: RunJournal;
+	try { gateJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { next.run.status = "completing"; for (const task of next.run.tasks) { task.phase = "completed"; task.attention = "none"; delete task.attentionReason; delete task.attentionDiagnostic; } next.run.completion = { phase: "gate-passed", gate }; }); }
+	catch (error: unknown) { return { journal, note: `Completion Gate passed in memory but could not be retained durably; no agent stop or archive effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
+	const persistedGate = await persistReviewJournal(repositoryRoot, gateJournal, dependencies);
+	if (!persistedGate) return { journal, note: "Completion Gate passed in memory but could not be retained durably; no agent stop or archive effect was attempted." };
+	return oneAction ? { journal: persistedGate, note: "Multi-Task Completion Gate passed and was durably recorded; graceful stopping is queued for a later pass.", action: "pass-completion-gate" } : advanceCompletionLifecycle(repositoryRoot, persistedGate, dependencies);
+}
+
+async function advanceMultiTaskCompletion(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies, oneAction: boolean): Promise<CompletionDecision> {
+	const queue = selectIntegrationQueueHead(journal.run);
+	if (queue.kind === "ready") return advanceMultiTaskIntegration(repositoryRoot, journal, dependencies);
+	if (queue.kind === "waiting") return { journal, note: queue.reason === "attention" ? journal.run.tasks[queue.index]?.attentionDiagnostic ?? `Task ${queue.taskId} requires attention before integration.` : `Task ${queue.taskId} is waiting for ordered ${queue.reason}; no final verification was attempted.` };
+	return advanceMultiTaskFinalization(repositoryRoot, journal, dependencies, oneAction);
+}
+
 async function advanceApprovedCompletion(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies, oneAction = false): Promise<CompletionDecision> {
 	let journal = journalInput;
 	if (journal.run.status === "completing") return advanceCompletionLifecycle(repositoryRoot, journal, dependencies, oneAction);
 	if (journal.run.status !== "active") return { journal, note: "" };
+	if (journal.run.tasks.length > 1) return advanceMultiTaskCompletion(repositoryRoot, journal, dependencies, oneAction);
 	const approvedTasks = journal.run.tasks.filter((candidate) => candidate.phase === "approved" && candidate.attention === "none" && candidate.approval?.phase === "valid");
 	const integratingTask = journal.run.tasks.find((candidate) => candidate.integration?.phase === "integrated");
 	if (approvedTasks.length === 0 && !integratingTask) return { journal, note: "" };
@@ -1875,7 +2050,8 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 	let journal = journalInput;
 	const task = journal.run.tasks[0];
 	if (!task || journal.run.status !== "completing" || !journal.run.completion) return { journal, note: "" };
-	if (task.attention !== "none") return { journal, note: task.attentionDiagnostic ?? `Completion is paused (${task.attentionReason ?? "needs-user"}).` };
+	const attentionTask = journal.run.tasks.find((candidate) => candidate.attention !== "none");
+	if (attentionTask) return { journal, note: attentionTask.attentionDiagnostic ?? `Completion is paused (${attentionTask.attentionReason ?? "needs-user"}).` };
 	let completion = journal.run.completion;
 	if (completion.phase === "gate-passed") {
 		const resources = completionResources(journal).map((resource) => ({ ...resource, state: "intended" as const, intendedAt: transitionTimestamp(journal, dependencies.clock.now()) }));
@@ -1940,7 +2116,7 @@ async function advanceCompletionLifecycle(repositoryRoot: string, journalInput: 
 		journal = persisted;
 		const finalPointers = await dependencies.runJournal.loadCompletionJournalPointers(repositoryRoot);
 		if (finalPointers.kind !== "loaded") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", finalPointers.message, dependencies);
-		const finalJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const current = next.run.completion; if (!current || current.phase !== "archive-intended") throw new Error("Archive intent disappeared before final snapshot."); const archive = { ...current.archive, activeJournalSha256: sha256Bytes(finalPointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(finalPointers.pointers.previousBytes) }; next.run.status = "completed"; next.run.tasks[0]!.phase = "completed"; next.run.tasks[0]!.attention = "none"; delete next.run.tasks[0]!.attentionReason; delete next.run.tasks[0]!.attentionDiagnostic; next.run.completion = { phase: "archived", gate: current.gate, resources: current.resources.map((resource) => ({ ...resource, acknowledgement: { ...resource.acknowledgement } })), archive, archivedAt: transitionTimestamp(journal, dependencies.clock.now()) }; }, "archive/run.json");
+		const finalJournal = advanceRunJournal(journal, dependencies.clock.now(), (next) => { const current = next.run.completion; if (!current || current.phase !== "archive-intended") throw new Error("Archive intent disappeared before final snapshot."); const archive = { ...current.archive, activeJournalSha256: sha256Bytes(finalPointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(finalPointers.pointers.previousBytes) }; next.run.status = "completed"; for (const task of next.run.tasks) { task.phase = "completed"; task.attention = "none"; delete task.attentionReason; delete task.attentionDiagnostic; } next.run.completion = { phase: "archived", gate: current.gate, resources: current.resources.map((resource) => ({ ...resource, acknowledgement: { ...resource.acknowledgement } })), archive, archivedAt: transitionTimestamp(journal, dependencies.clock.now()) }; }, "archive/run.json");
 		const published = await dependencies.runJournal.archiveCompletedRun({ repositoryRoot, runId: journal.run.id, run: finalJournal, archivedAt: finalJournal.run.completion?.phase === "archived" ? finalJournal.run.completion.archivedAt : dependencies.clock.now().toISOString(), verification: archive.verification, reports });
 		if (published.kind !== "published" && published.kind !== "existing-match") return persistCompletionAttention(repositoryRoot, journal, task.contract.id, "archive-failed", `Completion archive was not published: ${"message" in published ? published.message : "unknown archive failure"}`, dependencies);
 		await dependencies.runJournal.appendActivity(repositoryRoot, { timestamp: finalJournal.run.updatedAt, runId: finalJournal.run.id, event: "run-completed", message: `Run ${finalJournal.run.id} was archived at ${paths.archiveDirectory}.` }).catch(() => undefined);
@@ -1975,7 +2151,7 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 			delete task.attentionReason;
 			task.reworkCycles = cycle;
 			task.attempts.push(prepared);
-			delete next.run.monitor;
+			clearTaskMonitor(next.run, task.contract.id);
 		});
 	} catch (error: unknown) { return { journal, note: `Rework cycle reservation failed before Assignment or prompt effects. ${error instanceof Error ? error.message : "Journal validation failed."}` }; }
 	const persistedReserved = await persistReviewJournal(repositoryRoot, reserved, dependencies);
@@ -2030,11 +2206,10 @@ async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJo
 }
 
 function findInitialCodeTask(journal: RunJournal): { task: TaskRecord; index: number } | undefined {
-	for (let index = 0; index < journal.run.tasks.length; index += 1) {
-		const task = journal.run.tasks[index];
-		if (task && task.phase === "pending" && task.attempts.length === 0 && isCodeChanging([task])) return { task, index };
-	}
-	return undefined;
+	const admission = selectTaskAdmission(journal.run);
+	if (admission.kind !== "admit") return undefined;
+	const task = journal.run.tasks[admission.index];
+	return task ? { task, index: admission.index } : undefined;
 }
 
 async function dispatchInitialBuilder(input: {
@@ -2070,8 +2245,10 @@ async function dispatchInitialBuilder(input: {
 		}
 	};
 
-	const selected = findInitialCodeTask(journal);
+	const admission = selectTaskAdmission(journal.run);
+	const selected = admission.kind === "admit" ? { task: journal.run.tasks[admission.index]!, index: admission.index } : undefined;
 	if (!selected) return { kind: "dispatched", journal, message: `Run ${journal.run.id} started; no approved code-changing Task is awaiting its initial Builder.`, warnings };
+	const baseRevision = admission.kind === "admit" ? admission.baseRevision : journal.run.integrationBase.kind === "git" ? journal.run.integrationBase.revision : "";
 	if (journal.run.integrationBase.kind !== "git") return pending("The Run has no Git integration base; Builder dispatch is pending and no external effect was attempted.");
 	if (journal.run.controllerSessionId !== input.controllerSessionId) return pending("The Controller Session changed before Builder dispatch; the prepared action is pending reconciliation.");
 	if (!dependencies.herdr.createBuilderWorktree || !dependencies.herdr.startBuilder || !dependencies.herdr.promptBuilder || !dependencies.git.branchExists || !dependencies.git.inspectBuilderWorktree) return pending("Builder dispatch adapters are unavailable; the Run is durable and dispatch is pending.");
@@ -2107,7 +2284,7 @@ async function dispatchInitialBuilder(input: {
 		preparedAt: transitionTimestamp(journal, dependencies.clock.now()),
 		actualModel: model,
 		specificationHash: task.specificationHash,
-		baseRevision: journal.run.integrationBase.revision,
+		baseRevision,
 		assignmentPath: assignmentPaths.assignmentPath,
 		reportPath: assignmentPaths.reportPath,
 		evidenceDirectory: assignmentPaths.evidenceDirectory,
@@ -2120,6 +2297,7 @@ async function dispatchInitialBuilder(input: {
 			if (!candidateTask) throw new Error("Selected Task disappeared before dispatch.");
 			candidateTask.phase = "building";
 			candidateTask.attempts = [initialAttempt];
+			clearTaskMonitor(candidate.run, candidateTask.contract.id);
 		});
 	} catch (error: unknown) {
 		return pending(`Builder Attempt could not be prepared durably. ${error instanceof Error ? error.message : "Journal validation failed."}`);
@@ -2129,7 +2307,7 @@ async function dispatchInitialBuilder(input: {
 
 	let worktree: Extract<HerdrWorktreeCreateResult, { kind: "created" }>;
 	try {
-		const result = await dependencies.herdr.createBuilderWorktree({ repositoryRoot, branch, baseRevision: journal.run.integrationBase.revision, label: agentName });
+		const result = await dependencies.herdr.createBuilderWorktree({ repositoryRoot, branch, baseRevision, label: agentName });
 		if (result.kind === "failed") {
 			const currentTask = journal.run.tasks[selected.index];
 			const currentAttempt = currentTask?.attempts[0];
@@ -2145,11 +2323,11 @@ async function dispatchInitialBuilder(input: {
 	}
 	let inspected: BuilderWorktreeInspection;
 	try {
-		inspected = await dependencies.git.inspectBuilderWorktree(worktree.path, journal.run.integrationBase.revision);
+		inspected = await dependencies.git.inspectBuilderWorktree(worktree.path, baseRevision);
 	} catch (error: unknown) {
 		return pending(`Builder worktree verification failed; dispatch is pending. ${error instanceof Error ? error.message : "Git inspection failed."}`);
 	}
-	if (inspected.kind !== "ready" || inspected.head !== journal.run.integrationBase.revision || !inspected.clean) return pending("Builder worktree base or clean-head verification failed; dispatch is pending.");
+	if (inspected.kind !== "ready" || inspected.head !== baseRevision || !inspected.clean) return pending("Builder worktree base or clean-head verification failed; dispatch is pending.");
 
 	let actualStart: Extract<HerdrAgentStartResult, { kind: "started" }> | undefined;
 	for (let collision = 0; collision < 8; collision += 1) {
@@ -2260,9 +2438,9 @@ type ReconciliationWorkflowResult = {
 	diagnostic?: string;
 };
 
-function reconciliationCandidate(journal: RunJournal): { index: number; task: TaskRecord; attempt: AttemptRecord } | { ambiguous: true } | undefined {
+function reconciliationCandidate(journal: RunJournal, minimumIndex = 0): { index: number; task: TaskRecord; attempt: AttemptRecord } | undefined {
 	const candidates: Array<{ index: number; task: TaskRecord; attempt: AttemptRecord }> = [];
-	for (let index = 0; index < journal.run.tasks.length; index += 1) {
+	for (let index = minimumIndex; index < journal.run.tasks.length; index += 1) {
 		const task = journal.run.tasks[index]!;
 		const attempt = task.attempts.at(-1);
 		const transientContinuation = attempt?.state === "ended-error" && task.attention === "recovering" && attempt.recovery?.infrastructure !== undefined;
@@ -2271,7 +2449,6 @@ function reconciliationCandidate(journal: RunJournal): { index: number; task: Ta
 		if (attempt.role === "reviewer" && task.phase !== "reviewing") continue;
 		candidates.push({ index, task, attempt });
 	}
-	if (candidates.length > 1) return { ambiguous: true };
 	return candidates[0];
 }
 
@@ -2418,14 +2595,14 @@ async function applyTransientInfrastructureRecovery(input: {
 	void input.controllerSessionId;
 	let task = input.task;
 	let attempt = input.attempt;
-	const persist = async (update: (nextTask: TaskRecord, nextAttempt: AttemptRecord) => void): Promise<boolean> => {
+	const persist = async (update: (nextTask: TaskRecord, nextAttempt: AttemptRecord, nextJournal: RunJournal) => void): Promise<boolean> => {
 		let candidate: RunJournal;
 		try {
 			candidate = advanceRunJournal(journal, dependencies.clock.now(), (next) => {
 				const nextTask = next.run.tasks[taskIndex];
 				const nextAttempt = nextTask?.attempts.find((item) => item.id === attempt.id);
 				if (!nextTask || !nextAttempt) throw new Error("Transient recovery Attempt disappeared before persistence.");
-				update(nextTask, nextAttempt);
+				update(nextTask, nextAttempt, next);
 			});
 		} catch { return false; }
 		const replaced = await dependencies.runJournal.replaceActive(repositoryRoot, candidate).catch(() => undefined);
@@ -2555,15 +2732,16 @@ async function applyTransientInfrastructureRecovery(input: {
 		? { phase: "replacement-pane-intended" as const, branch, worktreePath, agentName: replacementName, sourcePaneId, workspaceId }
 		: { phase: "replacement-pane-intended" as const, sourcePaneId, worktreePath, agentName: replacementName, branch, workspaceId };
 	const reservedAt = replacement.preservedAt;
-	const reserved = await persist((nextTask, nextAttempt) => {
+		const reserved = await persist((nextTask, nextAttempt, nextJournal) => {
 		if (nextAttempt.state !== attempt.state || nextAttempt.id !== attempt.id) throw new Error("Transient predecessor changed before successor reservation.");
 		nextAttempt.state = "superseded";
 		nextAttempt.recovery = { ...(nextAttempt.recovery ?? { live: failureLive }), live: failureLive, preservation: preserved, infrastructure: outcome };
 		const successor: AttemptRecord = attempt.role === "builder"
 			? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, specificationHash: attempt.specificationHash, baseRevision: attempt.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
 			: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: reservedAt, actualModel: { ...selection.choice }, specificationHash: attempt.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: attempt.subject, independence: successorIndependence!, worktree: { path: attempt.worktree.path, baseline: { ...attempt.worktree.baseline, dirtyPaths: [...attempt.worktree.baseline.dirtyPaths], operationMarkers: [...attempt.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
-		nextTask.attempts.push(successor);
-		nextTask.attention = "none";
+			nextTask.attempts.push(successor);
+			clearTaskMonitor(nextJournal.run, nextTask.contract.id);
+			nextTask.attention = "none";
 		delete nextTask.attentionReason;
 		delete nextTask.attentionDiagnostic;
 	});
@@ -2645,11 +2823,10 @@ async function verifiedTaskFactValue(repositoryRoot: string, runId: string, task
 		return { kind: "verified", value: assignedValue };
 }
 
-async function reconcileCurrentAttempt(repositoryRoot: string, controllerSessionId: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<ReconciliationWorkflowResult> {
+async function reconcileOneCurrentAttempt(repositoryRoot: string, controllerSessionId: string, journalInput: RunJournal, dependencies: StewardDependencies, minimumIndex = 0): Promise<ReconciliationWorkflowResult> {
 	let journal = journalInput;
-	const selected = reconciliationCandidate(journal);
+	const selected = reconciliationCandidate(journal, minimumIndex);
 	if (!selected) return { kind: "none", journal, note: "No current non-finalized Attempt requires reconciliation." };
-	if ("ambiguous" in selected) return { kind: "degraded", journal, note: "Multiple non-finalized Attempts are eligible for reconciliation; no Attempt was selected." };
 	const { index } = selected;
 	let task = selected.task;
 	let attempt = selected.attempt;
@@ -2988,9 +3165,9 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 	const reportPath = attempt.reportPath;
 	let reportState: "valid" | "invalid" | "missing" | "unclear" = "missing";
 	if (attempt.role === "builder") {
-		const candidate = activeBuilder(journal);
+		const candidate = activeBuilder(journal, minimumIndex);
 		if (candidate && candidate.task.contract.id === task.contract.id && candidate.attempt.id === attempt.id && journal.run.controllerSessionId === controllerSessionId) {
-			const evidence = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, journal, dependencies);
+			const evidence = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, journal, dependencies, candidate);
 			journal = evidence.journal;
 			if (evidence.kind === "finalized" || journal.run.tasks[index]?.attempts.find((item) => item.id === attempt.id)?.state === "reported") return { kind: "changed", journal, note: evidence.note || `Builder Attempt ${attempt.id} report was validated and finalized.`, action: "finalize-builder-evidence" };
 			const observed = dependencies.runJournal.inspectAttemptReport ? await dependencies.runJournal.inspectAttemptReport(repositoryRoot, reportPath).catch(() => ({ kind: "unavailable", diagnostic: "Attempt Report observation failed." } as AttemptReportInspection)) : { kind: "missing" as const };
@@ -3201,6 +3378,21 @@ async function reconcileCurrentAttempt(repositoryRoot: string, controllerSession
 	return { kind: "none", journal, note: "No reconciliation effect was selected." };
 }
 
+async function reconcileCurrentAttempt(repositoryRoot: string, controllerSessionId: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<ReconciliationWorkflowResult> {
+	let journal = journalInput;
+	let minimumIndex = 0;
+	let note = "No current non-finalized Attempt requires reconciliation.";
+	while (true) {
+		const candidate = reconciliationCandidate(journal, minimumIndex);
+		if (!candidate) return { kind: "none", journal, note };
+		const result = await reconcileOneCurrentAttempt(repositoryRoot, controllerSessionId, journal, dependencies, minimumIndex);
+		if (result.kind !== "none") return result;
+		journal = result.journal;
+		note = result.note;
+		minimumIndex = candidate.index + 1;
+	}
+}
+
 type SilenceInspectionResult =
 	| { kind: "complete"; snapshot: SilenceInspectionSnapshot }
 	| { kind: "incomplete"; snapshot?: SilenceInspectionSnapshot; diagnostic: string };
@@ -3287,11 +3479,13 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 				ui.presentStatus(statusView, target);
 				return statusView;
 			}
-			const candidate = activeBuilder(currentJournal);
-			if (candidate) {
-				const decision = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
+			const builderCandidates = currentJournal.run.tasks.length > 1 ? activeBuilders(currentJournal) : (activeBuilder(currentJournal) ? [activeBuilder(currentJournal)!] : []);
+			for (const candidate of builderCandidates) {
+				const beforeBuilderRevision = currentJournal.journalRevision;
+				const decision = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, currentJournal, { runJournal, herdr, git, process, model, clock, ui }, candidate);
 				currentJournal = decision.journal;
 				note = decision.note;
+				if (currentJournal.journalRevision !== beforeBuilderRevision || decision.kind !== "waiting") break;
 			}
 			const approvedCheck = await validateApprovedTasks(repositoryRoot, currentJournal, { runJournal, herdr, git, process, model, clock, ui });
 			currentJournal = approvedCheck.journal;
@@ -3605,14 +3799,14 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	type SilencePass = { kind: "none" | "changed" | "degraded" | "effect"; journal: RunJournal; note: string; action?: MonitorWorkflowAction; diagnostic?: string; notification?: boolean };
 
-	async function persistSilence(repositoryRoot: string, journal: RunJournal, taskIndex: number, attemptId: string, update: (task: TaskRecord, attempt: AttemptRecord) => void): Promise<RunJournal | undefined> {
+	async function persistSilence(repositoryRoot: string, journal: RunJournal, taskIndex: number, attemptId: string, update: (task: TaskRecord, attempt: AttemptRecord, nextJournal: RunJournal) => void): Promise<RunJournal | undefined> {
 		let candidate: RunJournal;
 		try {
 			candidate = advanceRunJournal(journal, clock.now(), (next) => {
 				const task = next.run.tasks[taskIndex];
 				const attempt = task?.attempts.find((item) => item.id === attemptId);
 				if (!task || !attempt) throw new Error("Silence Attempt disappeared before the durable transition.");
-				update(task, attempt);
+				update(task, attempt, next);
 			});
 			} catch { return undefined; }
 		const replaced = await runJournal.replaceActive(repositoryRoot, candidate).catch(() => undefined);
@@ -3807,7 +4001,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 				: { phase: "replacement-pane-intended" as const, sourcePaneId: predecessor.dispatch.paneId, worktreePath: preserved.worktreePath, agentName: replacementName, branch, workspaceId: predecessor.dispatch.workspaceId };
 			let reserved: RunJournal | undefined;
 			try {
-				reserved = await persistSilence(repositoryRoot, journalInput, taskIndex, predecessor.id, (task, attempt) => {
+				reserved = await persistSilence(repositoryRoot, journalInput, taskIndex, predecessor.id, (task, attempt, nextJournal) => {
 					if (attempt.role !== predecessor.role || attempt.state !== predecessor.state || attempt.id !== predecessor.id) throw new Error("Replacement predecessor changed before reservation.");
 					attempt.state = "superseded";
 					const existing = attempt.recovery;
@@ -3816,6 +4010,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 						? { id: nextAttemptId, role: "builder", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, specificationHash: predecessor.specificationHash, baseRevision: predecessor.baseRevision, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, dispatch: replacementDispatch, replacement }
 						: { id: nextAttemptId, role: "reviewer", state: "prepared", preparedAt: nowIso, actualModel: { ...predecessor.actualModel }, specificationHash: predecessor.specificationHash, assignmentPath: paths.assignmentPath, reportPath: paths.reportPath, evidenceDirectory: paths.evidenceDirectory, subject: predecessor.subject, independence: { ...predecessor.independence }, worktree: { path: predecessor.worktree.path, baseline: { ...predecessor.worktree.baseline, dirtyPaths: [...predecessor.worktree.baseline.dirtyPaths], operationMarkers: [...predecessor.worktree.baseline.operationMarkers] } }, dispatch: replacementDispatch, replacement };
 					task.attempts.push(nextAttempt);
+					clearTaskMonitor(nextJournal.run, task.contract.id);
 					silenceAttention(task, "none");
 				});
 			} catch (error: unknown) { return { kind: "degraded", journal: journalInput, note: `Silent replacement reservation failed; no pane or prompt effect was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}`, diagnostic: "Replacement reservation failed." }; }
@@ -3845,36 +4040,41 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const journal = loaded.journal;
 		if (journal.run.controllerSessionId !== controllerSessionId) return monitorResult("none", journal, "Controller Session does not match; monitor observation is read-only.");
 		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; monitoring is dormant.", undefined, true);
-		const selected = currentMonitorAttempt(journal);
-		if (!selected || !observationIdentity(selected.attempt)) return monitorResult("none", journal, "No current prompted Steward Attempt is available for monitoring.");
-		const identity = observationIdentity(selected.attempt)!;
-		let agent: ManagedAgentInspection = { kind: "unclear", diagnostic: "Herdr monitoring inspection is unavailable." };
-		try { if (herdr.inspectManagedAgent) agent = await herdr.inspectManagedAgent(identity); } catch (error: unknown) { agent = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr monitoring inspection failed." }; }
-		let terminal: MonitorDigest = { kind: "unavailable", diagnostic: "Herdr terminal observation is unavailable." };
-		try { if (herdr.readManagedTerminal) terminal = await herdr.readManagedTerminal(identity); } catch (error: unknown) { terminal = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr terminal observation failed." }; }
-		let worktree: MonitorDigest = { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." };
-		let gitProgress: { head: string | null; digest: string | null; diagnostic?: string } = { head: null, digest: null, diagnostic: "Managed Git observation is unavailable." };
-		try {
-			const progress = git.inspectManagedWorktreeProgress ? await git.inspectManagedWorktreeProgress(selected.attempt.dispatch.phase === "prompted" || selected.attempt.dispatch.phase === "reconciled-active" ? selected.attempt.dispatch.worktreePath : "") : { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." } as ManagedWorktreeProgress;
-			if (progress.kind === "observed") { worktree = progress.worktree; gitProgress = { head: progress.git.head, digest: progress.git.digest.kind === "observed" ? progress.git.digest.sha256 : null, ...(progress.git.digest.kind === "unavailable" ? { diagnostic: progress.git.digest.diagnostic } : {}) }; }
-			else { worktree = { kind: "unavailable", diagnostic: progress.diagnostic }; gitProgress = { head: null, digest: null, diagnostic: progress.diagnostic }; }
-		} catch (error: unknown) { const diagnostic = error instanceof Error ? error.message : "Managed worktree observation failed."; worktree = { kind: "unavailable", diagnostic }; gitProgress = { head: null, digest: null, diagnostic }; }
-		let report: MonitorReportObservation = { kind: "unavailable", diagnostic: "Attempt Report observation is unavailable." };
-		try {
-			if (runJournal.inspectAttemptReport) {
-				const inspectedReport = await runJournal.inspectAttemptReport(repositoryRoot, selected.attempt.reportPath);
-				report = inspectedReport;
-			}
-		} catch (error: unknown) { report = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Attempt Report observation failed." }; }
-		const lifecycle = agent.kind === "observed" ? agent.lifecycle : "unavailable";
-		const stateChangeSequence = agent.kind === "observed" ? agent.stateChangeSequence : null;
-		const observedAt = new Date(Math.max(clock.now().getTime(), new Date(journal.run.updatedAt).getTime() + 1)).toISOString();
-		const checkpoint: MonitorCheckpoint = { observedAt, taskId: selected.task.contract.id, attemptId: selected.attempt.id, role: selected.attempt.role, agent: { ...identity, lifecycle, stateChangeSequence }, terminal, worktree, git: gitProgress, report };
-		const changedSources = monitorChangedSources(journal.run.monitor, checkpoint);
-		const degraded = agent.kind === "unclear" || terminal.kind === "unavailable" || worktree.kind === "unavailable" || Boolean(gitProgress.diagnostic) || report.kind === "unavailable";
-		if (changedSources.length === 0) return monitorResult(degraded ? "degraded" : "none", journal, `${trigger} monitoring scan found no changed durable facts.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
+		const selected = currentMonitorAttempts(journal);
+		if (selected.length === 0) return monitorResult("none", journal, "No current prompted Steward Attempt is available for monitoring.");
+		const observations = await Promise.all(selected.map(async (current) => {
+			const identity = observationIdentity(current.attempt);
+			if (!identity) return { current, checkpoint: undefined, changedSources: [], degraded: true };
+			let agent: ManagedAgentInspection = { kind: "unclear", diagnostic: "Herdr monitoring inspection is unavailable." };
+			try { if (herdr.inspectManagedAgent) agent = await herdr.inspectManagedAgent(identity); } catch (error: unknown) { agent = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr monitoring inspection failed." }; }
+			let terminal: MonitorDigest = { kind: "unavailable", diagnostic: "Herdr terminal observation is unavailable." };
+			try { if (herdr.readManagedTerminal) terminal = await herdr.readManagedTerminal(identity); } catch (error: unknown) { terminal = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Herdr terminal observation failed." }; }
+			let worktree: MonitorDigest = { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." };
+			let gitProgress: { head: string | null; digest: string | null; diagnostic?: string } = { head: null, digest: null, diagnostic: "Managed Git observation is unavailable." };
+			try {
+				const progress = git.inspectManagedWorktreeProgress ? await git.inspectManagedWorktreeProgress(current.attempt.dispatch.phase === "prompted" || current.attempt.dispatch.phase === "reconciled-active" ? current.attempt.dispatch.worktreePath : "") : { kind: "unavailable", diagnostic: "Managed worktree observation is unavailable." } as ManagedWorktreeProgress;
+				if (progress.kind === "observed") { worktree = progress.worktree; gitProgress = { head: progress.git.head, digest: progress.git.digest.kind === "observed" ? progress.git.digest.sha256 : null, ...(progress.git.digest.kind === "unavailable" ? { diagnostic: progress.git.digest.diagnostic } : {}) }; }
+				else { worktree = { kind: "unavailable", diagnostic: progress.diagnostic }; gitProgress = { head: null, digest: null, diagnostic: progress.diagnostic }; }
+			} catch (error: unknown) { const diagnostic = error instanceof Error ? error.message : "Managed worktree observation failed."; worktree = { kind: "unavailable", diagnostic }; gitProgress = { head: null, digest: null, diagnostic }; }
+			let report: MonitorReportObservation = { kind: "unavailable", diagnostic: "Attempt Report observation is unavailable." };
+			try {
+				if (runJournal.inspectAttemptReport) report = await runJournal.inspectAttemptReport(repositoryRoot, current.attempt.reportPath);
+			} catch (error: unknown) { report = { kind: "unavailable", diagnostic: error instanceof Error ? error.message : "Attempt Report observation failed." }; }
+			const lifecycle = agent.kind === "observed" ? agent.lifecycle : "unavailable";
+			const stateChangeSequence = agent.kind === "observed" ? agent.stateChangeSequence : null;
+			const observedAt = new Date(Math.max(clock.now().getTime(), new Date(journal.run.updatedAt).getTime() + 1)).toISOString();
+			const checkpoint: MonitorCheckpoint = { observedAt, taskId: current.task.contract.id, attemptId: current.attempt.id, role: current.attempt.role, agent: { ...identity, lifecycle, stateChangeSequence }, terminal, worktree, git: gitProgress, report };
+			const priorMonitor = journal.run.tasks.length > 1 ? journal.run.monitors?.find((item) => item.taskId === checkpoint.taskId && item.attemptId === checkpoint.attemptId && item.role === checkpoint.role) : journal.run.monitor;
+			const changedSources = monitorChangedSources(priorMonitor, checkpoint);
+			const degraded = agent.kind === "unclear" || terminal.kind === "unavailable" || worktree.kind === "unavailable" || Boolean(gitProgress.diagnostic) || report.kind === "unavailable";
+			return { current, checkpoint, changedSources, degraded };
+		}));
+		const changedObservations = observations.filter((item): item is typeof item & { checkpoint: MonitorCheckpoint } => item.checkpoint !== undefined && item.changedSources.length > 0);
+		const changedSources = [...new Set(changedObservations.flatMap((item) => item.changedSources))];
+		const degraded = observations.some((item) => item.degraded);
+		if (changedObservations.length === 0) return monitorResult(degraded ? "degraded" : "none", journal, `${trigger} monitoring scan found no changed durable facts.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
 		let candidate: RunJournal;
-		try { candidate = advanceRunJournal(journal, clock.now(), (next) => { next.run.monitor = checkpoint; }); }
+		try { candidate = advanceRunJournal(journal, clock.now(), (next) => { if (next.run.tasks.length > 1) { const keys = new Set(changedObservations.map((item) => `${item.checkpoint.taskId}/${item.checkpoint.attemptId}/${item.checkpoint.role}`)); const monitors = (next.run.monitors ?? []).filter((item) => !keys.has(`${item.taskId}/${item.attemptId}/${item.role}`)); monitors.push(...changedObservations.map((item) => item.checkpoint)); monitors.sort((left, right) => next.run.tasks.findIndex((task) => task.contract.id === left.taskId) - next.run.tasks.findIndex((task) => task.contract.id === right.taskId)); next.run.monitors = monitors; delete next.run.monitor; } else next.run.monitor = changedObservations[0]!.checkpoint; }); }
 		catch (error: unknown) { return monitorResult("degraded", journal, "Monitor observation could not be built durably; workflow state was unchanged.", error instanceof Error ? error.message : "Monitor checkpoint validation failed.", false, changedSources); }
 		if (!runJournal.replaceActive) return monitorResult("degraded", journal, "Monitor checkpoint storage is unavailable; workflow state was unchanged.", "Monitor checkpoint storage is unavailable.", false, changedSources);
 		let replaced: import("./run-journal-store.ts").ReplaceActiveResult;
@@ -3882,16 +4082,54 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (replaced.kind !== "replaced") return monitorResult("degraded", journal, "Monitor checkpoint lost a Journal race or encountered invalid current state; no workflow action was attempted.", "Monitor checkpoint replacement was rejected.", false, changedSources);
 		let activityFailed = false;
 		try {
-			const activity = await runJournal.appendActivity(repositoryRoot, { timestamp: replaced.journal.run.updatedAt, runId: replaced.journal.run.id, event: "monitor-observed", message: `Observed Attempt ${selected.attempt.id}: ${changedSources.join(", ")}.` });
+			const observedLabel = journal.run.tasks.length > 1 ? `Attempts ${changedObservations.map((item) => item.checkpoint.attemptId).join(", ")}` : `Attempt ${changedObservations[0]!.checkpoint.attemptId}`;
+			const activity = await runJournal.appendActivity(repositoryRoot, { timestamp: replaced.journal.run.updatedAt, runId: replaced.journal.run.id, event: "monitor-observed", message: `Observed ${observedLabel}: ${changedSources.join(", ")}.` });
 			activityFailed = activity.kind !== "appended";
 		} catch { activityFailed = true; }
 		if (activityFailed) return monitorResult("degraded", replaced.journal, "Monitor checkpoint persisted, but activity logging is degraded; no workflow action was attempted.", "Activity append failed after authoritative checkpoint persistence.", false, changedSources);
-		return monitorResult(degraded ? "degraded" : "record-observation", replaced.journal, `Observed Attempt ${selected.attempt.id}: ${changedSources.join(", ")}.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
+		const observedLabel = journal.run.tasks.length > 1 ? `Attempts ${changedObservations.map((item) => item.checkpoint.attemptId).join(", ")}` : `Attempt ${changedObservations[0]!.checkpoint.attemptId}`;
+		return monitorResult(degraded ? "degraded" : "record-observation", replaced.journal, `Observed ${observedLabel}: ${changedSources.join(", ")}.`, degraded ? "One or more monitoring sources were unavailable." : undefined, false, changedSources);
 	}
 
-		async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
+	async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind !== "loaded" || loaded.journal.run.controllerSessionId !== controllerSessionId || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active Controller-owned Run is available for a lifecycle wait." };
+		if (loaded.journal.run.tasks.length > 1) {
+			const selected = currentMonitorAttempts(loaded.journal);
+			if (selected.length === 0 || !herdr.inspectManagedAgent || !herdr.waitForManagedAgent) return { kind: "unavailable", diagnostic: "No current prompted multi-Task Attempt or Herdr lifecycle wait is available." };
+			const identities = selected.map((candidate) => observationIdentity(candidate.attempt));
+			if (identities.some((identity) => !identity)) return { kind: "unavailable", diagnostic: "A current multi-Task Attempt lacks an exact Herdr identity." };
+			const now = clock.now().getTime();
+			const deadline = Math.min(...selected.map((candidate) => nextSilenceDeadline(loaded.journal, candidate.attempt, now)));
+			const remaining = deadline - now;
+			if (remaining <= 0) return { kind: "timeout" };
+			const waiters = identities.map((identity) => herdr.inspectManagedAgent!(identity!).then((inspection) => ({ kind: "inspection" as const, inspection, identity: identity! })).catch((error: unknown) => ({ kind: "error" as const, identity: identity!, diagnostic: error instanceof Error ? error.message : "Herdr inspection failed." })));
+			const inspected = await Promise.all(waiters);
+			const unavailable = inspected.find((item) => item.kind === "error");
+			if (unavailable?.kind === "error") return { kind: "unavailable", diagnostic: unavailable.diagnostic };
+			const working = inspected.filter((item): item is Extract<typeof item, { kind: "inspection" }> => item.kind === "inspection" && item.inspection.kind === "observed" && item.inspection.lifecycle === "working");
+			if (working.length === 0) {
+				try { if (clock.wait) await clock.wait(remaining, signal); } catch { return { kind: "cancelled" }; }
+				return signal.aborted ? { kind: "cancelled" } : { kind: "timeout" };
+			}
+			const controllers = working.map(() => new AbortController());
+			const abortAll = (): void => { for (const controller of controllers) controller.abort(); };
+			const onAbort = (): void => abortAll();
+			signal.addEventListener("abort", onAbort, { once: true });
+			try {
+				const waited = await Promise.race(working.map((item, index) => herdr.waitForManagedAgent!(item.identity, Math.min(remaining, 30_000), controllers[index]!.signal).catch((error: unknown) => ({ kind: "unavailable" as const, diagnostic: error instanceof Error ? error.message : "Herdr lifecycle wait failed." }))));
+				if (signal.aborted) return { kind: "cancelled" };
+				if (waited.kind === "settled") return waited;
+				if (waited.kind === "cancelled") return waited;
+				if (waited.kind === "unavailable") return waited;
+				if (remaining <= 30_000) return { kind: "timeout" };
+				try { if (clock.wait) await clock.wait(remaining, signal); } catch { return { kind: "cancelled" }; }
+				return signal.aborted ? { kind: "cancelled" } : { kind: "timeout" };
+			} finally {
+				signal.removeEventListener("abort", onAbort);
+				abortAll();
+			}
+		}
 		const selected = currentMonitorAttempt(loaded.journal);
 		const identity = selected ? observationIdentity(selected.attempt) : undefined;
 		if (!identity || !herdr.inspectManagedAgent || !herdr.waitForManagedAgent) return { kind: "unavailable", diagnostic: "The current prompted Attempt or Herdr lifecycle wait is unavailable." };
@@ -3967,30 +4205,30 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			},
 		};
 		const activityDegraded = (journalValue: RunJournal, note: string): MonitorPassResult | undefined => activity.failed ? monitorResult("degraded", journalValue, `${note} Workflow state remains authoritative; no later automatic action was attempted in this pass.`, activity.diagnostic) : undefined;
-		const beforeBuilder = activeBuilder(journal);
-		if (beforeBuilder) {
+		for (const candidate of activeBuilders(journal)) {
 			const beforeRevision = journal.journalRevision;
-			const decision = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, journal, deps);
+			const decision = await validateActiveBuilderEvidence(repositoryRoot, controllerSessionId, journal, deps, candidate);
 			journal = decision.journal;
 			const degraded = activityDegraded(journal, decision.note || "Builder evidence decision completed.");
 			if (degraded) return degraded;
 			if (journal.journalRevision !== beforeRevision) return monitorResult("finalize-builder-evidence", journal, decision.note || "Builder evidence was durably finalized.");
+			if (decision.kind !== "waiting") break;
 		}
-		const silenceCandidate = reconciliationCandidate(journal);
-		if (silenceCandidate && !("ambiguous" in silenceCandidate)) {
+		for (let minimumIndex = 0; minimumIndex < journal.run.tasks.length; minimumIndex += 1) {
+			const silenceCandidate = reconciliationCandidate(journal, minimumIndex);
+			if (!silenceCandidate) break;
 			const silence = await advanceSilenceRecovery(repositoryRoot, journal, silenceCandidate.index, silenceCandidate.task, silenceCandidate.attempt);
-			if (silence.kind !== "none") {
-				let diagnostic = silence.diagnostic;
-				if (silence.journal.journalRevision !== journal.journalRevision) {
-					try {
-						const activityResult = await runJournal.appendActivity(repositoryRoot, { timestamp: silence.journal.run.updatedAt, runId: silence.journal.run.id, event: "silence-recovery-observed", message: silence.note });
-						if (activityResult.kind !== "appended") diagnostic = diagnostic ?? "Activity append failed after authoritative silence recovery persistence.";
-					} catch (error: unknown) {
-						diagnostic = diagnostic ?? (error instanceof Error ? error.message.slice(0, 2_000) : "Activity append failed after authoritative silence recovery persistence.");
-					}
+			if (silence.kind === "none") continue;
+			let diagnostic = silence.diagnostic;
+			if (silence.journal.journalRevision !== journal.journalRevision) {
+				try {
+					const activityResult = await runJournal.appendActivity(repositoryRoot, { timestamp: silence.journal.run.updatedAt, runId: silence.journal.run.id, event: "silence-recovery-observed", message: silence.note });
+					if (activityResult.kind !== "appended") diagnostic = diagnostic ?? "Activity append failed after authoritative silence recovery persistence.";
+				} catch (error: unknown) {
+					diagnostic = diagnostic ?? (error instanceof Error ? error.message.slice(0, 2_000) : "Activity append failed after authoritative silence recovery persistence.");
 				}
-				return monitorResult(silence.action ?? (silence.kind === "degraded" ? "degraded" : "record-observation"), silence.journal, silence.note, diagnostic, false, undefined, silence.notification);
 			}
+			return monitorResult(silence.action ?? (silence.kind === "degraded" ? "degraded" : "record-observation"), silence.journal, silence.note, diagnostic, false, undefined, silence.notification);
 		}
 		const beforeApprovalRevision = journal.journalRevision;
 		const approval = await validateApprovedTasks(repositoryRoot, journal, deps);
@@ -3999,22 +4237,31 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (approvalDegraded) return approvalDegraded;
 		if (journal.journalRevision !== beforeApprovalRevision) return monitorResult("invalidate-approval", journal, approval.note || "Approval was invalidated before a later effect.");
 		const beforeReview = journal.journalRevision;
-		const review = await advanceEligibleReview(repositoryRoot, controllerSessionId, journal, deps, !options.interactive);
-		journal = review.journal;
-		const reviewDegraded = activityDegraded(journal, review.note || "Review decision completed.");
-		if (reviewDegraded) return reviewDegraded;
-		if (review.action) return monitorResult(review.action, journal, review.note, review.diagnostic);
-		if (journal.journalRevision !== beforeReview) {
-			const task = journal.run.tasks[0];
-			const latest = task?.attempts.at(-1);
-			const action: MonitorWorkflowAction = task?.phase === "approved" ? "finalize-reviewer-evidence" : latest?.role === "reviewer" ? "dispatch-reviewer" : "dispatch-rework-builder";
-			return monitorResult(action, journal, review.note);
+		let review = { journal, note: "" } as ReviewDecision;
+		for (let minimumIndex = 0; minimumIndex < journal.run.tasks.length; minimumIndex += 1) {
+			review = await advanceEligibleReview(repositoryRoot, controllerSessionId, journal, deps, !options.interactive, minimumIndex);
+			journal = review.journal;
+			const reviewDegraded = activityDegraded(journal, review.note || "Review decision completed.");
+			if (reviewDegraded) return reviewDegraded;
+			if (review.action) return monitorResult(review.action, journal, review.note, review.diagnostic);
+			if (journal.journalRevision !== beforeReview) {
+				const changedTask = journal.run.tasks[minimumIndex];
+				const latest = changedTask?.attempts.at(-1);
+				const action: MonitorWorkflowAction = changedTask?.phase === "approved" ? "finalize-reviewer-evidence" : latest?.role === "reviewer" ? "dispatch-reviewer" : "dispatch-rework-builder";
+				return monitorResult(action, journal, review.note);
+			}
 		}
 		const completion = await advanceApprovedCompletion(repositoryRoot, journal, deps, true);
 		journal = completion.journal;
 		const completionDegraded = activityDegraded(journal, completion.note || "Completion decision completed.");
 		if (completionDegraded) return completionDegraded;
-		return monitorResult(completion.action ?? "none", journal, completion.note, completion.diagnostic, completion.completed);
+		if (completion.action) return monitorResult(completion.action, journal, completion.note, completion.diagnostic, completion.completed);
+		const admission = selectTaskAdmission(journal.run);
+		if (admission.kind === "admit") {
+			const dispatched = await dispatchInitialBuilder({ repositoryRoot, controllerSessionId, journal, dependencies: deps });
+			return monitorResult(dispatched.kind === "dispatched" ? "dispatch-builder" : "degraded", dispatched.journal, dispatched.message, dispatched.kind === "pending" ? dispatched.message : undefined);
+		}
+		return monitorResult("none", journal, completion.note, completion.diagnostic, completion.completed);
 	}
 
 	function presentMonitor(result: MonitorPassResult, target: "footer" | "command"): void {

@@ -574,7 +574,9 @@ export interface ApprovedIntegrationIdentity {
 	reviewerAttemptId: string;
 	builderManifestSha256: string;
 	reviewerManifestSha256: string;
-	action: { kind: "fast-forward"; argv: ["merge", "--ff-only", "--no-edit", string] };
+	action:
+		| { kind: "fast-forward"; argv: ["merge", "--ff-only", "--no-edit", string] }
+		| { kind: "merge-commit"; argv: ["merge", "--no-ff", "--no-edit", string] };
 }
 
 export type TaskIntegration =
@@ -649,6 +651,54 @@ export interface CompletionGateFacts {
 	predicates: CompletionGatePredicate[];
 }
 
+export const MULTI_COMPLETION_GATE_PREDICATES = [
+	"all-tasks-exact-specification",
+	"all-task-evidence-finalized",
+	"all-approvals-current",
+	"ordered-integration-prefix",
+	"final-verification-passed",
+	"integration-checkout-clean",
+	"no-unresolved-attention",
+] as const;
+
+export type MultiCompletionGatePredicate = (typeof MULTI_COMPLETION_GATE_PREDICATES)[number];
+
+export interface MultiCompletionTaskFacts {
+	taskId: string;
+	kind: "code" | "non-code";
+	builderAttemptId: string;
+	reviewerAttemptId?: string;
+	source?: {
+		baseRevision: string;
+		headRevision: string;
+		commits: string[];
+		builderManifestSha256: string;
+		reviewerManifestSha256: string;
+	};
+	integration?: {
+		targetBranch: string;
+		targetRevision: string;
+		approvedBaseRevision: string;
+		approvedHeadRevision: string;
+		approvedCommits: string[];
+		observedHead: string;
+		action: ApprovedIntegrationIdentity["action"];
+	};
+}
+
+export interface MultiCompletionGateFacts {
+	kind: "multi-task";
+	evaluatedAt: string;
+	tasks: MultiCompletionTaskFacts[];
+	integratedHead: string;
+	verificationResultSha256: string;
+	verificationLogSha256: string;
+	checkout: IntegrationCheckoutObservation;
+	predicates: MultiCompletionGatePredicate[];
+}
+
+export type AnyCompletionGateFacts = CompletionGateFacts | MultiCompletionGateFacts;
+
 export type CompletionAgentRole = "builder" | "reviewer";
 
 export interface CompletionAgentIdentity {
@@ -698,12 +748,12 @@ export interface CompletionArchiveIntent {
 }
 
 export type CompletionRecord =
-	| { phase: "gate-passed"; gate: CompletionGateFacts }
-	| { phase: "stops-intended"; gate: CompletionGateFacts; resources: CompletionStopResource[] }
-	| { phase: "stops-incomplete"; gate: CompletionGateFacts; resources: CompletionStopResource[]; failure: CompletionStopFailure }
-	| { phase: "stops-complete"; gate: CompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>> }
-	| { phase: "archive-intended"; gate: CompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent }
-	| { phase: "archived"; gate: CompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent; archivedAt: string };
+	| { phase: "gate-passed"; gate: AnyCompletionGateFacts }
+	| { phase: "stops-intended"; gate: AnyCompletionGateFacts; resources: CompletionStopResource[] }
+	| { phase: "stops-incomplete"; gate: AnyCompletionGateFacts; resources: CompletionStopResource[]; failure: CompletionStopFailure }
+	| { phase: "stops-complete"; gate: AnyCompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>> }
+	| { phase: "archive-intended"; gate: AnyCompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent }
+	| { phase: "archived"; gate: AnyCompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent; archivedAt: string };
 
 export type MonitorLifecycle = "working" | "blocked" | "idle" | "done" | "unknown" | "unavailable";
 
@@ -736,7 +786,7 @@ export interface MonitorCheckpoint {
 }
 
 export type CompletionGateResult =
-	| { passed: true; facts: Omit<CompletionGateFacts, "evaluatedAt"> }
+	| { passed: true; facts: Omit<CompletionGateFacts, "evaluatedAt"> | Omit<MultiCompletionGateFacts, "evaluatedAt"> }
 	| { passed: false; failures: string[] };
 
 /**
@@ -748,6 +798,7 @@ export type CompletionGateResult =
  * proof summary and never perform a transition.
  */
 export function evaluateCompletionGate(journal: RunJournal, checkout: IntegrationCheckoutObservation): CompletionGateResult {
+	if (journal.run.tasks.length > 1) return evaluateMultiCompletionGate(journal, checkout);
 	const failures: string[] = [];
 	if (journal.run.tasks.length !== 1) failures.push("exactly one Task is required");
 	const task = journal.run.tasks[0];
@@ -785,6 +836,43 @@ export function evaluateCompletionGate(journal: RunJournal, checkout: Integratio
 	};
 }
 
+function evaluateMultiCompletionGate(journal: RunJournal, checkout: IntegrationCheckoutObservation): CompletionGateResult {
+	const failures: string[] = [];
+	const base = journal.run.integrationBase;
+	const execution = journal.run.finalVerificationExecution;
+	if (base.kind !== "git") failures.push("multi-Task completion requires a git integration base");
+	if (journal.run.status === "completed") failures.push("the Run is already completed");
+	if (!execution || execution.phase !== "passed" || journal.run.finalVerification.kind !== "command" || execution.command !== journal.run.finalVerification.command || execution.exitCode !== 0 || execution.killed || !execution.logSha256 || !execution.resultSha256) failures.push("one exact passing final-verification result is required");
+	let integratedHead = base.kind === "git" ? base.revision : "";
+	const facts: MultiCompletionTaskFacts[] = [];
+	for (const task of journal.run.tasks) {
+		const builder = [...task.attempts].reverse().find((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder");
+		const reviewer = [...task.attempts].reverse().find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+		if (!builder || builder.evidence?.phase !== "finalized" || builder.evidence.status !== "completed") failures.push(`${task.contract.id} lacks finalized completed Builder evidence`);
+		if (task.attention !== "none" || task.attempts.some((attempt) => (attempt.role === "reviewer" && (attempt.reportRepair?.phase === "blocked" || attempt.integrity?.kind === "violated")))) failures.push(`${task.contract.id} has unresolved attention or evidence integrity failure`);
+		const isCode = task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit");
+		if (!isCode) {
+			if (task.phase !== "completed") failures.push(`${task.contract.id} is not complete`);
+			if (!builder) continue;
+			facts.push({ taskId: task.contract.id, kind: "non-code", builderAttemptId: builder.id, ...(reviewer ? { reviewerAttemptId: reviewer.id } : {}) });
+			continue;
+		}
+		const approval = task.approval;
+		const subject = approval?.phase === "valid" && approval.subject.kind === "git" ? approval.subject : undefined;
+		const builderEvidence = builder?.evidence;
+		const reviewerEvidence = reviewer?.evidence;
+		if (!reviewer || reviewerEvidence?.phase !== "finalized" || reviewerEvidence.verdict !== "approved" || reviewer.integrity?.kind !== "preserved" || !approval || approval.phase !== "valid" || !subject || approval.builderAttemptId !== builder?.id || approval.reviewerAttemptId !== reviewer.id || approval.reviewerManifestSha256 !== reviewerEvidence.manifestSha256 || JSON.stringify(approval.subject) !== JSON.stringify(reviewerEvidence.subject) || approval.worktreeSnapshot.dirtyPaths.length !== 0 || approval.worktreeSnapshot.operationMarkers.length !== 0) failures.push(`${task.contract.id} lacks current exact Approval and Reviewer evidence`);
+		const integration = task.integration;
+		const expectedAction = integration && integration.targetRevision === (base.kind === "git" ? integratedHead : "") && integration.approvedBaseRevision === subject?.baseRevision ? (integration.targetRevision === integration.approvedBaseRevision ? "fast-forward" : "merge-commit") : undefined;
+		if (!integration || integration.phase !== "integrated" || !subject || subject.commits.at(-1) !== subject.headRevision || integration.targetBranch !== (base.kind === "git" ? base.branch : "") || integration.targetRevision !== integratedHead || integration.approvedBaseRevision !== subject.baseRevision || integration.approvedHeadRevision !== subject.headRevision || JSON.stringify(integration.approvedCommits) !== JSON.stringify(subject.commits) || integration.builderAttemptId !== approval?.builderAttemptId || integration.reviewerAttemptId !== approval?.reviewerAttemptId || integration.builderManifestSha256 !== subject.builderManifestSha256 || integration.reviewerManifestSha256 !== approval?.reviewerManifestSha256 || integration.observedHead !== integration.approvedHeadRevision && integration.action.kind === "fast-forward" || integration.action.kind !== expectedAction) failures.push(`${task.contract.id} lacks an exact ordered integration identity`);
+		if (integration?.phase === "integrated") integratedHead = integration.observedHead;
+		facts.push({ taskId: task.contract.id, kind: "code", builderAttemptId: builder?.id ?? "missing-builder", reviewerAttemptId: reviewer?.id ?? "missing-reviewer", ...(subject && builderEvidence?.phase === "finalized" && reviewerEvidence?.phase === "finalized" ? { source: { baseRevision: subject.baseRevision, headRevision: subject.headRevision, commits: [...subject.commits], builderManifestSha256: builderEvidence.manifestSha256, reviewerManifestSha256: reviewerEvidence.manifestSha256 } } : {}), ...(integration?.phase === "integrated" ? { integration: { targetBranch: integration.targetBranch, targetRevision: integration.targetRevision, approvedBaseRevision: integration.approvedBaseRevision, approvedHeadRevision: integration.approvedHeadRevision, approvedCommits: [...integration.approvedCommits], observedHead: integration.observedHead, action: integration.action } } : {}) });
+	}
+	if (base.kind === "git" && (checkout.branch !== base.branch || checkout.head !== integratedHead || checkout.dirtyPaths.length !== 0 || checkout.operationMarkers.length !== 0 || !checkout.rangeExact)) failures.push("the fresh integration checkout must be exact, clean, and marker-free");
+	if (failures.length > 0 || !execution || execution.phase !== "passed" || base.kind !== "git") return { passed: false, failures: failures.slice(0, 8) };
+	return { passed: true, facts: { kind: "multi-task", tasks: facts, integratedHead, verificationResultSha256: execution.resultSha256, verificationLogSha256: execution.logSha256, checkout: cloneIntegrationObservation(checkout), predicates: [...MULTI_COMPLETION_GATE_PREDICATES] } };
+}
+
 export interface RunRecord {
 	id: string;
 	status: RunStatus;
@@ -800,6 +888,7 @@ export interface RunRecord {
 	finalVerificationExecution?: FinalVerificationExecution;
 	completion?: CompletionRecord;
 	monitor?: MonitorCheckpoint;
+	monitors?: MonitorCheckpoint[];
 }
 
 export interface RunJournal {
@@ -1375,7 +1464,7 @@ function validateAttempt(value: unknown, path: string, task: TaskContract, base:
 	const recovery = hasRecovery && dispatch.value ? validateAttemptRecovery(value.recovery, `${path}.recovery`, dispatch.value, { id: value.id as string, role: "builder", reportPath: value.reportPath as string, evidenceDirectory: value.evidenceDirectory as string, state: value.state as string, preparedAt: value.preparedAt as string }) : { diagnostics: hasRecovery ? [diagnostic("invalid-task", "Builder recovery requires a recognized dispatch identity.", `${path}.recovery`)] : [] };
 	const diagnostics = [...model.diagnostics, ...dispatch.diagnostics, ...replacement.diagnostics, ...evidence.diagnostics, ...recovery.diagnostics];
 	if (typeof value.specificationHash !== "string" || value.specificationHash !== specificationHash(task)) diagnostics.push(diagnostic("invalid-task", "Attempt specificationHash must match its Task contract.", `${path}.specificationHash`));
-	if (typeof value.baseRevision !== "string" || base.kind !== "git" || value.baseRevision !== base.revision) diagnostics.push(diagnostic("invalid-task", "Attempt baseRevision must match the Run integration base.", `${path}.baseRevision`));
+	if (typeof value.baseRevision !== "string" || base.kind !== "git" || !/^[0-9a-f]{40}$/.test(value.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Attempt baseRevision must be a full lowercase revision for the Git integration base.", `${path}.baseRevision`));
 	if (!absolutePathValue(value.assignmentPath) || !absolutePathValue(value.reportPath) || !absolutePathValue(value.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Attempt evidence paths must be absolute and safe.", path));
 	if (dispatch.value) {
 		if ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !["prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Active, awaiting-report, or reported Attempts require a proven dispatch.", path));
@@ -1560,6 +1649,9 @@ function cloneIntegrationObservation(observation: IntegrationCheckoutObservation
 }
 
 function cloneApprovedIntegrationIdentity(identity: ApprovedIntegrationIdentity): ApprovedIntegrationIdentity {
+	const action = identity.action.kind === "fast-forward"
+		? { kind: "fast-forward" as const, argv: [...identity.action.argv] as ["merge", "--ff-only", "--no-edit", string] }
+		: { kind: "merge-commit" as const, argv: [...identity.action.argv] as ["merge", "--no-ff", "--no-edit", string] };
 	return {
 		targetBranch: identity.targetBranch,
 		targetRevision: identity.targetRevision,
@@ -1570,7 +1662,7 @@ function cloneApprovedIntegrationIdentity(identity: ApprovedIntegrationIdentity)
 		reviewerAttemptId: identity.reviewerAttemptId,
 		builderManifestSha256: identity.builderManifestSha256,
 		reviewerManifestSha256: identity.reviewerManifestSha256,
-		action: { kind: "fast-forward", argv: [...identity.action.argv] as ["merge", "--ff-only", "--no-edit", string] },
+		action,
 	};
 }
 
@@ -1596,12 +1688,26 @@ function cloneCompletionGate(gate: CompletionGateFacts): CompletionGateFacts {
 	return { ...gate, checkout: cloneIntegrationObservation(gate.checkout), predicates: [...gate.predicates] };
 }
 
+function cloneAnyCompletionGate(gate: AnyCompletionGateFacts): AnyCompletionGateFacts {
+	if (!("tasks" in gate)) return cloneCompletionGate(gate);
+	return {
+		...gate,
+		tasks: gate.tasks.map((task) => ({
+			...task,
+			...(task.source ? { source: { ...task.source, commits: [...task.source.commits] } } : {}),
+			...(task.integration ? { integration: { ...task.integration, approvedCommits: [...task.integration.approvedCommits], action: task.integration.action.kind === "fast-forward" ? { kind: "fast-forward" as const, argv: [...task.integration.action.argv] as ["merge", "--ff-only", "--no-edit", string] } : { kind: "merge-commit" as const, argv: [...task.integration.action.argv] as ["merge", "--no-ff", "--no-edit", string] } } } : {}),
+		})),
+		checkout: cloneIntegrationObservation(gate.checkout),
+		predicates: [...gate.predicates],
+	};
+}
+
 function cloneCompletionArchive(archive: CompletionArchiveIntent): CompletionArchiveIntent {
 	return { ...archive, verification: { ...archive.verification }, reports: archive.reports.map((report) => ({ ...report })) };
 }
 
 function cloneCompletion(completion: CompletionRecord): CompletionRecord {
-	const gate = cloneCompletionGate(completion.gate);
+	const gate = cloneAnyCompletionGate(completion.gate);
 	if (completion.phase === "gate-passed") return { phase: completion.phase, gate };
 	if (completion.phase === "stops-intended") return { phase: completion.phase, gate, resources: completion.resources.map(cloneCompletionResource) };
 	if (completion.phase === "stops-incomplete") return { phase: completion.phase, gate, resources: completion.resources.map(cloneCompletionResource), failure: { ...completion.failure, resource: { ...completion.failure.resource } } };
@@ -1783,7 +1889,9 @@ function validateIntegrationObservation(value: unknown, path: string): { value?:
 function validateApprovedIntegrationIdentity(value: Record<string, unknown>, path: string): { value?: ApprovedIntegrationIdentity; diagnostics: RunDiagnostic[] } {
 	const action = value.action;
 	const required = ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action"];
-	if (required.some((key) => !Object.prototype.hasOwnProperty.call(value, key)) || !safeBranch(value.targetBranch) || typeof value.targetRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.targetRevision) || typeof value.approvedBaseRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.approvedBaseRevision) || typeof value.approvedHeadRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.approvedHeadRevision) || !Array.isArray(value.approvedCommits) || value.approvedCommits.length === 0 || value.approvedCommits.length > 100 || value.approvedCommits.some((commit) => typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) || new Set(value.approvedCommits).size !== value.approvedCommits.length || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || typeof value.builderManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.builderManifestSha256) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !isRecord(action) || !exactKeys(action, ["kind", "argv"]) || action.kind !== "fast-forward" || !Array.isArray(action.argv) || action.argv.length !== 4 || action.argv[0] !== "merge" || action.argv[1] !== "--ff-only" || action.argv[2] !== "--no-edit" || action.argv[3] !== value.approvedHeadRevision) return { diagnostics: [diagnostic("invalid-task", "Task integration identity or fixed fast-forward action is invalid.", path)] };
+	const validAction = isRecord(action) && exactKeys(action, ["kind", "argv"]) && Array.isArray(action.argv) && action.argv.length === 4 && action.argv[0] === "merge" && action.argv[2] === "--no-edit" && action.argv[3] === value.approvedHeadRevision && ((action.kind === "fast-forward" && action.argv[1] === "--ff-only") || (action.kind === "merge-commit" && action.argv[1] === "--no-ff"));
+	if (required.some((key) => !Object.prototype.hasOwnProperty.call(value, key)) || !safeBranch(value.targetBranch) || typeof value.targetRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.targetRevision) || typeof value.approvedBaseRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.approvedBaseRevision) || typeof value.approvedHeadRevision !== "string" || !/^[0-9a-f]{40}$/.test(value.approvedHeadRevision) || !Array.isArray(value.approvedCommits) || value.approvedCommits.length === 0 || value.approvedCommits.length > 100 || value.approvedCommits.some((commit) => typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) || new Set(value.approvedCommits).size !== value.approvedCommits.length || !safeIdentifier(value.builderAttemptId) || !safeIdentifier(value.reviewerAttemptId) || typeof value.builderManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.builderManifestSha256) || typeof value.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.reviewerManifestSha256) || !validAction) return { diagnostics: [diagnostic("invalid-task", "Task integration identity or fixed local merge action is invalid.", path)] };
+	const actionKind = action.kind as "fast-forward" | "merge-commit";
 	return {
 		value: {
 			targetBranch: value.targetBranch as string,
@@ -1795,7 +1903,9 @@ function validateApprovedIntegrationIdentity(value: Record<string, unknown>, pat
 			reviewerAttemptId: value.reviewerAttemptId as string,
 			builderManifestSha256: value.builderManifestSha256 as string,
 			reviewerManifestSha256: value.reviewerManifestSha256 as string,
-			action: { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", value.approvedHeadRevision as string] },
+			action: actionKind === "fast-forward"
+				? { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", value.approvedHeadRevision as string] }
+				: { kind: "merge-commit", argv: ["merge", "--no-ff", "--no-edit", value.approvedHeadRevision as string] },
 		},
 		diagnostics: [],
 	};
@@ -1806,7 +1916,7 @@ function validateTaskIntegration(value: unknown, path: string): { value?: TaskIn
 	const identity = validateApprovedIntegrationIdentity(value, path);
 	if (!identity.value || identity.diagnostics.length > 0) return { diagnostics: identity.diagnostics };
 	if (value.phase === "intended" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt"]) && canonicalTimestamp(value.intendedAt)) return { value: { ...identity.value, phase: "intended", intendedAt: value.intendedAt }, diagnostics: [] };
-	if (value.phase === "integrated" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "integratedAt", "observedHead"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.integratedAt) && value.integratedAt >= value.intendedAt && typeof value.observedHead === "string" && value.observedHead === value.approvedHeadRevision) return { value: { ...identity.value, phase: "integrated", intendedAt: value.intendedAt, integratedAt: value.integratedAt, observedHead: value.observedHead }, diagnostics: [] };
+	if (value.phase === "integrated" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "integratedAt", "observedHead"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.integratedAt) && value.integratedAt >= value.intendedAt && typeof value.observedHead === "string" && /^[0-9a-f]{40}$/.test(value.observedHead) && ((identity.value.action.kind === "fast-forward" && value.observedHead === value.approvedHeadRevision) || (identity.value.action.kind === "merge-commit" && value.observedHead !== value.targetRevision))) return { value: { ...identity.value, phase: "integrated", intendedAt: value.intendedAt, integratedAt: value.integratedAt, observedHead: value.observedHead }, diagnostics: [] };
 	if (value.phase === "failed" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "observedAt", "exitCode", "diagnostic"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.observedAt) && value.observedAt >= value.intendedAt && (value.exitCode === null || (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode))) && boundedText(value.diagnostic, 2_000)) return { value: { ...identity.value, phase: "failed", intendedAt: value.intendedAt, observedAt: value.observedAt, exitCode: value.exitCode, diagnostic: value.diagnostic }, diagnostics: [] };
 	if (value.phase === "ambiguous" && exactKeys(value, ["phase", "targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "builderAttemptId", "reviewerAttemptId", "builderManifestSha256", "reviewerManifestSha256", "action", "intendedAt", "observedAt", "exitCode", "diagnostic", "observed"]) && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.observedAt) && value.observedAt >= value.intendedAt && (value.exitCode === null || (typeof value.exitCode === "number" && Number.isSafeInteger(value.exitCode))) && boundedText(value.diagnostic, 2_000)) {
 		const observed = validateIntegrationObservation(value.observed, `${path}.observed`);
@@ -1838,7 +1948,53 @@ function validateFinalVerificationExecution(value: unknown, path: string, finalV
 	return { diagnostics: [diagnostic("invalid-run", "Final verification execution has invalid exact phase fields.", path)] };
 }
 
-function validateCompletionGate(value: unknown, path: string): { value?: CompletionGateFacts; diagnostics: RunDiagnostic[] } {
+function validateCompletionGate(value: unknown, path: string): { value?: AnyCompletionGateFacts; diagnostics: RunDiagnostic[] } {
+	if (isRecord(value) && value.kind === "multi-task") {
+		if (!exactKeys(value, ["kind", "evaluatedAt", "tasks", "integratedHead", "verificationResultSha256", "verificationLogSha256", "checkout", "predicates"]) || !canonicalTimestamp(value.evaluatedAt) || !Array.isArray(value.tasks) || value.tasks.length === 0 || typeof value.integratedHead !== "string" || !/^[0-9a-f]{40}$/.test(value.integratedHead) || typeof value.verificationResultSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.verificationResultSha256) || typeof value.verificationLogSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.verificationLogSha256) || !Array.isArray(value.predicates) || JSON.stringify(value.predicates) !== JSON.stringify([...MULTI_COMPLETION_GATE_PREDICATES])) return { diagnostics: [diagnostic("invalid-run", "Multi-Task Completion Gate facts must contain every named predicate exactly once.", path)] };
+		const tasks: MultiCompletionTaskFacts[] = [];
+		const diagnostics: RunDiagnostic[] = [];
+		for (let index = 0; index < value.tasks.length; index += 1) {
+			const item = value.tasks[index];
+			const itemPath = `${path}.tasks[${index}]`;
+			if (!isRecord(item) || (item.kind !== "code" && item.kind !== "non-code") || !safeIdentifier(item.taskId) || !safeIdentifier(item.builderAttemptId)) {
+				diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion facts contain an invalid Task identity.", itemPath));
+				continue;
+			}
+			const hasReviewer = Object.prototype.hasOwnProperty.call(item, "reviewerAttemptId");
+			const hasSource = Object.prototype.hasOwnProperty.call(item, "source");
+			const hasIntegration = Object.prototype.hasOwnProperty.call(item, "integration");
+			if (!exactKeys(item, ["taskId", "kind", "builderAttemptId", ...(hasReviewer ? ["reviewerAttemptId"] : []), ...(hasSource ? ["source"] : []), ...(hasIntegration ? ["integration"] : [])]) || (hasReviewer && !safeIdentifier(item.reviewerAttemptId)) || (item.kind === "code" && (!hasReviewer || !hasSource || !hasIntegration)) || (item.kind === "non-code" && (hasSource || hasIntegration))) {
+				diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion facts have invalid exact Task fields.", itemPath));
+				continue;
+			}
+			let source: MultiCompletionTaskFacts["source"];
+			if (hasSource) {
+				const raw = item.source;
+				if (!isRecord(raw) || !exactKeys(raw, ["baseRevision", "headRevision", "commits", "builderManifestSha256", "reviewerManifestSha256"]) || typeof raw.baseRevision !== "string" || !/^[0-9a-f]{40}$/.test(raw.baseRevision) || typeof raw.headRevision !== "string" || !/^[0-9a-f]{40}$/.test(raw.headRevision) || !Array.isArray(raw.commits) || raw.commits.length === 0 || raw.commits.some((commit) => typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) || typeof raw.builderManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(raw.builderManifestSha256) || typeof raw.reviewerManifestSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(raw.reviewerManifestSha256)) {
+					diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion source identity is invalid.", `${itemPath}.source`));
+					continue;
+				}
+				source = { baseRevision: raw.baseRevision, headRevision: raw.headRevision, commits: [...raw.commits] as string[], builderManifestSha256: raw.builderManifestSha256, reviewerManifestSha256: raw.reviewerManifestSha256 };
+			}
+			let integration: MultiCompletionTaskFacts["integration"];
+			if (hasIntegration) {
+				const raw = item.integration;
+				const action = isRecord(raw) ? raw.action : undefined;
+				if (!isRecord(raw) || !exactKeys(raw, ["targetBranch", "targetRevision", "approvedBaseRevision", "approvedHeadRevision", "approvedCommits", "observedHead", "action"]) || !safeBranch(raw.targetBranch) || typeof raw.targetRevision !== "string" || !/^[0-9a-f]{40}$/.test(raw.targetRevision) || typeof raw.approvedBaseRevision !== "string" || !/^[0-9a-f]{40}$/.test(raw.approvedBaseRevision) || typeof raw.approvedHeadRevision !== "string" || !/^[0-9a-f]{40}$/.test(raw.approvedHeadRevision) || !Array.isArray(raw.approvedCommits) || raw.approvedCommits.length === 0 || raw.approvedCommits.some((commit) => typeof commit !== "string" || !/^[0-9a-f]{40}$/.test(commit)) || typeof raw.observedHead !== "string" || !/^[0-9a-f]{40}$/.test(raw.observedHead) || !isRecord(action) || !exactKeys(action, ["kind", "argv"]) || !Array.isArray(action.argv) || action.argv.length !== 4 || action.argv[0] !== "merge" || action.argv[2] !== "--no-edit" || action.argv[3] !== raw.approvedHeadRevision || !((action.kind === "fast-forward" && action.argv[1] === "--ff-only") || (action.kind === "merge-commit" && action.argv[1] === "--no-ff"))) {
+					diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion integration identity is invalid.", `${itemPath}.integration`));
+					continue;
+				}
+				const rawAction = raw.action as Record<string, unknown>;
+				integration = { targetBranch: raw.targetBranch, targetRevision: raw.targetRevision, approvedBaseRevision: raw.approvedBaseRevision, approvedHeadRevision: raw.approvedHeadRevision, approvedCommits: [...raw.approvedCommits] as string[], observedHead: raw.observedHead, action: rawAction.kind === "fast-forward" ? { kind: "fast-forward", argv: ["merge", "--ff-only", "--no-edit", raw.approvedHeadRevision] } : { kind: "merge-commit", argv: ["merge", "--no-ff", "--no-edit", raw.approvedHeadRevision] } };
+			}
+			tasks.push({ taskId: item.taskId, kind: item.kind, builderAttemptId: item.builderAttemptId, ...(hasReviewer ? { reviewerAttemptId: item.reviewerAttemptId as string } : {}), ...(source ? { source } : {}), ...(integration ? { integration } : {}) });
+		}
+		const ids = tasks.map((task) => task.taskId);
+		if (new Set(ids).size !== ids.length) diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion identities must be unique.", `${path}.tasks`));
+		const checkout = validateIntegrationObservation(value.checkout, `${path}.checkout`);
+		diagnostics.push(...checkout.diagnostics);
+		return diagnostics.length > 0 || !checkout.value ? { diagnostics } : { value: { kind: "multi-task", evaluatedAt: value.evaluatedAt, tasks, integratedHead: value.integratedHead, verificationResultSha256: value.verificationResultSha256, verificationLogSha256: value.verificationLogSha256, checkout: checkout.value, predicates: [...value.predicates] as MultiCompletionGatePredicate[] }, diagnostics: [] };
+	}
 	if (!isRecord(value) || !exactKeys(value, ["evaluatedAt", "taskId", "integratedHead", "verificationResultSha256", "verificationLogSha256", "checkout", "predicates"]) || !canonicalTimestamp(value.evaluatedAt) || !safeIdentifier(value.taskId) || typeof value.integratedHead !== "string" || !/^[0-9a-f]{40}$/.test(value.integratedHead) || typeof value.verificationResultSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.verificationResultSha256) || typeof value.verificationLogSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.verificationLogSha256) || !Array.isArray(value.predicates) || JSON.stringify(value.predicates) !== JSON.stringify([...COMPLETION_GATE_PREDICATES]) || value.predicates.some((predicate) => !COMPLETION_GATE_PREDICATES.includes(predicate as CompletionGatePredicate))) return { diagnostics: [diagnostic("invalid-run", "Completion Gate facts must contain every named predicate exactly once.", path)] };
 	const checkout = validateIntegrationObservation(value.checkout, `${path}.checkout`);
 	return checkout.value && checkout.diagnostics.length === 0 ? { value: { evaluatedAt: value.evaluatedAt, taskId: value.taskId, integratedHead: value.integratedHead, verificationResultSha256: value.verificationResultSha256, verificationLogSha256: value.verificationLogSha256, checkout: checkout.value, predicates: [...value.predicates] as CompletionGatePredicate[] }, diagnostics: [] } : { diagnostics: checkout.diagnostics };
@@ -2104,6 +2260,22 @@ function validateMonitorCheckpoint(value: unknown, path: string, run: { createdA
 	return { value: { observedAt: value.observedAt as string, taskId: value.taskId as string, attemptId: value.attemptId as string, role: value.role as "builder" | "reviewer", agent: { name: agent.name as string, workspaceId: agent.workspaceId as string, paneId: agent.paneId as string, terminalId: agent.terminalId as string, lifecycle: agent.lifecycle as MonitorLifecycle, stateChangeSequence: agent.stateChangeSequence as number | null }, terminal: terminal.value, worktree: worktree.value, git: { head: git.head as string | null, digest: git.digest as string | null, ...(Object.prototype.hasOwnProperty.call(git, "diagnostic") ? { diagnostic: git.diagnostic as string } : {}) }, report: report.value }, diagnostics: [] };
 }
 
+function validateMonitorCheckpoints(value: unknown, path: string, run: { createdAt: string; updatedAt: string; tasks: TaskRecord[] }): { value?: MonitorCheckpoint[]; diagnostics: RunDiagnostic[] } {
+	if (!Array.isArray(value) || value.length === 0 || value.length > run.tasks.length) return { diagnostics: [diagnostic("invalid-run", "monitors must be a bounded non-empty ordered array.", path)] };
+	const diagnostics: RunDiagnostic[] = [];
+	const monitors: MonitorCheckpoint[] = [];
+	for (let index = 0; index < value.length; index += 1) {
+		const result = validateMonitorCheckpoint(value[index], `${path}[${index}]`, run);
+		if (result.value) monitors.push(result.value);
+		diagnostics.push(...result.diagnostics);
+	}
+	const taskOrder = run.tasks.map((task) => task.contract.id);
+	const identities = monitors.map((monitor) => `${monitor.taskId}/${monitor.attemptId}/${monitor.role}`);
+	if (new Set(identities).size !== identities.length) diagnostics.push(diagnostic("invalid-run", "monitor identities must be unique.", path));
+	if (monitors.some((monitor, index) => index > 0 && taskOrder.indexOf(monitor.taskId) < taskOrder.indexOf(monitors[index - 1]!.taskId))) diagnostics.push(diagnostic("invalid-run", "monitors must retain Task array order.", path));
+	return diagnostics.length > 0 ? { diagnostics } : { value: monitors, diagnostics: [] };
+}
+
 function validateRunRecord(value: unknown, path: string, options: { atActivePath: boolean } = { atActivePath: false }): { value?: RunRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) {
 		return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
@@ -2111,7 +2283,9 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	const hasFinalVerificationExecution = Object.prototype.hasOwnProperty.call(value, "finalVerificationExecution");
 	const hasCompletion = Object.prototype.hasOwnProperty.call(value, "completion");
 	const hasMonitor = Object.prototype.hasOwnProperty.call(value, "monitor");
-	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
+	const hasMonitors = Object.prototype.hasOwnProperty.call(value, "monitors");
+	if (hasMonitor && hasMonitors) return { diagnostics: [diagnostic("invalid-run", "Run cannot contain both legacy monitor and multi-Task monitors.", path)] };
+	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : []), ...(hasMonitors ? ["monitors"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	const diagnostics: RunDiagnostic[] = [];
 	if (!safeIdentifier(value.id) || !String(value.id).startsWith("run-")) diagnostics.push(diagnostic("invalid-run", "Run id must be a filesystem-safe run identifier.", `${path}.id`));
 	if (value.status !== "active" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "Run status must be active, completing, or completed.", `${path}.status`));
@@ -2216,7 +2390,9 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			const expectedCommits = subject.kind === "git" ? subject.commits : [];
 			const expectedHead = subject.kind === "git" ? subject.headRevision : "";
 			const expectedBase = subject.kind === "git" ? subject.baseRevision : "";
-			const identityMatches = subject.kind === "git" && expectedCommits.at(-1) === expectedHead && expectedBase === base.value.revision && integration.value.targetBranch === base.value.branch && integration.value.targetRevision === base.value.revision && integration.value.approvedBaseRevision === base.value.revision && integration.value.approvedBaseRevision === expectedBase && integration.value.approvedHeadRevision === expectedHead && JSON.stringify(integration.value.approvedCommits) === JSON.stringify(expectedCommits) && integration.value.builderAttemptId === approval.value.builderAttemptId && integration.value.reviewerAttemptId === approval.value.reviewerAttemptId && integration.value.builderManifestSha256 === subject.builderManifestSha256 && integration.value.reviewerManifestSha256 === approval.value.reviewerManifestSha256 && JSON.stringify(integration.value.action.argv) === JSON.stringify(["merge", "--ff-only", "--no-edit", expectedHead]);
+			const actionMatches = integration.value.action.argv[0] === "merge" && integration.value.action.argv[2] === "--no-edit" && integration.value.action.argv[3] === expectedHead && ((integration.value.action.kind === "fast-forward" && integration.value.action.argv[1] === "--ff-only") || (integration.value.action.kind === "merge-commit" && integration.value.action.argv[1] === "--no-ff"));
+			const legacySingle = (rawTasks?.length ?? 0) === 1;
+			const identityMatches = subject.kind === "git" && expectedCommits.at(-1) === expectedHead && (!legacySingle || expectedBase === base.value.revision) && integration.value.targetBranch === base.value.branch && (!legacySingle || integration.value.targetRevision === base.value.revision) && integration.value.approvedBaseRevision === expectedBase && integration.value.approvedHeadRevision === expectedHead && JSON.stringify(integration.value.approvedCommits) === JSON.stringify(expectedCommits) && integration.value.builderAttemptId === approval.value.builderAttemptId && integration.value.reviewerAttemptId === approval.value.reviewerAttemptId && integration.value.builderManifestSha256 === subject.builderManifestSha256 && integration.value.reviewerManifestSha256 === approval.value.reviewerManifestSha256 && actionMatches && (!legacySingle || integration.value.action.kind === "fast-forward");
 			if (!builder || !reviewer || reviewer.evidence?.phase !== "finalized" || builder.evidence?.phase !== "finalized" || builder.evidence.manifestSha256 !== integration.value.builderManifestSha256 || reviewer.evidence.manifestSha256 !== integration.value.reviewerManifestSha256 || !identityMatches) taskDiagnostics.push(diagnostic("invalid-task", "Integration identity must remain exactly bound to the current Approval and protected final evidence.", `${taskPath}.integration`));
 		}
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
@@ -2229,6 +2405,49 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	if (!settings.value || settings.diagnostics.length > 0) diagnostics.push(...settings.diagnostics.map((item) => diagnostic("invalid-config", item.message, item.path)));
 	const codeChanging = tasks.some((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"));
 	if (base.value && (codeChanging !== (base.value.kind === "git"))) diagnostics.push(diagnostic("invalid-run", "integrationBase must be git exactly for code-changing Runs and none otherwise.", `${path}.integrationBase`));
+	if (base.value?.kind === "git") {
+		const owned = new Map<string, string>();
+		const claim = (identity: string, taskId: string, field: string): void => {
+			if (!identity) return;
+			const prior = owned.get(`${field}/${identity}`);
+			if (prior && prior !== taskId) diagnostics.push(diagnostic("invalid-run", `Resource ${field} is shared by Tasks ${prior} and ${taskId}.`, `${path}.tasks`));
+			else owned.set(`${field}/${identity}`, taskId);
+		};
+		const integratedHeads = tasks.flatMap((task, index) => task.integration?.phase === "integrated" ? [{ index, head: task.integration.observedHead, integratedAt: task.integration.integratedAt }] : []);
+		let expectedTarget = base.value.revision;
+		let queueOpen = false;
+		for (let taskIndex = 0; taskIndex < tasks.length; taskIndex += 1) {
+			const task = tasks[taskIndex]!;
+			for (const attempt of task.attempts) {
+				claim(attempt.assignmentPath, task.contract.id, "assignment");
+				claim(attempt.reportPath, task.contract.id, "report");
+				claim(attempt.evidenceDirectory, task.contract.id, "evidence");
+				const dispatch = attempt.dispatch;
+				if ("branch" in dispatch) claim(dispatch.branch, task.contract.id, "branch");
+				if ("worktreePath" in dispatch) claim(dispatch.worktreePath, task.contract.id, "worktree");
+				if ("agentName" in dispatch) claim(dispatch.agentName, task.contract.id, "agent");
+				if ("workspaceId" in dispatch && typeof dispatch.workspaceId === "string") claim(dispatch.workspaceId, task.contract.id, "workspace");
+				if ("paneId" in dispatch && typeof dispatch.paneId === "string") claim(dispatch.paneId, task.contract.id, "pane");
+				if ("terminalId" in dispatch && typeof dispatch.terminalId === "string") claim(dispatch.terminalId, task.contract.id, "terminal");
+				if (attempt.role === "builder" && attempt.baseRevision !== base.value.revision && !integratedHeads.some((entry) => entry.index < taskIndex && entry.integratedAt <= attempt.preparedAt && entry.head === attempt.baseRevision)) diagnostics.push(diagnostic("invalid-task", "Builder Attempt baseRevision must be the Run base or an ordered head integrated before that Attempt was prepared.", `${path}.tasks.${task.contract.id}.attempts`));
+			}
+			const isCode = task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit");
+			if (!isCode) continue;
+			const integration = task.integration;
+			const historicalHeads = new Set([base.value.revision, ...tasks.slice(0, taskIndex).flatMap((candidate) => candidate.integration?.phase === "integrated" ? [candidate.integration.observedHead] : [])]);
+			if (integration && !historicalHeads.has(integration.approvedBaseRevision)) diagnostics.push(diagnostic("invalid-task", "Integration source base must be the Run base or a previously integrated ordered head.", `${path}.tasks.${task.contract.id}.integration`));
+			if (integration?.phase === "integrated") {
+				if (queueOpen || integration.targetRevision !== expectedTarget || integration.targetBranch !== base.value.branch || integration.approvedBaseRevision !== (task.approval?.phase === "valid" && task.approval.subject.kind === "git" ? task.approval.subject.baseRevision : "") || integration.action.kind !== (integration.targetRevision === integration.approvedBaseRevision ? "fast-forward" : "merge-commit")) diagnostics.push(diagnostic("invalid-task", "Integrated code Tasks must form one ordered prefix with the exact local action.", `${path}.tasks.${task.contract.id}.integration`));
+				expectedTarget = integration.observedHead;
+				queueOpen = false;
+			} else if (integration) {
+				if (queueOpen || integration.targetRevision !== expectedTarget || integration.targetBranch !== base.value.branch) diagnostics.push(diagnostic("invalid-task", "Only the first non-integrated code Task may retain an integration intent or classified result.", `${path}.tasks.${task.contract.id}.integration`));
+				queueOpen = true;
+			} else {
+				queueOpen = true;
+			}
+		}
+	}
 	const finalVerification = validateVerification(value.finalVerification, `${path}.finalVerification`, codeChanging);
 	diagnostics.push(...finalVerification.diagnostics);
 	const finalVerificationExecution = hasFinalVerificationExecution && finalVerification.value ? validateFinalVerificationExecution(value.finalVerificationExecution, `${path}.finalVerificationExecution`, finalVerification.value) : { diagnostics: [] };
@@ -2237,6 +2456,9 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	diagnostics.push(...completion.diagnostics);
 	const monitor = hasMonitor ? validateMonitorCheckpoint(value.monitor, `${path}.monitor`, { createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, tasks }) : { diagnostics: [] };
 	diagnostics.push(...monitor.diagnostics);
+	const monitors = hasMonitors ? validateMonitorCheckpoints(value.monitors, `${path}.monitors`, { createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, tasks }) : { diagnostics: [] };
+	diagnostics.push(...monitors.diagnostics);
+	if (hasMonitors && tasks.length < 2) diagnostics.push(diagnostic("invalid-run", "The multi-Task monitors representation requires more than one Task.", `${path}.monitors`));
 	if (completion.value) {
 		const prompted = new Set<string>();
 		const promptedInOrder: string[] = [];
@@ -2255,8 +2477,8 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			const failureIndex = identities.indexOf(failureIdentity);
 			if (failureIndex < 0 || resources[failureIndex]?.state !== "intended" || resources.slice(0, failureIndex).some((resource) => resource.state !== "acknowledged") || resources.slice(failureIndex + 1).some((resource) => resource.state !== "intended")) diagnostics.push(diagnostic("invalid-run", "Completion stop failure must identify the first unacknowledged resource and retain the bounded stop order.", `${path}.completion.failure`));
 		}
-		if ((completion.value.phase === "archive-intended" || completion.value.phase === "archived") && tasks.length === 1) {
-			const expectedReports = tasks[0]!.attempts.filter((attempt) => attempt.evidence?.phase === "finalized").map((attempt) => `${tasks[0]!.contract.id}/${attempt.id}/${attempt.role}`);
+		if (completion.value.phase === "archive-intended" || completion.value.phase === "archived") {
+			const expectedReports = tasks.flatMap((task) => task.attempts.filter((attempt) => attempt.evidence?.phase === "finalized").map((attempt) => `${task.contract.id}/${attempt.id}/${attempt.role}`));
 			const archivedReports = completion.value.archive.reports.map((report) => `${report.taskId}/${report.attemptId}/${report.role}`);
 			if (JSON.stringify(expectedReports) !== JSON.stringify(archivedReports) || completion.value.archive.reports.some((report) => report.destinationPath !== `reports/${report.taskId}/${report.attemptId}-${report.role}.md`)) diagnostics.push(diagnostic("invalid-run", "Completion archive inventory must retain exactly every protected finalized Attempt Report in Attempt order.", `${path}.completion.archive.reports`));
 		}
@@ -2264,14 +2486,36 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	if (value.status === "active" && completion.value) diagnostics.push(diagnostic("invalid-run", "Active Run Journals cannot contain completion records.", `${path}.completion`));
 	if (value.status === "completing" && (!completion.value || completion.value.phase === "archived")) diagnostics.push(diagnostic("invalid-run", "Completing Runs require a non-archived completion record.", `${path}.completion`));
 	if (value.status === "completed" && (!completion.value || completion.value.phase !== "archived" || tasks.some((task) => task.phase !== "completed" || task.attention !== "none"))) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots require archived completion and completed attention-free Tasks.", path));
-	if (finalVerificationExecution.value && tasks.length !== 1) diagnostics.push(diagnostic("invalid-run", "Final verification execution is only legal for a single-Task completion slice.", `${path}.finalVerificationExecution`));
-	if (finalVerificationExecution.value && tasks[0] && (!tasks[0].integration || tasks[0].integration.phase !== "integrated")) diagnostics.push(diagnostic("invalid-run", "Final verification execution requires a completed exact integration.", `${path}.finalVerificationExecution`));
+	const orderedCodeTasks = tasks.filter((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"));
+	const allCodeIntegrated = orderedCodeTasks.every((task) => task.integration?.phase === "integrated");
+	const allTasksReadyForFinalVerification = tasks.every((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? task.integration?.phase === "integrated" : task.phase === "completed");
+	const lastIntegratedTask = orderedCodeTasks.at(-1);
+	const finalIntegratedHead = lastIntegratedTask?.integration?.phase === "integrated" ? lastIntegratedTask.integration.observedHead : (base.value?.kind === "git" ? base.value.revision : null);
+	if (finalVerificationExecution.value && tasks.length > 1 && (!allTasksReadyForFinalVerification || !allCodeIntegrated || tasks.some((task) => task.attention !== "none" || ["building", "reviewing", "reworking"].includes(task.phase)))) diagnostics.push(diagnostic("invalid-run", "Multi-Task final verification requires the complete ordered integration prefix and no active or attention Task.", `${path}.finalVerificationExecution`));
+	if (finalVerificationExecution.value && tasks.length === 1 && tasks[0] && (!tasks[0].integration || tasks[0].integration.phase !== "integrated")) diagnostics.push(diagnostic("invalid-run", "Final verification execution requires a completed exact integration.", `${path}.finalVerificationExecution`));
 	if (finalVerificationExecution.value && tasks[0] && (!finalVerificationExecution.value.logPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`) || !finalVerificationExecution.value.resultPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`))) diagnostics.push(diagnostic("invalid-run", "Final verification paths must be deterministic inside this Run's completion directory.", `${path}.finalVerificationExecution`));
-	if (finalVerificationExecution.value?.phase === "intended" && tasks[0] && (tasks[0].phase !== "integrating" || tasks[0].attention !== "none")) diagnostics.push(diagnostic("invalid-run", "Final verification intent requires an attention-free integrating Task.", `${path}.finalVerificationExecution`));
-	if (finalVerificationExecution.value?.phase === "passed" && tasks[0] && (finalVerificationExecution.value.checkout.dirtyPaths.length > 0 || finalVerificationExecution.value.checkout.operationMarkers.length > 0 || !finalVerificationExecution.value.checkout.rangeExact || base.value?.kind !== "git" || tasks[0].integration?.phase !== "integrated" || finalVerificationExecution.value.checkout.branch !== base.value.branch || finalVerificationExecution.value.checkout.head !== tasks[0].integration.approvedHeadRevision)) diagnostics.push(diagnostic("invalid-run", "Passed final verification requires the exact clean integrated checkout.", `${path}.finalVerificationExecution`));
+	if (finalVerificationExecution.value?.phase === "intended" && tasks.length === 1 && tasks[0] && (tasks[0].phase !== "integrating" || tasks[0].attention !== "none")) diagnostics.push(diagnostic("invalid-run", "Final verification intent requires an attention-free integrating Task.", `${path}.finalVerificationExecution`));
+	if (finalVerificationExecution.value?.phase === "passed" && tasks[0] && (finalVerificationExecution.value.checkout.dirtyPaths.length > 0 || finalVerificationExecution.value.checkout.operationMarkers.length > 0 || !finalVerificationExecution.value.checkout.rangeExact || base.value?.kind !== "git" || !allCodeIntegrated || finalVerificationExecution.value.checkout.branch !== base.value.branch || finalVerificationExecution.value.checkout.head !== finalIntegratedHead)) diagnostics.push(diagnostic("invalid-run", "Passed final verification requires the exact clean integrated checkout.", `${path}.finalVerificationExecution`));
 	if (completion.value && tasks[0]) {
 		const gate = completion.value.gate;
-		if (gate.taskId !== tasks[0].contract.id || tasks[0].integration?.phase !== "integrated" || gate.integratedHead !== tasks[0].integration.approvedHeadRevision || finalVerificationExecution.value?.phase !== "passed" || gate.verificationLogSha256 !== finalVerificationExecution.value.logSha256 || gate.verificationResultSha256 !== finalVerificationExecution.value.resultSha256) diagnostics.push(diagnostic("invalid-run", "Completion Gate facts must remain bound to the current integrated Task and passing verification evidence.", `${path}.completion.gate`));
+		if ("tasks" in gate) {
+			let gateHead = base.value?.kind === "git" ? base.value.revision : "";
+			const gateEntriesMatch = tasks.length >= 2 && gate.tasks.length === tasks.length && tasks.every((task, index) => {
+				const entry = gate.tasks[index];
+				const builder = [...task.attempts].reverse().find((attempt): attempt is BuilderAttemptRecord => attempt.role === "builder");
+				const reviewer = [...task.attempts].reverse().find((attempt): attempt is ReviewerAttemptRecord => attempt.role === "reviewer");
+				if (!entry || entry.taskId !== task.contract.id || entry.builderAttemptId !== builder?.id || (entry.reviewerAttemptId ?? undefined) !== (reviewer?.id ?? undefined) || entry.kind !== (task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? "code" : "non-code")) return false;
+				if (entry.kind === "non-code") return task.phase === "completed" && !entry.source && !entry.integration;
+				const subject = task.approval?.phase === "valid" && task.approval.subject.kind === "git" ? task.approval.subject : undefined;
+				const builderEvidence = builder?.evidence?.phase === "finalized" ? builder.evidence : undefined;
+				const reviewerEvidence = reviewer?.evidence?.phase === "finalized" ? reviewer.evidence : undefined;
+				const integration = task.integration?.phase === "integrated" ? task.integration : undefined;
+				if (!subject || !builderEvidence || !reviewerEvidence || !integration || !entry.source || !entry.integration || entry.source.baseRevision !== subject.baseRevision || entry.source.headRevision !== subject.headRevision || JSON.stringify(entry.source.commits) !== JSON.stringify(subject.commits) || entry.source.builderManifestSha256 !== builderEvidence.manifestSha256 || entry.source.reviewerManifestSha256 !== reviewerEvidence.manifestSha256 || entry.integration.targetBranch !== integration.targetBranch || entry.integration.targetRevision !== integration.targetRevision || entry.integration.approvedBaseRevision !== integration.approvedBaseRevision || entry.integration.approvedHeadRevision !== integration.approvedHeadRevision || JSON.stringify(entry.integration.approvedCommits) !== JSON.stringify(integration.approvedCommits) || entry.integration.observedHead !== integration.observedHead || JSON.stringify(entry.integration.action) !== JSON.stringify(integration.action) || integration.targetRevision !== gateHead) return false;
+				gateHead = integration.observedHead;
+				return true;
+			});
+			if (!gateEntriesMatch || gate.integratedHead !== gateHead || tasks.some((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") && task.integration?.phase !== "integrated") || finalVerificationExecution.value?.phase !== "passed" || gate.verificationLogSha256 !== finalVerificationExecution.value.logSha256 || gate.verificationResultSha256 !== finalVerificationExecution.value.resultSha256 || (finalVerificationExecution.value?.phase === "passed" && JSON.stringify(gate.checkout) !== JSON.stringify(finalVerificationExecution.value.checkout))) diagnostics.push(diagnostic("invalid-run", "Multi-Task Completion Gate facts must remain bound to every ordered integrated Task and passing verification evidence.", `${path}.completion.gate`));
+		} else if (gate.taskId !== tasks[0].contract.id || tasks[0].integration?.phase !== "integrated" || gate.integratedHead !== tasks[0].integration.approvedHeadRevision || finalVerificationExecution.value?.phase !== "passed" || gate.verificationLogSha256 !== finalVerificationExecution.value.logSha256 || gate.verificationResultSha256 !== finalVerificationExecution.value.resultSha256) diagnostics.push(diagnostic("invalid-run", "Completion Gate facts must remain bound to the current integrated Task and passing verification evidence.", `${path}.completion.gate`));
 	}
 	if (value.status === "completed" && (!finalVerificationExecution.value || finalVerificationExecution.value.phase !== "passed")) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots require one passing final verification execution.", path));
 	if (finalVerificationExecution.value?.phase === "passed" && tasks[0]?.phase === "completed" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "A passed final verification cannot be detached from completion.", `${path}.finalVerificationExecution`));
@@ -2298,6 +2542,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			...(finalVerificationExecution.value ? { finalVerificationExecution: finalVerificationExecution.value } : {}),
 			...(completion.value ? { completion: completion.value } : {}),
 			...(monitor.value ? { monitor: monitor.value } : {}),
+			...(monitors.value ? { monitors: monitors.value } : {}),
 		},
 		diagnostics: [],
 	};
@@ -2529,6 +2774,7 @@ export function cloneRunJournal(journal: RunJournal): RunJournal {
 			...(journal.run.finalVerificationExecution ? { finalVerificationExecution: cloneVerificationExecution(journal.run.finalVerificationExecution) } : {}),
 			...(journal.run.completion ? { completion: cloneCompletion(journal.run.completion) } : {}),
 			...(journal.run.monitor ? { monitor: cloneMonitorCheckpoint(journal.run.monitor) } : {}),
+			...(journal.run.monitors ? { monitors: journal.run.monitors.map(cloneMonitorCheckpoint) } : {}),
 		},
 	};
 }

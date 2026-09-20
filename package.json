@@ -42,6 +42,7 @@
     "test:herdr": "vitest run test/herdr-adapter.contract.test.ts test/herdr-completion.contract.test.ts test/herdr-monitor.contract.test.ts test/herdr-recovery.contract.test.ts --maxWorkers=1",
     "test:start": "vitest run test/start.functional.test.ts",
     "test:storage": "vitest run test/run-journal.storage.test.ts",
+    "test:coordination": "vitest run test/coordination-policy.contract.test.ts test/coordination.functional.test.ts test/multi-task-storage.contract.test.ts --maxWorkers=1",
     "test:config": "vitest run test/config.functional.test.ts",
     "test": "vitest run --maxWorkers=1"
   }

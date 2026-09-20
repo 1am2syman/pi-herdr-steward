@@ -961,7 +961,10 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 				if (range.code !== 0 || range.killed || range.stderr.length > 0 || (range.stdout.length > 0 && !range.stdout.endsWith("\n"))) return unavailable("Approved Git range output was malformed.");
 				const commits = range.stdout.length === 0 ? [] : range.stdout.trimEnd().split("\n");
 				if (commits.some((commit) => !/^[0-9a-f]{40}$/.test(commit)) || new Set(commits).size !== commits.length) return unavailable("Approved Git range contained malformed or duplicate revisions.");
-				const observation = { branch: branch.stdout.trim(), head: head.stdout.trim(), dirtyPaths, operationMarkers, rangeExact: resolvedBase.stdout.trim() === input.approvedBaseRevision && resolvedHead.stdout.trim() === input.approvedHeadRevision && ancestor.code === 0 && !ancestor.killed && ancestor.stderr.length === 0 && JSON.stringify(commits) === JSON.stringify(input.approvedCommits) };
+				const targetHead = head.stdout.trim();
+				const sourceAncestor = targetHead === input.targetRevision ? undefined : await run(input.repositoryRoot, ["merge-base", "--is-ancestor", input.approvedHeadRevision, targetHead]);
+				const sourceIntegrated = targetHead === input.targetRevision || Boolean(sourceAncestor && sourceAncestor.code === 0 && !sourceAncestor.killed && sourceAncestor.stderr.length === 0);
+				const observation = { branch: branch.stdout.trim(), head: targetHead, dirtyPaths, operationMarkers, rangeExact: resolvedBase.stdout.trim() === input.approvedBaseRevision && resolvedHead.stdout.trim() === input.approvedHeadRevision && ancestor.code === 0 && !ancestor.killed && ancestor.stderr.length === 0 && sourceIntegrated && JSON.stringify(commits) === JSON.stringify(input.approvedCommits) };
 				return { kind: "inspected", observation, resolvedBaseRevision: resolvedBase.stdout.trim(), resolvedHeadRevision: resolvedHead.stdout.trim(), commits };
 			} catch (error: unknown) {
 				return unavailable(error instanceof Error ? error.message : "Integration checkout inspection failed.");
@@ -1004,9 +1007,10 @@ export function createGitAdapter(exec: CommandRunner | undefined): StewardGitAda
 			}
 		},
 		async integrateApprovedRange(input) {
-			if (input.action.kind !== "fast-forward" || JSON.stringify(input.action.argv) !== JSON.stringify(["merge", "--ff-only", "--no-edit", input.approvedHeadRevision])) return { kind: "thrown", message: "Integration action is not the fixed fast-forward envelope." };
+			const expected = input.action.kind === "fast-forward" ? ["merge", "--ff-only", "--no-edit", input.approvedHeadRevision] : ["merge", "--no-ff", "--no-edit", input.approvedHeadRevision];
+			if (JSON.stringify(input.action.argv) !== JSON.stringify(expected)) return { kind: "thrown", message: "Integration action is not a fixed local merge envelope." };
 			try {
-				const result = await run(input.repositoryRoot, ["merge", "--ff-only", "--no-edit", input.approvedHeadRevision]);
+				const result = await run(input.repositoryRoot, expected);
 				return { kind: "completed", code: result.code, stdout: result.stdout, stderr: result.stderr, killed: result.killed };
 			} catch (error: unknown) {
 				return { kind: "thrown", message: error instanceof Error ? error.message : "Git fast-forward integration failed before a result was returned." };
