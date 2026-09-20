@@ -239,14 +239,14 @@ export function registerStewardExtension(
 				ctx.ui.notify("Usage: /steward status | /steward config | /steward start | /steward resume [--takeover]", "info");
 				return;
 			}
-			if (!sameRuntime(runtime, ctx)) {
+			if (!runtimeBoundToSessionLifecycle || !sameRuntime(runtime, ctx)) {
 				if (runtime) await runtime.monitor.stop();
 				runtime = makeRuntime(ctx, adapterFactory, exec, compactionHost);
 				runtimeBoundToSessionLifecycle = false;
 			}
 			const current = runtime;
 			if (!current) return;
-			const commandSteward = createSteward(adapterFactory(requestFromContext(ctx, exec)));
+			const commandSteward = current.steward;
 			await current.monitor.runExclusive(async () => {
 				const controllerSessionId = ctx.sessionManager.getSessionId();
 				if (command === "status") {
