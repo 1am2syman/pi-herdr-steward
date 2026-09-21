@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { createRunJournalAdapter } from "../src/adapters.ts";
 import { type ArchiveCompletedRunRequest } from "../src/completion-store.ts";
 import { registerStewardExtension, type StewardCommandContext, type StewardCommandHandler, type StewardRegistrationSurface } from "../src/extension.ts";
-import { builderAssignmentSha256, type RunDraft, type RunJournal } from "../src/run.ts";
+import { builderAssignmentSha256, type RunConfirmationSummary, type RunDraft, type RunJournal } from "../src/run.ts";
 import { resolveRunJournalPaths } from "../src/run-journal-store.ts";
 import { serializeBuilderAttemptReport, type BuilderAttemptReport } from "../src/attempt-report.ts";
 import { deserializeReviewerAssignment, serializeReviewerAttemptReport, type ReviewerAttemptReport } from "../src/review.ts";
@@ -19,6 +19,19 @@ const fingerprint = `sha256:${"a".repeat(64)}`;
 const recovery: RecoveryDefaults = { passiveInspectionIntervalSeconds: 301, secondInspectionAndNudgeIntervalSeconds: 302, nudgeGracePeriodSeconds: 121, externalCommandWarningThresholdSeconds: 1801, maximumActiveTasks: 1, transientRetryLimit: 1, reworkCycleLimit: 4 };
 const modelPlan: ProjectModelPlans = { builder: { primary: { model: "builder/model", thinkingLevel: "high" }, fallbacks: [] }, reviewer: { primary: { model: "reviewer/model", thinkingLevel: "high" }, fallbacks: [] } };
 
+export type Ticket08ExtensionRegistrar = typeof registerStewardExtension;
+
+export interface Ticket08CompletionEffects {
+	merges: number;
+	processes: number;
+	stops: string[];
+	notifications: number;
+	confirmations?: number;
+	confirmationSummaries?: RunConfirmationSummary[];
+	archives?: number;
+	state: "base" | "integrated";
+}
+
 function sha(bytes: Buffer): string { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
 
 function draft(): RunDraft {
@@ -29,23 +42,29 @@ function context(root: string): StewardCommandContext {
 	return { mode: "tui", hasUI: true, cwd: root, modelRegistry: {} as StewardCommandContext["modelRegistry"], model: undefined, thinkingLevel: undefined, scopedModels: [], sessionManager: { getSessionId: () => "controller-session" } as StewardCommandContext["sessionManager"], ui: { select: async () => undefined, confirm: async () => false, input: async () => undefined, notify() {}, setStatus() {} } };
 }
 
-function registered(dependencies: StewardDependencies): () => StewardCommandHandler {
+function registered(dependencies: StewardDependencies, registrar: Ticket08ExtensionRegistrar = registerStewardExtension): () => StewardCommandHandler {
 	let handler: StewardCommandHandler | undefined;
 	const surface: StewardRegistrationSurface = { on() {}, registerCommand(_name, options) { handler = options.handler; } };
-	registerStewardExtension(surface, () => dependencies);
+	registrar(surface, () => dependencies);
 	return () => { if (!handler) throw new Error("Steward command was not registered"); return handler; };
 }
 
-async function invoke(root: string, dependencies: StewardDependencies, command: string): Promise<StatusView> {
+async function invoke(root: string, dependencies: StewardDependencies, command: string, registrar: Ticket08ExtensionRegistrar = registerStewardExtension): Promise<StatusView> {
 	let view: StatusView | undefined;
 	dependencies.ui = { ...dependencies.ui, presentStatus(value) { view = value; } };
-	await registered(dependencies)()(command, context(root));
+	await registered(dependencies, registrar)()(command, context(root));
 	if (!view) throw new Error("registered status did not present a view");
 	return view;
 }
 
-function dependencies(root: string, effects: { merges: number; processes: number; stops: string[]; notifications: number; state: "base" | "integrated" }): StewardDependencies {
+function dependencies(root: string, effects: Ticket08CompletionEffects): StewardDependencies {
 	const runJournal = createRunJournalAdapter();
+	const archiveCompletedRun = runJournal.archiveCompletedRun;
+	if (!archiveCompletedRun) throw new Error("Completion fixture requires the production archive adapter");
+	runJournal.archiveCompletedRun = async (input) => {
+		effects.archives = (effects.archives ?? 0) + 1;
+		return archiveCompletedRun(input);
+	};
 	const builderPath = join(root, "builder-worktree");
 	let uuid = 0;
 	const ui: StewardUiAdapter = {
@@ -53,7 +72,11 @@ function dependencies(root: string, effects: { merges: number; processes: number
 		async editConfiguration() { return { kind: "cancelled" }; },
 		presentConfigurationResult() {},
 		async draftRun() { return { kind: "drafted" as const, draft: draft() }; },
-		async confirmRun() { return true; },
+		async confirmRun(summary) {
+			effects.confirmations = (effects.confirmations ?? 0) + 1;
+			effects.confirmationSummaries = [...(effects.confirmationSummaries ?? []), summary];
+			return true;
+		},
 		presentStartResult() {},
 		notifyCompletion() { effects.notifications += 1; },
 	};
@@ -86,9 +109,9 @@ function dependencies(root: string, effects: { merges: number; processes: number
 	};
 }
 
-async function start(root: string, deps: StewardDependencies): Promise<RunJournal> {
+async function start(root: string, deps: StewardDependencies, registrar: Ticket08ExtensionRegistrar = registerStewardExtension): Promise<RunJournal> {
 	await mkdir(join(root, "builder-worktree", "src"), { recursive: true });
-	await registered(deps)()("start", context(root));
+	await registered(deps, registrar)()("start", context(root));
 	const result = await deps.runJournal.loadActive(root);
 	if (result.kind !== "loaded") throw new Error("Run was not created");
 	return result.journal;
@@ -120,7 +143,7 @@ async function writeReviewer(journal: RunJournal): Promise<void> {
 }
 
 export async function captureArchiveFixture(root: string): Promise<{ request: ArchiveCompletedRunRequest; activeBytes: Buffer; previousBytes: Buffer; paths: ReturnType<typeof resolveRunJournalPaths> }> {
-	const effects = { merges: 0, processes: 0, stops: [] as string[], notifications: 0, state: "base" as const };
+	const effects: Ticket08CompletionEffects = { merges: 0, processes: 0, stops: [], notifications: 0, confirmations: 0, archives: 0, state: "base" };
 	const deps = dependencies(root, effects);
 	const started = await start(root, deps);
 	await writeBuilder(root, started);
@@ -134,4 +157,31 @@ export async function captureArchiveFixture(root: string): Promise<{ request: Ar
 	if (!request) throw new Error("Archive request was not captured");
 	const paths = resolveRunJournalPaths(root);
 	return { request, activeBytes: await readFile(paths.activePath), previousBytes: await readFile(paths.previousPath), paths };
+}
+
+export interface Ticket08CompletionFlow {
+	effects: Ticket08CompletionEffects;
+	deps: StewardDependencies;
+	started: RunJournal;
+	reviewerDispatch: RunJournal;
+	finalView: StatusView;
+	archiveDirectory: string;
+}
+
+/** Drive the registered ticket-08 completion path with a caller-supplied extension export. */
+export async function driveTicket08CompletionFlow(root: string, registrar: Ticket08ExtensionRegistrar = registerStewardExtension): Promise<Ticket08CompletionFlow> {
+	const effects: Ticket08CompletionEffects = { merges: 0, processes: 0, stops: [], notifications: 0, confirmations: 0, archives: 0, state: "base" };
+	const deps = dependencies(root, effects);
+	const started = await start(root, deps, registrar);
+	await writeBuilder(root, started);
+	await invoke(root, deps, "status", registrar);
+	const loaded = await deps.runJournal.loadActive(root);
+	if (loaded.kind !== "loaded") throw new Error("Reviewer dispatch did not persist");
+	await writeReviewer(loaded.journal);
+	const finalView = await invoke(root, deps, "status", registrar);
+	if (finalView.kind !== "present" || !("completed" in finalView) || !finalView.completed) throw new Error("Registered completion flow did not reach a completed view");
+	const archiveRoot = join(root, ".pi", "steward", "archives");
+	const archives = await readdir(archiveRoot);
+	if (archives.length !== 1 || !archives[0]) throw new Error(`Expected one completed archive, found ${archives.length}`);
+	return { effects, deps, started, reviewerDispatch: loaded.journal, finalView, archiveDirectory: join(archiveRoot, archives[0]) };
 }

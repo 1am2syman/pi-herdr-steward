@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "A compact Pi extension for inspecting Steward Runs.",
   "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "files": [
     "src"
   ],
@@ -49,6 +52,9 @@
     "test:coordination": "vitest run test/coordination-policy.contract.test.ts test/coordination.functional.test.ts test/multi-task-storage.contract.test.ts --maxWorkers=1",
     "test:revise": "vitest run test/revise.functional.test.ts --maxWorkers=1",
     "test:config": "vitest run test/config.functional.test.ts",
+    "test:install-docs": "vitest run test/install-functional-path.static.test.ts --maxWorkers=1",
+    "test:install-functional": "node --experimental-strip-types test/install-functional-path.smoke.ts",
+    "smoke:herdr-real": "node --experimental-strip-types scripts/smoke-real-herdr.mjs",
     "test": "vitest run --maxWorkers=1"
   }
 }
