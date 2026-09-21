@@ -4755,7 +4755,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 	}
 
 	function revisionStopForAttempt(attempt: AttemptRecord, timestamp: string): RecoveryStop {
-		const identity = attemptIdentity(attempt);
+		const identity = recoveryIdentityFor(attempt);
 		return identity ? { phase: "intended", intendedAt: timestamp, agent: identity } : { phase: "not-required", reason: "never-started" };
 	}
 
@@ -5066,7 +5066,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 		const lastProgressAt = existingSilence?.lastProgressAt ?? attemptInput.recovery?.live.observedAt ?? attemptInput.activatedAt ?? attemptInput.preparedAt;
 		const phaseAt = existingSilence?.phaseAt ?? lastProgressAt;
-		const base = { now, passiveInspectionMs: journalInput.run.effectiveSettings.passiveInspectionIntervalSeconds * 1_000, secondInspectionMs: journalInput.run.effectiveSettings.secondInspectionAndNudgeIntervalSeconds * 1_000, nudgeGraceMs: journalInput.run.effectiveSettings.nudgeGracePeriodSeconds * 1_000, externalWarningMs: journalInput.run.effectiveSettings.externalCommandWarningThresholdSeconds * 1_000, lastProgressAt: new Date(lastProgressAt).getTime(), phaseAt: new Date(phaseAt).getTime(), retryOrdinal: journalInput.run.tasks[taskIndex]?.attempts.filter((item) => attemptSpecificationVersion(item) === attemptInput.specificationVersion && item.replacement).length ?? 0, retryLimit: journalInput.run.effectiveSettings.transientRetryLimit, process: "none" as const, unchanged: !sourceChanged && !processChanged };
+		const base = { now, passiveInspectionMs: journalInput.run.effectiveSettings.passiveInspectionIntervalSeconds * 1_000, secondInspectionMs: journalInput.run.effectiveSettings.secondInspectionAndNudgeIntervalSeconds * 1_000, nudgeGraceMs: journalInput.run.effectiveSettings.nudgeGracePeriodSeconds * 1_000, externalWarningMs: journalInput.run.effectiveSettings.externalCommandWarningThresholdSeconds * 1_000, lastProgressAt: new Date(lastProgressAt).getTime(), phaseAt: new Date(phaseAt).getTime(), retryOrdinal: journalInput.run.tasks[taskIndex]?.attempts.filter((item) => attemptSpecificationVersion(item) === attemptSpecificationVersion(attemptInput) && item.replacement).length ?? 0, retryLimit: journalInput.run.effectiveSettings.transientRetryLimit, process: "none" as const, unchanged: !sourceChanged && !processChanged };
 		const decision = decideSilenceRecovery({ ...base, phase: priorPhase === "suspected" ? "suspected" : priorPhase === "nudged" ? "nudged" : priorPhase === "interrupted" ? "interrupted" : priorPhase === "resumed" ? "resumed" : "none" });
 		if (decision.kind === "wait" || decision.kind === "inspection-incomplete") return { kind: "none", journal: journalInput, note: "Passive inspection is unchanged but no silence recovery deadline is due." };
 		if (decision.kind === "suspect") {

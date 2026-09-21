@@ -10,7 +10,7 @@ import { registerStewardExtension, type StewardCommandContext, type StewardComma
 import { buildInitialRunJournal, specificationHash, validateRunJournal, type BuilderAttemptRecord, type FinalVerificationExecution, type IntegrationCheckoutObservation, type ReviewWorktreeSnapshot, type ReviewerAttemptRecord, type RunDraft, type RunJournal, type TaskIntegration, type TaskRecord } from "../src/run.ts";
 import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 import type { ReviewSubject } from "../src/review.ts";
-import type { StewardDependencies, StewardUiAdapter } from "../src/steward.ts";
+import type { ManagedAgentInspection, ManagedAgentIdentity, StewardDependencies, StewardUiAdapter } from "../src/steward.ts";
 
 const roots: string[] = [];
 const baseRevision = "0123456789abcdef0123456789abcdef01234567";
@@ -177,6 +177,74 @@ async function fixture(root: string, terminal = false): Promise<{ journal: RunJo
 	return { journal: validated.value, files };
 }
 
+function makePromptIntendedReviewer(task: TaskRecord): ManagedAgentIdentity {
+	const attempt = task.attempts.at(-1);
+	if (!attempt || attempt.role !== "reviewer" || attempt.dispatch.phase !== "prompted") throw new Error("prompt-intended Reviewer fixture is incomplete");
+	const dispatch = attempt.dispatch;
+	const identity = { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
+	attempt.state = "prepared";
+	delete attempt.activatedAt;
+	attempt.dispatch = { phase: "prompt-intended", agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, assignmentSha256: dispatch.assignmentSha256 } as ReviewerAttemptRecord["dispatch"];
+	return identity;
+}
+
+function intendedRevisionStopJournal(baseJournal: RunJournal): { journal: RunJournal; identity: ManagedAgentIdentity } {
+	const journal = structuredClone(baseJournal);
+	const task = journal.run.tasks[1]!;
+	const attempt = task.attempts.at(-1);
+	if (!attempt || attempt.role !== "reviewer" || attempt.dispatch.phase !== "prompted") throw new Error("intended revision-stop fixture is incomplete");
+	const dispatch = attempt.dispatch;
+	const identity = { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
+	const beforeContract = structuredClone(task.contract);
+	const beforeSpecificationVersion = task.specificationVersion;
+	const beforeSpecificationHash = task.specificationHash;
+	const afterContract = { ...beforeContract, requiredOutcome: "Resume-boundary revised Task 2" };
+	const afterSpecificationVersion = beforeSpecificationVersion + 1;
+	const afterSpecificationHash = specificationHash(afterContract);
+	const confirmedAt = timestamp(50);
+	attempt.state = "cancelled";
+	delete attempt.activatedAt;
+	attempt.dispatch = { phase: "prompt-intended", agentName: dispatch.agentName, worktreePath: dispatch.worktreePath, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId, assignmentSha256: dispatch.assignmentSha256 } as ReviewerAttemptRecord["dispatch"];
+	attempt.revisionCancellation = {
+		reason: "task-specification-revised",
+		cancelledAt: confirmedAt,
+		previousState: "prepared",
+		oldSpecificationVersion: beforeSpecificationVersion,
+		oldSpecificationHash: beforeSpecificationHash,
+		replacementSpecificationVersion: afterSpecificationVersion,
+		replacementSpecificationHash: afterSpecificationHash,
+		owningRunRevision: 2,
+		stop: { phase: "intended", intendedAt: confirmedAt, agent: identity },
+	};
+	task.contract = afterContract;
+	task.specificationVersion = afterSpecificationVersion;
+	task.specificationHash = afterSpecificationHash;
+	task.phase = "pending";
+	task.reworkCycles = 0;
+	task.attention = "none";
+	delete task.attentionReason;
+	delete task.attentionDiagnostic;
+	journal.journalRevision = baseJournal.journalRevision + 1;
+	journal.run.updatedAt = timestamp(51);
+	journal.run.revisions = [{
+		revision: 2,
+		confirmedAt,
+		controllerSessionId: journal.run.controllerSessionId,
+		basisJournalRevision: baseJournal.journalRevision,
+		taskDeltas: [{
+			taskId: task.contract.id,
+			before: { specificationVersion: beforeSpecificationVersion, specificationHash: beforeSpecificationHash, contract: beforeContract },
+			after: { specificationVersion: afterSpecificationVersion, specificationHash: afterSpecificationHash, contract: afterContract },
+			priorReworkCycles: 0,
+			cancelledAttemptIds: [attempt.id],
+			invalidatedReviewerAttempts: [],
+		}],
+	}];
+	const validated = validateRunJournal(journal);
+	if (!validated.value || validated.diagnostics.length > 0) throw new Error(`invalid intended revision-stop fixture: ${validated.diagnostics.map((item) => item.message).join("; ")}`);
+	return { journal: validated.value, identity };
+}
+
 function context(root: string, session = "revise-controller"): StewardCommandContext {
 	return { mode: "tui", hasUI: true, cwd: root, modelRegistry: {} as StewardCommandContext["modelRegistry"], model: undefined, thinkingLevel: undefined, scopedModels: [], sessionManager: { getSessionId: () => session } as StewardCommandContext["sessionManager"], ui: { select: async () => undefined, input: async () => undefined, confirm: async () => false, notify() {}, setStatus() {} } };
 }
@@ -199,7 +267,7 @@ function changedDraft(journal: RunJournal): import("../src/run.ts").RunRevisionD
 	};
 }
 
-async function dependenciesFor(root: string, ui: StewardUiAdapter, options: { onStop?: StewardDependencies["herdr"]["stopAgentGracefully"]; onReplace?: (count: number) => void; onModelValidation?: () => void } = {}): Promise<StewardDependencies> {
+async function dependenciesFor(root: string, ui: StewardUiAdapter, options: { onStop?: StewardDependencies["herdr"]["stopAgentGracefully"]; onInspect?: (identity: ManagedAgentIdentity) => Promise<ManagedAgentInspection>; onReplace?: (count: number) => void; onModelValidation?: () => void } = {}): Promise<StewardDependencies> {
 	const store = createRunJournalAdapter();
 	let replacements = 0;
 	const runJournal: StewardDependencies["runJournal"] = {
@@ -208,7 +276,7 @@ async function dependenciesFor(root: string, ui: StewardUiAdapter, options: { on
 	};
 	return {
 		runJournal,
-		herdr: { async checkAvailability() { return { kind: "available", status: "running", running: true, compatible: true, endpointCompatible: true }; }, ...(options.onStop ? { stopAgentGracefully: options.onStop } : {}) },
+		herdr: { async checkAvailability() { return { kind: "available", status: "running", running: true, compatible: true, endpointCompatible: true }; }, ...(options.onStop ? { stopAgentGracefully: options.onStop } : {}), ...(options.onInspect ? { inspectManagedAgent: options.onInspect } : {}) },
 		git: { async inspectIntegrationBase() { return { kind: "ready", branch: "main", revision: baseRevision }; } },
 		process: {},
 		model: { listModelChoices: () => [], async validateModelPlans() { options.onModelValidation?.(); return []; } },
@@ -220,6 +288,94 @@ async function dependenciesFor(root: string, ui: StewardUiAdapter, options: { on
 afterEach(async () => { for (const root of roots.splice(0).reverse()) await rm(root, { recursive: true, force: true }); });
 
 describe("ticket-17 registered active-Run revision", () => {
+	it("records the exact identity of a prompt-intended Attempt before graceful stop", async () => {
+		const root = await mkdtemp(join(tmpdir(), "pi-herdr-revise-prompt-intended-"));
+		roots.push(root);
+		const fixtureValue = await fixture(root);
+		const identity = makePromptIntendedReviewer(fixtureValue.journal.run.tasks[1]!);
+		const store = createRunJournalAdapter();
+		expect((await store.createActive(root, fixtureValue.journal)).kind).toBe("created");
+		let stopInput: { repositoryRoot: string; name: string; workspaceId: string; paneId: string; terminalId: string } | undefined;
+		const ui: StewardUiAdapter = {
+			presentStatus() {},
+			presentStartResult() {},
+			presentConfigurationResult() {},
+			async editConfiguration() { return { kind: "cancelled" }; },
+			async draftRun() { return { kind: "cancelled" }; },
+			async confirmRun() { return false; },
+			async draftRunRevision() {
+				const draft = changedDraft(fixtureValue.journal);
+				draft.tasks[1]!.contract.requiredOutcome = "Prompt-intended revised Task 2";
+				return { kind: "drafted", draft };
+			},
+			async confirmRunRevision() { return true; },
+			presentRevisionResult() {},
+		};
+		const dependencies = await dependenciesFor(root, ui, {
+			onStop: async (input) => {
+				stopInput = input;
+				return { kind: "acknowledged", name: input.name, workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, tabId: "prompt-intended-tab" };
+			},
+		});
+		await register(dependencies).command("revise", context(root));
+		expect(stopInput).toEqual({ repositoryRoot: root, ...identity });
+		const loaded = await store.loadActive(root);
+		expect(loaded.kind).toBe("loaded");
+		if (loaded.kind !== "loaded") return;
+		const cancelled = loaded.journal.run.tasks[1]!.attempts.find((attempt) => attempt.id === "attempt-02");
+		expect(cancelled?.state).toBe("cancelled");
+		expect(cancelled?.revisionCancellation?.stop).toMatchObject({ phase: "acknowledged", agent: identity });
+	});
+
+	it.each(["missing", "live", "unclear"] as const)("registered resume reconciles an intended revision stop when the exact Agent is %s", async (scenario) => {
+		const root = await mkdtemp(join(tmpdir(), `pi-herdr-revise-stop-${scenario}-`));
+		roots.push(root);
+		const fixtureValue = await fixture(root);
+		const store = createRunJournalAdapter();
+		expect((await store.createActive(root, fixtureValue.journal)).kind).toBe("created");
+		const intended = intendedRevisionStopJournal(fixtureValue.journal);
+		expect((await store.replaceActive(root, intended.journal)).kind).toBe("replaced");
+		let inspectedIdentity: ManagedAgentIdentity | undefined;
+		let stopCalls = 0;
+		const ui: StewardUiAdapter = {
+			presentStatus() {},
+			presentStartResult() {},
+			presentConfigurationResult() {},
+			async editConfiguration() { return { kind: "cancelled" }; },
+			async draftRun() { return { kind: "cancelled" }; },
+			async confirmRun() { return false; },
+			presentResumeResult() {},
+		};
+		const dependencies = await dependenciesFor(root, ui, {
+			onInspect: async (identity) => {
+				inspectedIdentity = identity;
+				if (scenario === "missing") return { kind: "missing", diagnostic: "exact revision-stop Agent is absent" };
+				if (scenario === "unclear") return { kind: "unclear", diagnostic: "exact revision-stop Agent is unclear" };
+				return { kind: "observed", identity, lifecycle: "working", stateChangeSequence: 7 };
+			},
+			onStop: async (input) => {
+				stopCalls += 1;
+				return { kind: "acknowledged", name: input.name, workspaceId: input.workspaceId, paneId: input.paneId, terminalId: input.terminalId, tabId: "resume-stop-tab" };
+			},
+		});
+		await register(dependencies).command("resume", context(root));
+		expect(inspectedIdentity).toEqual(intended.identity);
+		expect(stopCalls).toBe(scenario === "live" ? 1 : 0);
+		const loaded = await store.loadActive(root);
+		expect(loaded.kind).toBe("loaded");
+		if (loaded.kind !== "loaded") return;
+		const task = loaded.journal.run.tasks[1]!;
+		const cancellation = task.attempts.find((attempt) => attempt.id === "attempt-02")?.revisionCancellation;
+		if (scenario === "unclear") {
+			expect(cancellation?.stop).toMatchObject({ phase: "ambiguous", agent: intended.identity });
+			expect(task.attention).toBe("needs-user");
+			expect(task.attentionReason).toBe("revision-stop-ambiguous");
+		} else {
+			expect(cancellation?.stop).toMatchObject({ phase: "acknowledged", agent: intended.identity });
+			expect(task.attention).toBe("none");
+		}
+	});
+
 	it("revises only Task 2 through the real handler, stops after the CAS, and preserves Task 1 and evidence", async () => {
 		const root = await mkdtemp(join(tmpdir(), "pi-herdr-revise-"));
 		roots.push(root);

@@ -9,7 +9,7 @@ import { createRunJournalAdapter } from "../src/adapters.ts";
 import { resolveRunJournalPaths } from "../src/run-journal-store.ts";
 import { registerStewardExtension, type StewardCommandContext, type StewardCommandHandler } from "../src/extension.ts";
 import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
-import type { RunDraft, RunJournal } from "../src/run.ts";
+import { specificationHash, type RunDraft, type RunJournal } from "../src/run.ts";
 import type { ManagedAgentInspection, MonitorDigest, ResumeResult, SilenceProcessObservation, StewardDependencies, StewardHerdrAdapter, StewardUiAdapter } from "../src/steward.ts";
 
 vi.setConfig({ testTimeout: 60_000 });
@@ -411,6 +411,85 @@ it.sequential("registered default limit 2 performs two linked replacements then 
 	expect(fixture.effects.recoveryPanes).toBe(effects.panes);
 	expect(fixture.effects.replacementStarts).toBe(effects.starts);
 	expect(fixture.effects.replacementPrompts).toBe(effects.prompts);
+}, 60_000);
+
+it.sequential("registered revised Task lineage counts replacement ordinals within the current specification", async () => {
+	const fixture = await makeFixture(noneProcess(), { transientRetryLimit: 2 });
+	let journal = await reserveNextReplacement(fixture);
+	journal = await continueReplacement(fixture);
+	const candidate = structuredClone(journal);
+	const task = candidate.run.tasks[0]!;
+	const predecessor = task.attempts.at(-1);
+	if (!predecessor || predecessor.role !== "builder" || predecessor.dispatch.phase !== "prompted") throw new Error("current Builder fixture is missing");
+	const oldContract = structuredClone(task.contract);
+	const oldSpecificationVersion = task.specificationVersion;
+	const oldSpecificationHash = task.specificationHash;
+	const dispatch = predecessor.dispatch;
+	const identity = { name: dispatch.agentName, workspaceId: dispatch.workspaceId, paneId: dispatch.paneId, terminalId: dispatch.terminalId };
+	const confirmedAt = new Date(fixture.clock.nowMs + 1_000).toISOString();
+	const updatedAt = new Date(Date.parse(confirmedAt) + 1_000).toISOString();
+	const revisedContract = { ...oldContract, requiredOutcome: "Keep the revised exact change in the managed worktree" };
+	const revisedSpecificationVersion = oldSpecificationVersion + 1;
+	const revisedSpecificationHash = specificationHash(revisedContract);
+	const nextAttempt = structuredClone(predecessor);
+	predecessor.state = "cancelled";
+	delete predecessor.recovery;
+	predecessor.revisionCancellation = {
+		reason: "task-specification-revised",
+		cancelledAt: confirmedAt,
+		previousState: "active",
+		oldSpecificationVersion,
+		oldSpecificationHash,
+		replacementSpecificationVersion: revisedSpecificationVersion,
+		replacementSpecificationHash: revisedSpecificationHash,
+		owningRunRevision: 2,
+		stop: { phase: "acknowledged", intendedAt: confirmedAt, acknowledgedAt: confirmedAt, agent: identity },
+	};
+	nextAttempt.id = "attempt-03";
+	nextAttempt.state = "active";
+	nextAttempt.preparedAt = confirmedAt;
+	nextAttempt.activatedAt = confirmedAt;
+	nextAttempt.specificationVersion = revisedSpecificationVersion;
+	nextAttempt.specificationHash = revisedSpecificationHash;
+	delete nextAttempt.replacement;
+	delete nextAttempt.recovery;
+	delete nextAttempt.revisionCancellation;
+	nextAttempt.dispatch = { ...dispatch, promptedAt: confirmedAt };
+	task.attempts.push(nextAttempt);
+	task.contract = revisedContract;
+	task.specificationVersion = revisedSpecificationVersion;
+	task.specificationHash = revisedSpecificationHash;
+	task.phase = "building";
+	task.reworkCycles = 0;
+	task.attention = "none";
+	delete task.attentionReason;
+	delete task.attentionDiagnostic;
+	candidate.journalRevision = journal.journalRevision + 1;
+	candidate.run.updatedAt = updatedAt;
+	candidate.run.revisions = [{
+		revision: 2,
+		confirmedAt,
+		controllerSessionId: candidate.run.controllerSessionId,
+		basisJournalRevision: journal.journalRevision,
+		taskDeltas: [{
+			taskId: task.contract.id,
+			before: { specificationVersion: oldSpecificationVersion, specificationHash: oldSpecificationHash, contract: oldContract },
+			after: { specificationVersion: revisedSpecificationVersion, specificationHash: revisedSpecificationHash, contract: revisedContract },
+			priorReworkCycles: 0,
+			cancelledAttemptIds: [predecessor.id],
+			invalidatedReviewerAttempts: [],
+		}],
+	}];
+	const replaced = await fixture.deps.runJournal.replaceActive(fixture.root, candidate);
+	if (replaced.kind !== "replaced") throw new Error(`revised lineage fixture was rejected: ${JSON.stringify(replaced)}`);
+
+	journal = await reserveNextReplacement(fixture);
+	let taskAfterFirstCurrentReplacement = journal.run.tasks[0]!;
+	expect(taskAfterFirstCurrentReplacement.attempts.filter((attempt) => attempt.replacement).map((attempt) => [attempt.specificationVersion ?? 1, attempt.replacement?.retryOrdinal])).toEqual([[1, 1], [2, 1]]);
+	journal = await continueReplacement(fixture);
+	journal = await reserveNextReplacement(fixture);
+	taskAfterFirstCurrentReplacement = journal.run.tasks[0]!;
+	expect(taskAfterFirstCurrentReplacement.attempts.filter((attempt) => attempt.replacement).map((attempt) => [attempt.specificationVersion ?? 1, attempt.replacement?.retryOrdinal])).toEqual([[1, 1], [2, 1], [2, 2]]);
 }, 60_000);
 
 it.sequential("registered replacement limit 0 fails closed with bounded exhausted state and no replacement effect", async () => {
