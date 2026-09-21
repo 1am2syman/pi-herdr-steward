@@ -1,17 +1,110 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { archiveCompletedRun, COMPLETION_OUTPUT_VERSION, decodeVerificationOutput, finalizeVerificationResult, inspectFinalVerificationResult, resolveCompletionPaths } from "../src/completion-store.ts";
-import { advanceRunJournal, deserializeRunJournal } from "../src/run.ts";
+import { archiveCancelledRun, archiveCompletedRun, COMPLETION_OUTPUT_VERSION, decodeVerificationOutput, finalizeVerificationResult, inspectFinalVerificationResult, listTerminalArchives, resolveCompletionPaths, type ArchiveCancelledRunRequest, type CompletionReportSource } from "../src/completion-store.ts";
+import { advanceRunJournal, buildInitialRunJournal, createRunIdentity, deserializeRunJournal, type BuilderAttemptRecord, type RunDraft, type RunJournal } from "../src/run.ts";
+import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 import { createRunJournalAdapter } from "../src/adapters.ts";
 import { resolveRunJournalPaths } from "../src/run-journal-store.ts";
 import { captureArchiveFixture } from "./ticket08-archive-fixture.ts";
 
 const roots: string[] = [];
 vi.setConfig({ testTimeout: 60_000 });
+
+const cancelledRecovery: RecoveryDefaults = { passiveInspectionIntervalSeconds: 301, secondInspectionAndNudgeIntervalSeconds: 302, nudgeGracePeriodSeconds: 121, externalCommandWarningThresholdSeconds: 1801, maximumActiveTasks: 1, transientRetryLimit: 1, reworkCycleLimit: 4 };
+const cancelledModelPlan: ProjectModelPlans = { builder: { primary: { model: "builder/model", thinkingLevel: "high" }, fallbacks: [] }, reviewer: { primary: { model: "reviewer/model", thinkingLevel: "high" }, fallbacks: [] } };
+
+function cancelledDraft(): RunDraft {
+	return {
+		declaredOutcome: "Preserve cancellation evidence",
+		tasks: [{ requiredOutcome: "Retain the run evidence", allowedScope: ["src"], expectedArtifacts: [{ kind: "git-commit" }], verification: { kind: "command", command: "npm test" }, reviewRequired: true }],
+		modelPlan: cancelledModelPlan,
+		effectiveSettings: cancelledRecovery,
+		finalVerification: { kind: "command", command: "npm test" },
+	};
+}
+
+function shaBuffer(value: Buffer): string {
+	return hashBytes(value);
+}
+
+async function cancelledArchiveFixture(root: string, withReport: boolean): Promise<{ input: ArchiveCancelledRunRequest; pointers: { activeBytes: Buffer; previousBytes: Buffer }; reportPath?: string }> {
+	const store = createRunJournalAdapter();
+	const initial = buildInitialRunJournal({ identity: createRunIdentity(new Date("2026-09-21T00:00:00.000Z"), "01234567-89ab-cdef-0123-456789abcdef"), controllerSessionId: "controller-session", draft: cancelledDraft(), modelPlan: cancelledModelPlan, effectiveSettings: cancelledRecovery, integrationBase: { kind: "git", branch: "main", revision: "0000000000000000000000000000000000000000" } });
+	let prepared = initial;
+	let reportPath: string | undefined;
+	if (withReport) {
+		const assignmentPaths = store.resolveAssignmentPaths(root, initial.run.id, "task-01", "attempt-01");
+		reportPath = assignmentPaths.reportPath;
+		const attempt: BuilderAttemptRecord = {
+			id: "attempt-01",
+			role: "builder",
+			state: "prepared",
+			preparedAt: "2026-09-21T00:00:00.001Z",
+			actualModel: { ...cancelledModelPlan.builder.primary },
+			specificationHash: initial.run.tasks[0]!.specificationHash,
+			baseRevision: "0000000000000000000000000000000000000000",
+			assignmentPath: assignmentPaths.assignmentPath,
+			reportPath,
+			evidenceDirectory: assignmentPaths.evidenceDirectory,
+			dispatch: { phase: "worktree-intended", branch: "steward/run/task-01/attempt-01", agentName: "steward-b-01234567-01-01" },
+		};
+		prepared = advanceRunJournal(initial, new Date("2026-09-21T00:00:00.002Z"), (next) => {
+			next.run.tasks[0]!.phase = "building";
+			next.run.tasks[0]!.attempts.push(attempt);
+		});
+		await mkdir(assignmentPaths.evidenceDirectory, { recursive: true });
+		await writeFile(reportPath, "stable cancelled report\n");
+	}
+	const stopsComplete = advanceRunJournal(prepared, new Date("2026-09-21T00:00:00.003Z"), (next) => {
+		const task = next.run.tasks[0]!;
+		const attempt = task.attempts[0];
+		task.phase = "cancelled";
+		if (attempt) attempt.state = "cancelled";
+		next.run.status = "cancelled";
+		next.run.cancellation = {
+			phase: "stops-complete",
+			cancelledAt: "2026-09-21T00:00:00.003Z",
+			controllerSessionId: "controller-session",
+			controllerLease: { sessionId: "controller-session", leaseId: initial.run.controllerLease!.leaseId },
+			priorTasks: [{ taskId: "task-01", phase: withReport ? "building" : "pending", attention: "none", attempts: withReport ? [{ attemptId: "attempt-01", state: "prepared" }] : [] }],
+			panes: [],
+			worktrees: [],
+			stops: withReport ? [{ taskId: "task-01", attemptId: "attempt-01", role: "builder", state: "not-required", reason: "never-started" }] : [],
+		};
+	});
+	const created = await store.createActive(root, initial);
+	if (created.kind !== "created") throw new Error(`Cancelled archive fixture could not create active Journal: ${created.kind} ${"diagnostics" in created ? created.diagnostics.map((item) => item.message).join("; ") : ""}`);
+	const replacedPrepared = prepared.journalRevision === initial.journalRevision ? { kind: "replaced" as const } : await store.replaceActive(root, prepared);
+	if (replacedPrepared.kind !== "replaced") throw new Error(`Cancelled archive fixture could not persist prepared Journal: ${replacedPrepared.kind} ${"diagnostics" in replacedPrepared ? replacedPrepared.diagnostics.map((item) => item.message).join("; ") : ""}`);
+	const replaced = await store.replaceActive(root, stopsComplete);
+	if (replaced.kind !== "replaced") throw new Error(`Cancelled archive fixture could not persist stops-complete Journal: ${replaced.kind} ${"diagnostics" in replaced ? replaced.diagnostics.map((item) => item.message).join("; ") : ""}`);
+	const paths = resolveCompletionPaths(root, initial.run.id);
+	const beforeIntent = await store.loadCompletionJournalPointers!(root);
+	if (beforeIntent.kind !== "loaded") throw new Error("Cancelled archive fixture pointers were not available before archive intent.");
+	const reports: CompletionReportSource[] = withReport && reportPath ? [{ taskId: "task-01", attemptId: "attempt-01", role: "builder", sourcePath: reportPath, destinationPath: "reports/task-01/attempt-01-builder.md", size: Buffer.byteLength("stable cancelled report\n"), sha256: shaBuffer(Buffer.from("stable cancelled report\n")) }] : [];
+	const archiveIntent = advanceRunJournal(stopsComplete, new Date("2026-09-21T00:00:00.004Z"), (next) => {
+		const current = next.run.cancellation;
+		if (!current || current.phase !== "stops-complete") throw new Error("Cancelled archive fixture lost stops-complete state.");
+		next.run.cancellation = {
+			...current,
+			phase: "archive-intended",
+			archive: { intendedAt: "2026-09-21T00:00:00.004Z", archiveDirectory: paths.archiveDirectory, runPath: paths.archiveRunPath, previousRunPath: paths.archivePreviousRunPath, manifestPath: paths.archiveManifestPath, activeJournalSha256: shaBuffer(beforeIntent.pointers.activeBytes), previousJournalSha256: shaBuffer(beforeIntent.pointers.previousBytes), reports },
+		};
+	});
+	await store.replaceActive(root, archiveIntent);
+	const finalPointers = await store.loadCompletionJournalPointers!(root);
+	if (finalPointers.kind !== "loaded") throw new Error("Cancelled archive fixture pointers were not available after archive intent.");
+	const archived = advanceRunJournal(archiveIntent, new Date("2026-09-21T00:00:00.005Z"), (next) => {
+		const current = next.run.cancellation;
+		if (!current || current.phase !== "archive-intended") throw new Error("Cancelled archive fixture lost archive intent.");
+		next.run.cancellation = { ...current, phase: "archived", archive: { ...current.archive, activeJournalSha256: shaBuffer(finalPointers.pointers.activeBytes), previousJournalSha256: shaBuffer(finalPointers.pointers.previousBytes) }, archivedAt: "2026-09-21T00:00:00.005Z" };
+	});
+	return { input: { repositoryRoot: root, runId: initial.run.id, run: archived, archivedAt: "2026-09-21T00:00:00.005Z", reports }, pointers: finalPointers.pointers, ...(reportPath ? { reportPath } : {}) };
+}
 
 function hashBytes(value: Buffer): string {
 	return "sha256:" + createHash("sha256").update(value).digest("hex");
@@ -152,5 +245,61 @@ describe("ticket-08 completed archive storage", () => {
 		expect(await readFile(fixture.paths.activePath)).toEqual(liveActive);
 		expect(await readFile(fixture.paths.previousPath)).toEqual(livePrevious);
 		expect(resolveRunJournalPaths(root).activePath).toBe(fixture.paths.activePath);
+	});
+});
+
+describe("ticket-18 cancelled archive storage", () => {
+	it("publishes a zero-report cancelled archive, reuses an identical archive, and exposes strict terminal listing", async () => {
+		const root = await mkdtemp(join(tmpdir(), "steward-t18-cancelled-archive-"));
+		roots.push(root);
+		const fixture = await cancelledArchiveFixture(root, false);
+		const published = await archiveCancelledRun({ ...fixture.input, activeRunBytes: fixture.pointers.activeBytes, previousRunBytes: fixture.pointers.previousBytes });
+		expect(published.kind).toBe("published");
+		const paths = resolveCompletionPaths(root, fixture.input.runId);
+		expect(await stat(paths.archiveDirectory).then((value) => value.mode & 0o777)).toBe(0o500);
+		expect(await stat(paths.archiveRunPath).then((value) => value.mode & 0o777)).toBe(0o400);
+		expect(await stat(paths.archivePreviousRunPath).then((value) => value.mode & 0o777)).toBe(0o400);
+		expect(await stat(paths.archiveManifestPath).then((value) => value.mode & 0o777)).toBe(0o400);
+		expect(await stat(paths.archiveReportsDirectory).catch(() => undefined)).toBeUndefined();
+		const listed = await listTerminalArchives(root);
+		expect(listed.kind).toBe("loaded");
+		if (listed.kind !== "loaded") return;
+		expect(listed.archives).toHaveLength(1);
+		expect(listed.archives[0]?.kind).toBe("cancelled");
+
+		const journalPaths = resolveRunJournalPaths(root);
+		await writeFile(journalPaths.activePath, fixture.pointers.activeBytes);
+		await writeFile(journalPaths.previousPath, fixture.pointers.previousBytes);
+		const existing = await archiveCancelledRun({ ...fixture.input, activeRunBytes: fixture.pointers.activeBytes, previousRunBytes: fixture.pointers.previousBytes });
+		expect(existing.kind).toBe("existing-match");
+		expect(await stat(journalPaths.activePath).catch(() => undefined)).toBeUndefined();
+		expect(await stat(journalPaths.previousPath).catch(() => undefined)).toBeUndefined();
+	});
+
+	it("preserves cancelled pointers when a report changes and rejects unsafe archive contents", async () => {
+		const root = await mkdtemp(join(tmpdir(), "steward-t18-cancelled-adversary-"));
+		roots.push(root);
+		const fixture = await cancelledArchiveFixture(root, true);
+		if (!fixture.reportPath) throw new Error("Cancelled report fixture did not create a report");
+		const original = await readFile(fixture.reportPath);
+		await writeFile(fixture.reportPath, Buffer.from("changed cancelled report\n"));
+		const changed = await archiveCancelledRun({ ...fixture.input, activeRunBytes: fixture.pointers.activeBytes, previousRunBytes: fixture.pointers.previousBytes });
+		expect(changed.kind).toBe("storage-error");
+		expect(await readFile(resolveRunJournalPaths(root).activePath)).toEqual(fixture.pointers.activeBytes);
+		expect(await readFile(resolveRunJournalPaths(root).previousPath)).toEqual(fixture.pointers.previousBytes);
+		await writeFile(fixture.reportPath, original);
+		const published = await archiveCancelledRun({ ...fixture.input, activeRunBytes: fixture.pointers.activeBytes, previousRunBytes: fixture.pointers.previousBytes });
+		expect(published.kind).toBe("published");
+		const paths = resolveCompletionPaths(root, fixture.input.runId);
+		await writeFile(join(paths.archiveDirectory, "unexpected"), "unsafe\n");
+		expect((await listTerminalArchives(root)).kind).toBe("unavailable");
+		await rm(join(paths.archiveDirectory, "unexpected"), { force: true });
+		await symlink(paths.archiveRunPath, join(paths.archiveDirectory, "run-link"));
+		expect((await listTerminalArchives(root)).kind).toBe("unavailable");
+		await rm(join(paths.archiveDirectory, "run-link"), { force: true });
+		const manifest = JSON.parse((await readFile(paths.archiveManifestPath)).toString("utf8")) as Record<string, unknown>;
+		manifest.unknown = true;
+		await writeFile(paths.archiveManifestPath, `${JSON.stringify(manifest)}\n`);
+		expect((await listTerminalArchives(root)).kind).toBe("unavailable");
 	});
 });

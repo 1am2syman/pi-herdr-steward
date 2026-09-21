@@ -20,8 +20,8 @@ import { formatTaskFactInstruction } from "./reconciliation.ts";
 
 export const RUN_JOURNAL_SCHEMA_VERSION = 1 as const;
 
-export type RunStatus = "active" | "completing" | "completed";
-export type TaskPhase = "pending" | "building" | "reviewing" | "reworking" | "approved" | "integrating" | "completed";
+export type RunStatus = "active" | "completing" | "completed" | "cancelled";
+export type TaskPhase = "pending" | "building" | "reviewing" | "reworking" | "approved" | "integrating" | "completed" | "cancelled";
 export type TaskAttention = "none" | "blocked" | "waiting-external" | "suspected-stall" | "recovering" | "needs-user";
 export type TaskAttentionReason =
 	| "rework-preflight"
@@ -1115,6 +1115,80 @@ export type CompletionRecord =
 	| { phase: "archive-intended"; gate: AnyCompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent }
 	| { phase: "archived"; gate: AnyCompletionGateFacts; resources: Array<Extract<CompletionStopResource, { state: "acknowledged" }>>; archive: CompletionArchiveIntent; archivedAt: string };
 
+export type StewardOwnedPaneKind = "builder-root" | "reviewer" | "recovery";
+
+export interface StewardOwnedPane {
+	runId: string;
+	taskId: string;
+	attemptId: string;
+	role: CompletionAgentRole;
+	kind: StewardOwnedPaneKind;
+	workspaceId: string;
+	paneId: string;
+	terminalId: string;
+}
+
+export interface StewardOwnedWorktree {
+	runId: string;
+	taskId: string;
+	attemptId: string;
+	workspaceId: string;
+	paneId: string;
+	terminalId: string;
+	branch: string;
+	path: string;
+}
+
+export interface CancellationPriorTask {
+	taskId: string;
+	phase: Exclude<TaskPhase, "cancelled" | "completed">;
+	attention: TaskAttention;
+	attempts: Array<{ attemptId: string; state: "prepared" | "active" | "awaiting-report" }>;
+}
+
+export type CancellationAgentStop =
+	| { taskId: string; attemptId: string; role: CompletionAgentRole; state: "not-required"; reason: "never-started" | "already-missing" | "already-stopped" | "ownership-gap"; agent?: CompletionAgentIdentity }
+	| { taskId: string; attemptId: string; role: CompletionAgentRole; state: "intended"; agent: CompletionAgentIdentity; intendedAt: string }
+	| { taskId: string; attemptId: string; role: CompletionAgentRole; state: "acknowledged"; agent: CompletionAgentIdentity; intendedAt: string; acknowledgedAt: string; acknowledgement: { name: string; workspaceId: string; tabId: string; paneId: string; terminalId: string } }
+	| { taskId: string; attemptId: string; role: CompletionAgentRole; state: "failed" | "ambiguous"; agent: CompletionAgentIdentity; intendedAt: string; observedAt: string; diagnostic: string };
+
+export interface CancellationStopFailure {
+	taskId: string;
+	attemptId: string;
+	role: CompletionAgentRole;
+	state: "failed" | "ambiguous";
+	observedAt: string;
+	diagnostic: string;
+}
+
+export interface CancellationArchiveIntent {
+	intendedAt: string;
+	archiveDirectory: string;
+	runPath: string;
+	previousRunPath: string;
+	manifestPath: string;
+	activeJournalSha256: string;
+	previousJournalSha256: string;
+	reports: CompletionReportInventoryItem[];
+}
+
+interface CancellationFacts {
+	cancelledAt: string;
+	controllerSessionId: string;
+	controllerLease?: { sessionId: string; leaseId: string };
+	priorTasks: CancellationPriorTask[];
+	panes: StewardOwnedPane[];
+	worktrees: StewardOwnedWorktree[];
+	stops: CancellationAgentStop[];
+}
+
+export type CancellationRecord =
+	| (CancellationFacts & { phase: "stops-intended" })
+	| (CancellationFacts & { phase: "stops-incomplete"; failure: CancellationStopFailure })
+	| (CancellationFacts & { phase: "stops-complete" })
+	| (CancellationFacts & { phase: "archive-intended"; archive: CancellationArchiveIntent })
+	| (CancellationFacts & { phase: "archived"; archive: CancellationArchiveIntent; archivedAt: string });
+
 export type MonitorLifecycle = "working" | "blocked" | "idle" | "done" | "unknown" | "unavailable";
 
 export type MonitorDigest =
@@ -1256,6 +1330,7 @@ export interface RunRecord {
 	revisions?: RunRevisionRecord[];
 	finalVerificationExecution?: FinalVerificationExecution;
 	completion?: CompletionRecord;
+	cancellation?: CancellationRecord;
 	monitor?: MonitorCheckpoint;
 	monitors?: MonitorCheckpoint[];
 }
@@ -1852,7 +1927,7 @@ function validateReviewerEvidence(value: unknown, path: string): { value?: Revie
 	return { diagnostics: [diagnostic("invalid-task", "Reviewer evidence has invalid exact fields.", path)] };
 }
 
-function validateReviewerAttempt(value: Record<string, unknown>, path: string, task: TaskContract, base: IntegrationBase, allowedSpecificationHashes: ReadonlySet<string> = new Set([specificationHash(task)])): { value?: ReviewerAttemptRecord; diagnostics: RunDiagnostic[] } {
+function validateReviewerAttempt(value: Record<string, unknown>, path: string, task: TaskContract, base: IntegrationBase, allowedSpecificationHashes: ReadonlySet<string> = new Set([specificationHash(task)]), allowRunCancellation = false): { value?: ReviewerAttemptRecord; diagnostics: RunDiagnostic[] } {
 	const hasActivatedAt = Object.prototype.hasOwnProperty.call(value, "activatedAt");
 	const hasIntegrity = Object.prototype.hasOwnProperty.call(value, "integrity");
 	const hasEvidence = Object.prototype.hasOwnProperty.call(value, "evidence");
@@ -1862,7 +1937,7 @@ function validateReviewerAttempt(value: Record<string, unknown>, path: string, t
 	const hasSpecificationVersion = Object.prototype.hasOwnProperty.call(value, "specificationVersion");
 	const hasRevisionCancellation = Object.prototype.hasOwnProperty.call(value, "revisionCancellation");
 	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", ...(hasSpecificationVersion ? ["specificationVersion"] : []), "specificationHash", "assignmentPath", "reportPath", "evidenceDirectory", "subject", "independence", "worktree", "dispatch", ...(hasReplacement ? ["replacement"] : []), ...(hasRecovery ? ["recovery"] : []), ...(hasRepair ? ["reportRepair"] : []), ...(hasIntegrity ? ["integrity"] : []), ...(hasEvidence ? ["evidence"] : []), ...(hasRevisionCancellation ? ["revisionCancellation"] : [])];
-	if (!exactKeys(value, keys) || value.role !== "reviewer" || !safeIdentifier(value.id) || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded", "cancelled"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || ((value.state === "superseded" || value.state === "cancelled") && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || hasIntegrity || hasRepair || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && (!hasEvidence || !hasIntegrity)) || (value.state === "cancelled" && !hasRevisionCancellation) || (hasSpecificationVersion && (!Number.isSafeInteger(value.specificationVersion) || (value.specificationVersion as number) < 1))) return { diagnostics: [diagnostic("invalid-task", "Reviewer Attempt has invalid lifecycle fields.", path)] };
+	if (!exactKeys(value, keys) || value.role !== "reviewer" || !safeIdentifier(value.id) || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded", "cancelled"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || ((value.state === "superseded" || value.state === "cancelled") && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || hasIntegrity || hasRepair || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && (!hasEvidence || !hasIntegrity)) || (value.state === "cancelled" && !hasRevisionCancellation && !allowRunCancellation) || (hasSpecificationVersion && (!Number.isSafeInteger(value.specificationVersion) || (value.specificationVersion as number) < 1))) return { diagnostics: [diagnostic("invalid-task", "Reviewer Attempt has invalid lifecycle fields.", path)] };
 	const model = modelChoiceValue(value.actualModel, `${path}.actualModel`);
 	const dispatch = validateReviewerDispatch(value.dispatch, `${path}.dispatch`);
 	const replacement = hasReplacement ? validateAttemptReplacement(value.replacement, `${path}.replacement`, value.id as string) : { diagnostics: [] };
@@ -1879,12 +1954,12 @@ function validateReviewerAttempt(value: Record<string, unknown>, path: string, t
 	if (typeof value.specificationHash !== "string" || !allowedSpecificationHashes.has(value.specificationHash)) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt specificationHash must match a retained Task specification.", `${path}.specificationHash`));
 	if (base.kind !== "git") diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt requires the Builder Git integration base in this slice.", path));
 	if (!absolutePathValue(value.assignmentPath) || !absolutePathValue(value.reportPath) || !absolutePathValue(value.evidenceDirectory)) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt paths must be absolute.", path));
-	if (dispatch.value && ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !["prompted", "reconciled-active"].includes(dispatch.value.phase) || (value.state === "superseded" || value.state === "cancelled") && !["agent-intended", "assignment-intended", "prompt-intended", "prompted", "reconciled-active", "pane-intended", "replacement-pane-intended"].includes(dispatch.value.phase) || (value.state === "active" || value.state === "reported" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt || (value.state === "active" || value.state === "reported" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt || (value.state === "prepared" && ["prompted", "reconciled-active"].includes(dispatch.value.phase)))) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt state and dispatch phase disagree.", path));
+	if (dispatch.value && ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !["prompted", "reconciled-active"].includes(dispatch.value.phase) || (value.state === "superseded" || value.state === "cancelled") && !["agent-intended", "assignment-intended", "prompt-intended", "prompted", "reconciled-active", "pane-intended", "replacement-pane-intended"].includes(dispatch.value.phase) || (value.state === "active" || value.state === "reported" || (value.state === "cancelled" && cancellationPreviousState !== undefined && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt || (value.state === "active" || value.state === "reported" || (value.state === "cancelled" && cancellationPreviousState !== undefined && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt || (value.state === "prepared" && ["prompted", "reconciled-active"].includes(dispatch.value.phase)))) diagnostics.push(diagnostic("invalid-task", "Reviewer Attempt state and dispatch phase disagree.", path));
 	if (dispatch.value && value.state === "ended-error" && ["prompted", "reconciled-active"].includes(dispatch.value.phase) && (!hasActivatedAt || !canonicalTimestamp(value.activatedAt))) diagnostics.push(diagnostic("invalid-task", "An active-time ended-error Reviewer Attempt must retain its activation timestamp.", path));
 	if (reportRepair.value && (!["prompted", "reconciled-active"].includes(dispatch.value?.phase ?? "") || (value.state !== "active" && !(value.state === "reported" && reportRepair.value.phase === "requested")))) diagnostics.push(diagnostic("invalid-task", "Reviewer report repair must remain bound to the same prompted Reviewer; only a requested repair may be retained after valid finalization.", `${path}.reportRepair`));
 	if (value.state === "reported" && evidence.value?.phase !== "finalized") diagnostics.push(diagnostic("invalid-task", "Reported Reviewer Attempts require finalized evidence.", `${path}.evidence`));
 	if (value.state === "ended-error" && !recovery.value?.infrastructure) diagnostics.push(diagnostic("invalid-task", "Ended-error Reviewer Attempts require a typed infrastructure outcome.", `${path}.recovery`));
-	if (value.state === "cancelled" && cancellationPreviousState !== "prepared" && !hasActivatedAt) diagnostics.push(diagnostic("invalid-task", "A cancelled active Reviewer Attempt must retain its activation timestamp.", path));
+	if (value.state === "cancelled" && cancellationPreviousState !== undefined && cancellationPreviousState !== "prepared" && !hasActivatedAt) diagnostics.push(diagnostic("invalid-task", "A cancelled active Reviewer Attempt must retain its activation timestamp.", path));
 	if (value.state !== "cancelled" && hasRevisionCancellation) diagnostics.push(diagnostic("invalid-task", "Revision cancellation is only legal on cancelled Attempts.", `${path}.revisionCancellation`));
 	if (recovery.value?.infrastructure && evidence.value?.phase === "finalized") diagnostics.push(diagnostic("invalid-task", "Infrastructure outcomes cannot coexist with finalized Reviewer evidence.", `${path}.recovery`));
 	if (value.state === "reported" && integrity.value?.kind !== "preserved" && integrity.value?.kind !== "violated") diagnostics.push(diagnostic("invalid-task", "Reported Reviewer Attempts require an integrity result.", `${path}.integrity`));
@@ -1917,7 +1992,7 @@ function validateReviewerIntegrity(value: unknown, path: string): { value?: Revi
 	return { diagnostics: [diagnostic("invalid-task", "Reviewer integrity has invalid exact fields.", path)] };
 }
 
-function validateAttempt(value: unknown, path: string, task: TaskContract, base: IntegrationBase, allowedSpecificationHashes: ReadonlySet<string> = new Set([specificationHash(task)])): { value?: AttemptRecord; diagnostics: RunDiagnostic[] } {
+function validateAttempt(value: unknown, path: string, task: TaskContract, base: IntegrationBase, allowedSpecificationHashes: ReadonlySet<string> = new Set([specificationHash(task)]), allowRunCancellation = false): { value?: AttemptRecord; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value)) return { diagnostics: [diagnostic("invalid-task", "Attempt must be an object.", path)] };
 	const hasActivatedAt = Object.prototype.hasOwnProperty.call(value, "activatedAt");
 	const hasEvidence = Object.prototype.hasOwnProperty.call(value, "evidence");
@@ -1926,7 +2001,7 @@ function validateAttempt(value: unknown, path: string, task: TaskContract, base:
 	const hasSpecificationVersion = Object.prototype.hasOwnProperty.call(value, "specificationVersion");
 	const hasRevisionCancellation = Object.prototype.hasOwnProperty.call(value, "revisionCancellation");
 	const keys = ["id", "role", "state", "preparedAt", ...(hasActivatedAt ? ["activatedAt"] : []), "actualModel", ...(hasSpecificationVersion ? ["specificationVersion"] : []), "specificationHash", "baseRevision", "assignmentPath", "reportPath", "evidenceDirectory", "dispatch", ...(hasReplacement ? ["replacement"] : []), ...(hasRecovery ? ["recovery"] : []), ...(hasEvidence ? ["evidence"] : []), ...(hasRevisionCancellation ? ["revisionCancellation"] : [])];
-	if (!exactKeys(value, keys) || !safeIdentifier(value.id) || value.role !== "builder" || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded", "cancelled"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || ((value.state === "superseded" || value.state === "cancelled") && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && !hasEvidence) || (value.state === "cancelled" && !hasRevisionCancellation) || (hasSpecificationVersion && (!Number.isSafeInteger(value.specificationVersion) || (value.specificationVersion as number) < 1))) {
+	if (!exactKeys(value, keys) || !safeIdentifier(value.id) || value.role !== "builder" || !["prepared", "active", "awaiting-report", "reported", "ended-error", "superseded", "cancelled"].includes(value.state as string) || !canonicalTimestamp(value.preparedAt) || ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !canonicalTimestamp(value.activatedAt)) || ((value.state === "superseded" || value.state === "cancelled") && hasActivatedAt && !canonicalTimestamp(value.activatedAt)) || (value.state === "prepared" && (hasActivatedAt || (hasEvidence && isRecord(value.evidence) && value.evidence.phase !== "rejected"))) || (value.state === "active" && !hasActivatedAt) || (value.state === "awaiting-report" && (!hasActivatedAt || !hasRecovery || (hasEvidence && (!isRecord(value.evidence) || value.evidence.phase !== "rejected")))) || (value.state === "reported" && !hasEvidence) || (value.state === "cancelled" && !hasRevisionCancellation && !allowRunCancellation) || (hasSpecificationVersion && (!Number.isSafeInteger(value.specificationVersion) || (value.specificationVersion as number) < 1))) {
 		return { diagnostics: [diagnostic("invalid-task", "Attempt has invalid lifecycle fields.", path)] };
 	}
 	const model = modelChoiceValue(value.actualModel, `${path}.actualModel`);
@@ -1943,14 +2018,14 @@ function validateAttempt(value: unknown, path: string, task: TaskContract, base:
 	if (dispatch.value) {
 		if ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported") && !["prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Active, awaiting-report, or reported Attempts require a proven dispatch.", path));
 		if ((value.state === "superseded" || value.state === "cancelled") && !["worktree-intended", "replacement-pane-intended", "agent-intended", "assignment-intended", "prompt-intended", "prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Historical terminal Attempts require a retained dispatch identity.", path));
-		if ((value.state === "active" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Active, reported, or historical prompted Attempts require a matching activation timestamp.", path));
-		if ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error" || (value.state === "cancelled" && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Reconciled Attempts require a matching reconciliation timestamp.", path));
+		if ((value.state === "active" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error" || (value.state === "cancelled" && cancellationPreviousState !== undefined && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "prompted" && value.activatedAt !== dispatch.value.promptedAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Active, reported, or historical prompted Attempts require a matching activation timestamp.", path));
+		if ((value.state === "active" || value.state === "awaiting-report" || value.state === "reported" || value.state === "superseded" || value.state === "ended-error" || (value.state === "cancelled" && cancellationPreviousState !== undefined && cancellationPreviousState !== "prepared")) && dispatch.value.phase === "reconciled-active" && value.activatedAt !== dispatch.value.reconciledAt && value.state !== "ended-error") diagnostics.push(diagnostic("invalid-task", "Reconciled Attempts require a matching reconciliation timestamp.", path));
 		if (value.state === "prepared" && ["prompted", "reconciled-active"].includes(dispatch.value.phase)) diagnostics.push(diagnostic("invalid-task", "Prepared Attempts cannot have a proven dispatch.", path));
 		if (value.state === "ended-error" && ["prompted", "reconciled-active"].includes(dispatch.value.phase) && (!hasActivatedAt || !canonicalTimestamp(value.activatedAt))) diagnostics.push(diagnostic("invalid-task", "An active-time ended-error Attempt must retain its activation timestamp.", path));
 	}
 	if (value.state === "reported" && evidence.value?.phase !== "finalized") diagnostics.push(diagnostic("invalid-task", "Reported Attempts require finalized Builder evidence.", `${path}.evidence`));
 	if (value.state === "ended-error" && !recovery.value?.infrastructure) diagnostics.push(diagnostic("invalid-task", "Ended-error Attempts require a typed infrastructure outcome.", `${path}.recovery`));
-	if (value.state === "cancelled" && cancellationPreviousState !== "prepared" && !hasActivatedAt) diagnostics.push(diagnostic("invalid-task", "A cancelled active Attempt must retain its activation timestamp.", path));
+	if (value.state === "cancelled" && cancellationPreviousState !== undefined && cancellationPreviousState !== "prepared" && !hasActivatedAt) diagnostics.push(diagnostic("invalid-task", "A cancelled active Attempt must retain its activation timestamp.", path));
 	if (value.state !== "cancelled" && hasRevisionCancellation) diagnostics.push(diagnostic("invalid-task", "Revision cancellation is only legal on cancelled Attempts.", `${path}.revisionCancellation`));
 	if (recovery.value?.infrastructure && evidence.value?.phase === "finalized") diagnostics.push(diagnostic("invalid-task", "Infrastructure outcomes cannot coexist with finalized Builder evidence.", `${path}.recovery`));
 	if (value.state === "active" && evidence.value?.phase === "finalized") diagnostics.push(diagnostic("invalid-task", "Active Attempts cannot contain finalized Builder evidence.", `${path}.evidence`));
@@ -2302,6 +2377,33 @@ function cloneCompletion(completion: CompletionRecord): CompletionRecord {
 	if (completion.phase === "stops-complete") return { phase: completion.phase, gate, resources: completion.resources.map((resource) => cloneCompletionResource(resource) as Extract<CompletionStopResource, { state: "acknowledged" }>) };
 	if (completion.phase === "archive-intended") return { phase: completion.phase, gate, resources: completion.resources.map((resource) => cloneCompletionResource(resource) as Extract<CompletionStopResource, { state: "acknowledged" }>), archive: cloneCompletionArchive(completion.archive) };
 	return { phase: completion.phase, gate, resources: completion.resources.map((resource) => cloneCompletionResource(resource) as Extract<CompletionStopResource, { state: "acknowledged" }>), archive: cloneCompletionArchive(completion.archive), archivedAt: completion.archivedAt };
+}
+
+function cloneCancellationStop(stop: CancellationAgentStop): CancellationAgentStop {
+	if (stop.state === "not-required") return { ...stop, ...(stop.agent ? { agent: { ...stop.agent } } : {}) };
+	if (stop.state === "intended") return { ...stop, agent: { ...stop.agent } };
+	if (stop.state === "acknowledged") return { ...stop, agent: { ...stop.agent }, acknowledgement: { ...stop.acknowledgement } };
+	return { ...stop, agent: { ...stop.agent } };
+}
+
+function cloneCancellationArchive(archive: CancellationArchiveIntent): CancellationArchiveIntent {
+	return { ...archive, reports: archive.reports.map((report) => ({ ...report })) };
+}
+
+function cloneCancellation(cancellation: CancellationRecord): CancellationRecord {
+	const base = {
+		cancelledAt: cancellation.cancelledAt,
+		controllerSessionId: cancellation.controllerSessionId,
+		...(cancellation.controllerLease ? { controllerLease: { ...cancellation.controllerLease } } : {}),
+		priorTasks: cancellation.priorTasks.map((task) => ({ ...task, attempts: task.attempts.map((attempt) => ({ ...attempt })) })),
+		panes: cancellation.panes.map((pane) => ({ ...pane })),
+		worktrees: cancellation.worktrees.map((worktree) => ({ ...worktree })),
+		stops: cancellation.stops.map(cloneCancellationStop),
+	};
+	if (cancellation.phase === "stops-incomplete") return { ...base, phase: cancellation.phase, failure: { ...cancellation.failure } };
+	if (cancellation.phase === "archive-intended") return { ...base, phase: cancellation.phase, archive: cloneCancellationArchive(cancellation.archive) };
+	if (cancellation.phase === "archived") return { ...base, phase: cancellation.phase, archive: cloneCancellationArchive(cancellation.archive), archivedAt: cancellation.archivedAt };
+	return { ...base, phase: cancellation.phase };
 }
 
 function cloneMonitorDigest(digest: MonitorDigest): MonitorDigest {
@@ -2748,8 +2850,8 @@ function validateCompletionFailure(value: unknown, path: string): { value?: Comp
 	return resource.value && resource.diagnostics.length === 0 ? { value: { state: value.state, resource: resource.value, observedAt: value.observedAt, diagnostic: value.diagnostic }, diagnostics: [] } : { diagnostics: resource.diagnostics };
 }
 
-function validateReportInventory(value: unknown, path: string): { value?: CompletionReportInventoryItem[]; diagnostics: RunDiagnostic[] } {
-	if (!Array.isArray(value) || value.length === 0 || value.length > 24) return { diagnostics: [diagnostic("invalid-run", "Completion report inventory must be a bounded non-empty array.", path)] };
+function validateReportInventory(value: unknown, path: string, allowEmpty = false): { value?: CompletionReportInventoryItem[]; diagnostics: RunDiagnostic[] } {
+	if (!Array.isArray(value) || (!allowEmpty && value.length === 0) || value.length > 24) return { diagnostics: [diagnostic("invalid-run", `Completion report inventory must be a bounded ${allowEmpty ? "array" : "non-empty array"}.`, path)] };
 	const inventory: CompletionReportInventoryItem[] = [];
 	const diagnostics: RunDiagnostic[] = [];
 	for (let index = 0; index < value.length; index += 1) {
@@ -2805,6 +2907,92 @@ function validateCompletion(value: unknown, path: string): { value?: CompletionR
 		return { diagnostics: [...resources.flatMap((result) => result.diagnostics), ...archive.diagnostics] };
 	}
 	return { diagnostics: [diagnostic("invalid-run", "Completion has invalid exact phase fields.", path)] };
+}
+
+function validateCancellationIdentity(value: unknown, path: string): { value?: CompletionAgentIdentity; diagnostics: RunDiagnostic[] } {
+	return validateCompletionAgentIdentity(value, path);
+}
+
+function validateOwnedPane(value: unknown, path: string, runId: string): { value?: StewardOwnedPane; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["runId", "taskId", "attemptId", "role", "kind", "workspaceId", "paneId", "terminalId"]) || value.runId !== runId || !safeIdentifier(value.taskId) || !safeIdentifier(value.attemptId) || (value.role !== "builder" && value.role !== "reviewer") || !["builder-root", "reviewer", "recovery"].includes(value.kind as string) || !trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId)) return { diagnostics: [diagnostic("invalid-run", "Cancellation pane ownership has invalid exact fields.", path)] };
+	return { value: { runId, taskId: value.taskId, attemptId: value.attemptId, role: value.role, kind: value.kind as StewardOwnedPaneKind, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId }, diagnostics: [] };
+}
+
+function validateOwnedWorktree(value: unknown, path: string, runId: string): { value?: StewardOwnedWorktree; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["runId", "taskId", "attemptId", "workspaceId", "paneId", "terminalId", "branch", "path"]) || value.runId !== runId || !safeIdentifier(value.taskId) || !safeIdentifier(value.attemptId) || !trimmedString(value.workspaceId) || !trimmedString(value.paneId) || !trimmedString(value.terminalId) || !safeBranch(value.branch) || !absolutePathValue(value.path)) return { diagnostics: [diagnostic("invalid-run", "Cancellation worktree ownership has invalid exact fields.", path)] };
+	return { value: { runId, taskId: value.taskId, attemptId: value.attemptId, workspaceId: value.workspaceId, paneId: value.paneId, terminalId: value.terminalId, branch: value.branch, path: value.path }, diagnostics: [] };
+}
+
+function validateCancellationStop(value: unknown, path: string): { value?: CancellationAgentStop; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["taskId", "attemptId", "role", "state", ...(value.state === "not-required" && value.agent === undefined ? ["reason"] : value.state === "not-required" ? ["reason", "agent"] : value.state === "intended" ? ["agent", "intendedAt"] : value.state === "acknowledged" ? ["agent", "intendedAt", "acknowledgedAt", "acknowledgement"] : ["agent", "intendedAt", "observedAt", "diagnostic"])] ) || !safeIdentifier(value.taskId) || !safeIdentifier(value.attemptId) || (value.role !== "builder" && value.role !== "reviewer") || typeof value.state !== "string") return { diagnostics: [diagnostic("invalid-run", "Cancellation stop record has invalid exact fields.", path)] };
+	const base = { taskId: value.taskId, attemptId: value.attemptId, role: value.role as CompletionAgentRole };
+	if (value.state === "not-required") {
+		if (value.reason !== "never-started" && value.reason !== "already-missing" && value.reason !== "already-stopped" && value.reason !== "ownership-gap") return { diagnostics: [diagnostic("invalid-run", "Cancellation not-required stop has an invalid reason.", path)] };
+		if (value.agent !== undefined) { const identity = validateCancellationIdentity(value.agent, `${path}.agent`); if (!identity.value || identity.diagnostics.length > 0) return { diagnostics: identity.diagnostics }; return { value: { ...base, state: "not-required", reason: value.reason, agent: identity.value }, diagnostics: [] }; }
+		return { value: { ...base, state: "not-required", reason: value.reason }, diagnostics: [] };
+	}
+	const identity = validateCancellationIdentity(value.agent, `${path}.agent`);
+	if (!identity.value || identity.diagnostics.length > 0) return { diagnostics: identity.diagnostics };
+	if (value.state === "intended" && canonicalTimestamp(value.intendedAt)) return { value: { ...base, state: "intended", agent: identity.value, intendedAt: value.intendedAt }, diagnostics: [] };
+	if (value.state === "acknowledged" && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.acknowledgedAt) && value.acknowledgedAt >= value.intendedAt && isRecord(value.acknowledgement) && exactKeys(value.acknowledgement, ["name", "workspaceId", "tabId", "paneId", "terminalId"]) && value.acknowledgement.name === identity.value.agentName && value.acknowledgement.workspaceId === identity.value.workspaceId && value.acknowledgement.paneId === identity.value.paneId && value.acknowledgement.terminalId === identity.value.terminalId && trimmedString(value.acknowledgement.tabId)) {
+		return { value: { ...base, state: "acknowledged", agent: identity.value, intendedAt: value.intendedAt, acknowledgedAt: value.acknowledgedAt, acknowledgement: { name: value.acknowledgement.name as string, workspaceId: value.acknowledgement.workspaceId as string, tabId: value.acknowledgement.tabId as string, paneId: value.acknowledgement.paneId as string, terminalId: value.acknowledgement.terminalId as string } }, diagnostics: [] };
+	}
+	if ((value.state === "failed" || value.state === "ambiguous") && canonicalTimestamp(value.intendedAt) && canonicalTimestamp(value.observedAt) && value.observedAt >= value.intendedAt && boundedText(value.diagnostic, 2_000)) return { value: { ...base, state: value.state, agent: identity.value, intendedAt: value.intendedAt, observedAt: value.observedAt, diagnostic: value.diagnostic }, diagnostics: [] };
+	return { diagnostics: [diagnostic("invalid-run", "Cancellation stop record has invalid exact lifecycle fields.", path)] };
+}
+
+function validateCancellationArchive(value: unknown, path: string, runId: string): { value?: CancellationArchiveIntent; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || !exactKeys(value, ["intendedAt", "archiveDirectory", "runPath", "previousRunPath", "manifestPath", "activeJournalSha256", "previousJournalSha256", "reports"]) || !canonicalTimestamp(value.intendedAt) || !absolutePathValue(value.archiveDirectory) || !absolutePathValue(value.runPath) || !absolutePathValue(value.previousRunPath) || !absolutePathValue(value.manifestPath) || !value.archiveDirectory.endsWith(`/archives/${runId}`) || value.runPath !== `${value.archiveDirectory}/run.json` || value.previousRunPath !== `${value.archiveDirectory}/previous-run.json` || value.manifestPath !== `${value.archiveDirectory}/manifest.json` || typeof value.activeJournalSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.activeJournalSha256) || typeof value.previousJournalSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.previousJournalSha256)) return { diagnostics: [diagnostic("invalid-run", "Cancellation archive intent has invalid deterministic paths or hashes.", path)] };
+	const reports = validateReportInventory(value.reports, `${path}.reports`, true);
+	return reports.value && reports.diagnostics.length === 0 ? { value: { intendedAt: value.intendedAt, archiveDirectory: value.archiveDirectory, runPath: value.runPath, previousRunPath: value.previousRunPath, manifestPath: value.manifestPath, activeJournalSha256: value.activeJournalSha256, previousJournalSha256: value.previousJournalSha256, reports: reports.value }, diagnostics: [] } : { diagnostics: reports.diagnostics };
+}
+
+function validateCancellation(value: unknown, path: string, runId: string): { value?: CancellationRecord; diagnostics: RunDiagnostic[] } {
+	if (!isRecord(value) || typeof value.phase !== "string" || !canonicalTimestamp(value.cancelledAt) || !trimmedString(value.controllerSessionId) || !Array.isArray(value.priorTasks) || !Array.isArray(value.panes) || !Array.isArray(value.worktrees) || !Array.isArray(value.stops)) return { diagnostics: [diagnostic("invalid-run", "Cancellation has invalid base facts.", path)] };
+	const diagnostics: RunDiagnostic[] = [];
+	const priorTasks: CancellationPriorTask[] = [];
+	for (let index = 0; index < value.priorTasks.length; index += 1) {
+		const item = value.priorTasks[index];
+		if (!isRecord(item) || !exactKeys(item, ["taskId", "phase", "attention", "attempts"]) || !safeIdentifier(item.taskId) || !["pending", "building", "reviewing", "reworking", "approved", "integrating"].includes(item.phase as string) || !["none", "blocked", "waiting-external", "suspected-stall", "recovering", "needs-user"].includes(item.attention as string) || !Array.isArray(item.attempts)) { diagnostics.push(diagnostic("invalid-run", "Cancellation prior Task fact is invalid.", `${path}.priorTasks[${index}]`)); continue; }
+		const attempts = item.attempts.filter((attempt): attempt is Record<string, unknown> => isRecord(attempt));
+		if (attempts.length !== item.attempts.length || attempts.some((attempt) => !exactKeys(attempt, ["attemptId", "state"]) || !safeIdentifier(attempt.attemptId) || !["prepared", "active", "awaiting-report"].includes(attempt.state as string))) diagnostics.push(diagnostic("invalid-run", "Cancellation prior Attempt facts are invalid.", `${path}.priorTasks[${index}].attempts`));
+		priorTasks.push({ taskId: item.taskId, phase: item.phase as Exclude<TaskPhase, "cancelled" | "completed">, attention: item.attention as TaskAttention, attempts: attempts.map((attempt) => ({ attemptId: attempt.attemptId as string, state: attempt.state as "prepared" | "active" | "awaiting-report" })) });
+	}
+	const panes: StewardOwnedPane[] = [];
+	for (let index = 0; index < value.panes.length; index += 1) { const result = validateOwnedPane(value.panes[index], `${path}.panes[${index}]`, runId); if (result.value) panes.push(result.value); diagnostics.push(...result.diagnostics); }
+	const worktrees: StewardOwnedWorktree[] = [];
+	for (let index = 0; index < value.worktrees.length; index += 1) { const result = validateOwnedWorktree(value.worktrees[index], `${path}.worktrees[${index}]`, runId); if (result.value) worktrees.push(result.value); diagnostics.push(...result.diagnostics); }
+	const stops: CancellationAgentStop[] = [];
+	for (let index = 0; index < value.stops.length; index += 1) { const result = validateCancellationStop(value.stops[index], `${path}.stops[${index}]`); if (result.value) stops.push(result.value); diagnostics.push(...result.diagnostics); }
+	const stopKeys = stops.map((stop) => `${stop.taskId}/${stop.attemptId}/${stop.role}`);
+	const paneKeys = panes.map((pane) => `${pane.workspaceId}/${pane.paneId}`);
+	const terminalKeys = panes.map((pane) => `${pane.workspaceId}/${pane.terminalId}`);
+	const worktreePathKeys = worktrees.map((worktree) => worktree.path);
+	const worktreeBranchKeys = worktrees.map((worktree) => worktree.branch);
+	const worktreeRootPaneKeys = worktrees.map((worktree) => `${worktree.workspaceId}/${worktree.paneId}`);
+	if (new Set(stopKeys).size !== stopKeys.length || new Set(paneKeys).size !== panes.length || new Set(terminalKeys).size !== panes.length || new Set(worktreePathKeys).size !== worktrees.length || new Set(worktreeBranchKeys).size !== worktrees.length || new Set(worktreeRootPaneKeys).size !== worktrees.length || panes.some((pane) => (pane.role === "builder" && pane.kind !== "builder-root") || (pane.role === "reviewer" && pane.kind === "builder-root"))) diagnostics.push(diagnostic("invalid-run", "Cancellation ownership identities must be unique and role-consistent.", path));
+	const controllerLease = isRecord(value.controllerLease) ? value.controllerLease : undefined;
+	if (value.controllerLease !== undefined && (!controllerLease || !exactKeys(controllerLease, ["sessionId", "leaseId"]) || controllerLease.sessionId !== value.controllerSessionId || !trimmedString(controllerLease.leaseId))) diagnostics.push(diagnostic("invalid-run", "Cancellation Controller lease identity is invalid.", `${path}.controllerLease`));
+	const base = { cancelledAt: value.cancelledAt, controllerSessionId: value.controllerSessionId, ...(controllerLease ? { controllerLease: { sessionId: controllerLease.sessionId as string, leaseId: controllerLease.leaseId as string } } : {}), priorTasks, panes, worktrees, stops };
+	const archive = value.phase === "archive-intended" || value.phase === "archived" ? validateCancellationArchive(value.archive, `${path}.archive`, runId) : { diagnostics: [] };
+	diagnostics.push(...archive.diagnostics);
+	if (value.phase === "stops-intended" && exactKeys(value, ["phase", "cancelledAt", "controllerSessionId", ...(value.controllerLease ? ["controllerLease"] : []), "priorTasks", "panes", "worktrees", "stops"]) && stops.every((stop) => stop.state === "intended" || stop.state === "acknowledged" || stop.state === "not-required")) return diagnostics.length === 0 ? { value: { ...base, phase: value.phase }, diagnostics: [] } : { diagnostics };
+	if (value.phase === "stops-incomplete" && exactKeys(value, ["phase", "cancelledAt", "controllerSessionId", ...(value.controllerLease ? ["controllerLease"] : []), "priorTasks", "panes", "worktrees", "stops", "failure"]) && stops.every((stop) => ["intended", "not-required", "acknowledged", "failed", "ambiguous"].includes(stop.state)) && isRecord(value.failure) && exactKeys(value.failure, ["taskId", "attemptId", "role", "state", "observedAt", "diagnostic"]) && safeIdentifier(value.failure.taskId) && safeIdentifier(value.failure.attemptId) && (value.failure.role === "builder" || value.failure.role === "reviewer") && (value.failure.state === "failed" || value.failure.state === "ambiguous") && canonicalTimestamp(value.failure.observedAt) && boundedText(value.failure.diagnostic, 2_000)) {
+		const failureKey = `${value.failure.taskId}/${value.failure.attemptId}/${value.failure.role}`;
+		const failureIndex = stopKeys.indexOf(failureKey);
+		if (failureIndex < 0 || stops[failureIndex]?.state !== value.failure.state || stops.slice(0, failureIndex).some((stop) => stop.state !== "acknowledged" && stop.state !== "not-required") || stops.slice(failureIndex + 1).some((stop) => stop.state === "acknowledged" || stop.state === "failed" || stop.state === "ambiguous")) diagnostics.push(diagnostic("invalid-run", "Cancellation stop failure must identify the first unresolved stop and retain later stops without claiming acknowledgement.", `${path}.failure`));
+		return diagnostics.length === 0 ? { value: { ...base, phase: value.phase, failure: { taskId: value.failure.taskId, attemptId: value.failure.attemptId, role: value.failure.role, state: value.failure.state, observedAt: value.failure.observedAt, diagnostic: value.failure.diagnostic } }, diagnostics: [] } : { diagnostics };
+	}
+	if (value.phase === "stops-complete" && exactKeys(value, ["phase", "cancelledAt", "controllerSessionId", ...(value.controllerLease ? ["controllerLease"] : []), "priorTasks", "panes", "worktrees", "stops"]) && stops.every((stop) => stop.state === "acknowledged" || stop.state === "not-required")) return diagnostics.length === 0 ? { value: { ...base, phase: value.phase }, diagnostics: [] } : { diagnostics };
+	if (value.phase === "archive-intended" && exactKeys(value, ["phase", "cancelledAt", "controllerSessionId", ...(value.controllerLease ? ["controllerLease"] : []), "priorTasks", "panes", "worktrees", "stops", "archive"]) && stops.every((stop) => stop.state === "acknowledged" || stop.state === "not-required") && archive.value) return diagnostics.length === 0 ? { value: { ...base, phase: value.phase, archive: archive.value }, diagnostics: [] } : { diagnostics };
+	if (value.phase === "archived" && exactKeys(value, ["phase", "cancelledAt", "controllerSessionId", ...(value.controllerLease ? ["controllerLease"] : []), "priorTasks", "panes", "worktrees", "stops", "archive", "archivedAt"]) && canonicalTimestamp(value.archivedAt) && value.archivedAt >= value.cancelledAt && stops.every((stop) => stop.state === "acknowledged" || stop.state === "not-required") && archive.value) return diagnostics.length === 0 ? { value: { ...base, phase: value.phase, archive: archive.value, archivedAt: value.archivedAt }, diagnostics: [] } : { diagnostics };
+	return { diagnostics: [...diagnostics, diagnostic("invalid-run", "Cancellation has invalid exact phase fields.", path)] };
+}
+
+function cancellationDispatchIdentity(attempt: AttemptRecord): CompletionAgentIdentity | undefined {
+	const dispatch = attempt.dispatch as unknown as Record<string, unknown>;
+	if (!["agentName", "workspaceId", "paneId", "terminalId"].every((key) => typeof dispatch[key] === "string")) return undefined;
+	return { role: attempt.role, agentName: dispatch.agentName as string, workspaceId: dispatch.workspaceId as string, paneId: dispatch.paneId as string, terminalId: dispatch.terminalId as string };
 }
 
 function isReworkDispatch(value: BuilderDispatchRecord): value is ReworkDispatchRecord {
@@ -3211,15 +3399,17 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	}
 	const hasFinalVerificationExecution = Object.prototype.hasOwnProperty.call(value, "finalVerificationExecution");
 	const hasCompletion = Object.prototype.hasOwnProperty.call(value, "completion");
+	const hasCancellation = Object.prototype.hasOwnProperty.call(value, "cancellation");
 	const hasMonitor = Object.prototype.hasOwnProperty.call(value, "monitor");
 	const hasMonitors = Object.prototype.hasOwnProperty.call(value, "monitors");
 	const hasControllerLease = Object.prototype.hasOwnProperty.call(value, "controllerLease");
 	const hasRevisions = Object.prototype.hasOwnProperty.call(value, "revisions");
 	if (hasMonitor && hasMonitors) return { diagnostics: [diagnostic("invalid-run", "Run cannot contain both legacy monitor and multi-Task monitors.", path)] };
-	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", ...(hasControllerLease ? ["controllerLease"] : []), "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasRevisions ? ["revisions"] : []), ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasMonitor ? ["monitor"] : []), ...(hasMonitors ? ["monitors"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
+	if (!exactKeys(value, ["id", "status", "declaredOutcome", "createdAt", "updatedAt", "controllerSessionId", ...(hasControllerLease ? ["controllerLease"] : []), "integrationBase", "tasks", "modelPlan", "effectiveSettings", "finalVerification", ...(hasRevisions ? ["revisions"] : []), ...(hasFinalVerificationExecution ? ["finalVerificationExecution"] : []), ...(hasCompletion ? ["completion"] : []), ...(hasCancellation ? ["cancellation"] : []), ...(hasMonitor ? ["monitor"] : []), ...(hasMonitors ? ["monitors"] : [])])) return { diagnostics: [diagnostic("invalid-run", "Run contains unknown or missing keys.", path)] };
 	const diagnostics: RunDiagnostic[] = [];
+	const cancelledRun = value.status === "cancelled" && hasCancellation;
 	if (!safeIdentifier(value.id) || !String(value.id).startsWith("run-")) diagnostics.push(diagnostic("invalid-run", "Run id must be a filesystem-safe run identifier.", `${path}.id`));
-	if (value.status !== "active" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "Run status must be active, completing, or completed.", `${path}.status`));
+	if (value.status !== "active" && value.status !== "completing" && value.status !== "completed" && value.status !== "cancelled") diagnostics.push(diagnostic("invalid-run", "Run status must be active, completing, completed, or cancelled.", `${path}.status`));
 	if (value.status === "completed" && options.atActivePath) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots are not legal in active-run.json.", `${path}.status`));
 	if (!trimmedString(value.declaredOutcome)) diagnostics.push(diagnostic("invalid-run", "declaredOutcome must be non-empty.", `${path}.declaredOutcome`));
 	if (!canonicalTimestamp(value.createdAt) || !canonicalTimestamp(value.updatedAt) || value.createdAt > value.updatedAt) diagnostics.push(diagnostic("invalid-run", "Run timestamps must be canonical UTC ISO values in order.", `${path}.createdAt`));
@@ -3319,7 +3509,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		if (!Number.isSafeInteger(task.specificationVersion) || (task.specificationVersion as number) < 1) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationVersion must be a positive safe integer.", `${taskPath}.specificationVersion`));
 		if (typeof task.specificationHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(task.specificationHash) || (contractResult.value && specificationHash(contractResult.value) !== task.specificationHash)) taskDiagnostics.push(diagnostic("invalid-task", "Task specificationHash does not match its exact contract.", `${taskPath}.specificationHash`));
 		const settingsLimit = isRecord(value.effectiveSettings) && Number.isSafeInteger(value.effectiveSettings.reworkCycleLimit) ? value.effectiveSettings.reworkCycleLimit as number : 5;
-		if (!["pending", "building", "reviewing", "reworking", "approved", "integrating", "completed"].includes(task.phase as string) || !["none", "blocked", "waiting-external", "suspected-stall", "recovering", "needs-user"].includes(task.attention as string) || !Array.isArray(task.attempts) || !Number.isSafeInteger(task.reworkCycles) || (task.reworkCycles as number) < 0 || (task.reworkCycles as number) > 5 || (task.reworkCycles as number) > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Task has an invalid phase, attention, Attempt sequence, or bounded rework counter.", taskPath));
+		if (!["pending", "building", "reviewing", "reworking", "approved", "integrating", "completed", "cancelled"].includes(task.phase as string) || !["none", "blocked", "waiting-external", "suspected-stall", "recovering", "needs-user"].includes(task.attention as string) || !Array.isArray(task.attempts) || !Number.isSafeInteger(task.reworkCycles) || (task.reworkCycles as number) < 0 || (task.reworkCycles as number) > 5 || (task.reworkCycles as number) > settingsLimit) taskDiagnostics.push(diagnostic("invalid-task", "Task has an invalid phase, attention, Attempt sequence, or bounded rework counter.", taskPath));
 		if (hasAttentionDiagnostic && (!boundedText(task.attentionDiagnostic, 2_000) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionDiagnostic must be bounded and accompany durable attention.", `${taskPath}.attentionDiagnostic`));
 		if (hasAttentionReason && (!["rework-preflight", "protected-evidence", "rework-exhausted", "review-approval-required", "integration-preflight", "integration-failed", "integration-ambiguous", "final-verification-unexecutable", "final-verification-failed", "final-verification-ambiguous", "final-verification-ownership-unclear", "verification-dirtied-checkout", "agent-stop-failed", "archive-failed", "reconciliation-blocked-question", "reconciliation-report-missing", "reconciliation-live-unclear", "reconciliation-agent-missing", "silence-passive-inspection", "external-process-live", "external-process-grace", "silence-effect-ambiguous", "silence-recovery-exhausted", "transient-infrastructure-recovery", "transient-stop-ambiguous", "transient-fallback-unavailable", "transient-retries-exhausted", "revision-stop-ambiguous"].includes(task.attentionReason as string) || task.attention === "none")) taskDiagnostics.push(diagnostic("invalid-task", "Task attentionReason must be a recognized durable attention reason.", `${taskPath}.attentionReason`));
 		const attempts: AttemptRecord[] = [];
@@ -3332,8 +3522,8 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 				const hasAttemptSpecificationVersion = isRecord(rawAttempt) && Object.prototype.hasOwnProperty.call(rawAttempt, "specificationVersion");
 				const attemptResult = contractResult.value && base.value
 					? isRecord(rawAttempt) && rawAttempt.role === "reviewer"
-						? validateReviewerAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value, new Set([specificationHash(contractResult.value), ...retainedSpecificationHashes(contractResult.value.id)]))
-						: validateAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value, new Set([specificationHash(contractResult.value), ...retainedSpecificationHashes(contractResult.value.id)]))
+					? validateReviewerAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value, new Set([specificationHash(contractResult.value), ...retainedSpecificationHashes(contractResult.value.id)]), value.status === "cancelled")
+					: validateAttempt(rawAttempt, `${taskPath}.attempts[${attemptIndex}]`, contractResult.value, base.value, new Set([specificationHash(contractResult.value), ...retainedSpecificationHashes(contractResult.value.id)]), value.status === "cancelled")
 					: { diagnostics: [diagnostic("invalid-task", "Attempt cannot be validated without a valid Task and integration base.", `${taskPath}.attempts[${attemptIndex}]`)] };
 				if (attemptResult.value) attempts.push(attemptResult.value);
 				taskDiagnostics.push(...attemptResult.diagnostics);
@@ -3376,6 +3566,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		const latest = currentAttempts[currentAttempts.length - 1];
 		const latestReviewer = latest?.role === "reviewer" ? latest : undefined;
 		const latestBuilder = latest?.role === "builder" ? latest : undefined;
+		if (task.phase !== "cancelled") {
 		if (task.phase === "pending" && currentAttempts.length !== 0) taskDiagnostics.push(diagnostic("invalid-task", "Pending Tasks must not have current specification Attempts.", taskPath));
 		if (task.phase === "building" && (!latestBuilder || (latestBuilder.state === "superseded" || (latestBuilder.state === "ended-error" && task.attention !== "needs-user" && task.attention !== "recovering")))) taskDiagnostics.push(diagnostic("invalid-task", "Building Tasks require one current Builder Attempt.", taskPath));
 		if (task.phase === "reworking" && (currentAttempts.length < 3 || !latestBuilder || (latestBuilder.replacement === undefined && latestBuilder.state !== "ended-error" && !isReworkDispatch(latestBuilder.dispatch) && !isIntegrationReworkDispatch(latestBuilder.dispatch) && !isFinalVerificationReworkDispatch(latestBuilder.dispatch)))) taskDiagnostics.push(diagnostic("invalid-task", "Reworking Tasks require a latest reserved rework or transient ended-error Builder Attempt.", taskPath));
@@ -3432,6 +3623,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 				&& integration.value.reviewerManifestSha256 === approval.value.reviewerManifestSha256
 				&& actionMatches;
 			if (!builder || !reviewer || reviewer.evidence?.phase !== "finalized" || builder.evidence?.phase !== "finalized" || builder.evidence.manifestSha256 !== integration.value.builderManifestSha256 || reviewer.evidence.manifestSha256 !== integration.value.reviewerManifestSha256 || !identityMatches) taskDiagnostics.push(diagnostic("invalid-task", "Integration identity must remain exactly bound to the current Approval and protected final evidence.", `${taskPath}.integration`));
+		}
 		}
 		if (contractResult.value && taskIds.has(contractResult.value.id)) taskDiagnostics.push(diagnostic("invalid-task", "Task IDs must be unique.", `${taskPath}.contract.id`));
 		if (contractResult.value) taskIds.add(contractResult.value.id);
@@ -3609,6 +3801,66 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	}
 	const completion = hasCompletion ? validateCompletion(value.completion, `${path}.completion`) : { diagnostics: [] };
 	diagnostics.push(...completion.diagnostics);
+	const cancellation = hasCancellation ? validateCancellation(value.cancellation, `${path}.cancellation`, typeof value.id === "string" ? value.id : "invalid-run") : { diagnostics: [] };
+	diagnostics.push(...cancellation.diagnostics);
+	if (completion.value && cancellation.value) diagnostics.push(diagnostic("invalid-run", "A Run cannot contain both completion and cancellation records.", path));
+	if (value.status === "cancelled" && (!cancellation.value || cancellation.diagnostics.length > 0)) diagnostics.push(diagnostic("invalid-run", "Cancelled Runs require a strict cancellation record.", `${path}.cancellation`));
+	if (value.status !== "cancelled" && cancellation.value) diagnostics.push(diagnostic("invalid-run", "Cancellation facts are only legal on a cancelled Run.", `${path}.cancellation`));
+	if (cancellation.value) {
+		const changedTasks = tasks.filter((task) => task.phase === "cancelled");
+		const priorByTask = new Map(cancellation.value.priorTasks.map((item) => [item.taskId, item]));
+		if (new Set(cancellation.value.priorTasks.map((item) => item.taskId)).size !== cancellation.value.priorTasks.length || JSON.stringify(cancellation.value.priorTasks.map((item) => item.taskId)) !== JSON.stringify(changedTasks.map((task) => task.contract.id))) diagnostics.push(diagnostic("invalid-run", "Cancellation prior Task inventory must enumerate every changed non-completed Task in order.", `${path}.cancellation.priorTasks`));
+		for (const task of tasks) {
+			const prior = priorByTask.get(task.contract.id);
+			if (task.phase === "cancelled") {
+				if (!prior) diagnostics.push(diagnostic("invalid-run", "Cancelled Task must retain its exact prior phase and attention.", `${path}.tasks.${task.contract.id}`));
+					const expected = task.attempts.filter((attempt) => attempt.state === "cancelled" && attempt.revisionCancellation === undefined);
+				const recorded = prior?.attempts ?? [];
+				if (expected.length !== recorded.length || expected.some((attempt, index) => attempt.id !== recorded[index]?.attemptId)) diagnostics.push(diagnostic("invalid-run", "Cancellation prior Attempt inventory must enumerate cancelled Attempts in order.", `${path}.cancellation.priorTasks`));
+			} else if (prior) diagnostics.push(diagnostic("invalid-run", "Cancellation may not retain a prior fact for an unchanged Task.", `${path}.cancellation.priorTasks`));
+		}
+		const cancelledAttempts = tasks.flatMap((task) => task.attempts.filter((attempt) => attempt.state === "cancelled" && attempt.revisionCancellation === undefined).map((attempt) => `${task.contract.id}/${attempt.id}/${attempt.role}`));
+		const stopAttemptKeys = cancellation.value.stops.map((stop) => `${stop.taskId}/${stop.attemptId}`);
+		if (cancellation.value.stops.length !== cancelledAttempts.length || cancellation.value.stops.some((stop, index) => `${stop.taskId}/${stop.attemptId}/${stop.role}` !== cancelledAttempts[index] || stopAttemptKeys[index] !== `${stop.taskId}/${stop.attemptId}`)) diagnostics.push(diagnostic("invalid-run", "Cancellation stop inventory must enumerate every Attempt changed by cancellation exactly once.", `${path}.cancellation.stops`));
+		const expectedPanes = new Map<string, StewardOwnedPane>();
+		const expectedWorktrees = new Map<string, StewardOwnedWorktree>();
+		const expectedWorktreesByBranch = new Map<string, StewardOwnedWorktree>();
+		const expectedWorktreesByRootPane = new Map<string, StewardOwnedWorktree>();
+		for (const task of tasks) for (const attempt of task.attempts) {
+			const identity = cancellationDispatchIdentity(attempt);
+			if (!identity) continue;
+			const dispatch = attempt.dispatch as unknown as Record<string, unknown>;
+			const pane: StewardOwnedPane = { runId: value.id as string, taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, kind: attempt.role === "builder" ? "builder-root" : attempt.replacement ? "recovery" : "reviewer", workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId };
+			const paneKey = `${pane.workspaceId}/${pane.paneId}`;
+			const previousPane = expectedPanes.get(paneKey);
+			if (previousPane && (previousPane.terminalId !== pane.terminalId || previousPane.role !== pane.role || previousPane.kind !== pane.kind)) diagnostics.push(diagnostic("invalid-run", "Cancellation ownership facts conflict for a reused pane identity.", `${path}.cancellation.panes`));
+			else if (!previousPane) expectedPanes.set(paneKey, pane);
+			if (attempt.role === "builder" && typeof dispatch.branch === "string" && typeof dispatch.worktreePath === "string") {
+				const worktree: StewardOwnedWorktree = { runId: value.id as string, taskId: task.contract.id, attemptId: attempt.id, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, branch: dispatch.branch, path: dispatch.worktreePath };
+				const previousByPath = expectedWorktrees.get(worktree.path);
+				const previousByBranch = expectedWorktreesByBranch.get(worktree.branch);
+				const previousByRootPane = expectedWorktreesByRootPane.get(`${worktree.workspaceId}/${worktree.paneId}`);
+				const priorFacts = [...new Set([previousByPath, previousByBranch, previousByRootPane].filter((candidate): candidate is StewardOwnedWorktree => candidate !== undefined))];
+				if (priorFacts.some((previousWorktree) => previousWorktree.workspaceId !== worktree.workspaceId || previousWorktree.path !== worktree.path || previousWorktree.branch !== worktree.branch || previousWorktree.paneId !== worktree.paneId || previousWorktree.terminalId !== worktree.terminalId)) diagnostics.push(diagnostic("invalid-run", "Cancellation ownership facts conflict for a reused Builder worktree identity.", `${path}.cancellation.worktrees`));
+				else if (priorFacts.length === 0) {
+					expectedWorktrees.set(worktree.path, worktree);
+					expectedWorktreesByBranch.set(worktree.branch, worktree);
+					expectedWorktreesByRootPane.set(`${worktree.workspaceId}/${worktree.paneId}`, worktree);
+				}
+			}
+		}
+		const sortedOwnership = <T>(items: T[], key: (item: T) => string): T[] => [...items].sort((left, right) => key(left).localeCompare(key(right)));
+		if (JSON.stringify(sortedOwnership(cancellation.value.panes, (pane) => `${pane.workspaceId}/${pane.paneId}/${pane.terminalId}/${pane.taskId}/${pane.attemptId}`)) !== JSON.stringify(sortedOwnership([...expectedPanes.values()], (pane) => `${pane.workspaceId}/${pane.paneId}/${pane.terminalId}/${pane.taskId}/${pane.attemptId}`)) || JSON.stringify(sortedOwnership(cancellation.value.worktrees, (worktree) => `${worktree.workspaceId}/${worktree.path}/${worktree.branch}/${worktree.taskId}/${worktree.attemptId}`)) !== JSON.stringify(sortedOwnership([...expectedWorktrees.values()], (worktree) => `${worktree.workspaceId}/${worktree.path}/${worktree.branch}/${worktree.taskId}/${worktree.attemptId}`))) diagnostics.push(diagnostic("invalid-run", "Cancellation ownership inventory must match exact persisted dispatch identities.", `${path}.cancellation`));
+		for (let index = 0; index < cancellation.value.stops.length; index += 1) {
+			const stop = cancellation.value.stops[index]!;
+			const attempt = tasks.flatMap((task) => task.attempts.filter((candidate) => task.contract.id === stop.taskId && candidate.id === stop.attemptId && candidate.role === stop.role))[0];
+			const identity = attempt ? cancellationDispatchIdentity(attempt) : undefined;
+			if (stop.state === "not-required" && (stop.reason === "never-started" || stop.reason === "ownership-gap") && stop.agent !== undefined) diagnostics.push(diagnostic("invalid-run", "Never-started or ownership-gap cancellation stops cannot claim an Agent identity.", `${path}.cancellation.stops[${index}]`));
+			if (stop.state !== "not-required" || (stop.reason !== "never-started" && stop.reason !== "ownership-gap")) {
+				if (!identity || !stop.agent || stop.agent.role !== identity.role || stop.agent.agentName !== identity.agentName || stop.agent.workspaceId !== identity.workspaceId || stop.agent.paneId !== identity.paneId || stop.agent.terminalId !== identity.terminalId) diagnostics.push(diagnostic("invalid-run", "Cancellation stop identity must match the persisted Attempt dispatch identity.", `${path}.cancellation.stops[${index}]`));
+			}
+		}
+	}
 	const monitor = hasMonitor ? validateMonitorCheckpoint(value.monitor, `${path}.monitor`, { createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, tasks }) : { diagnostics: [] };
 	diagnostics.push(...monitor.diagnostics);
 	const monitors = hasMonitors ? validateMonitorCheckpoints(value.monitors, `${path}.monitors`, { createdAt: value.createdAt as string, updatedAt: value.updatedAt as string, tasks }) : { diagnostics: [] };
@@ -3645,6 +3897,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 	if (value.status === "active" && completion.value) diagnostics.push(diagnostic("invalid-run", "Active Run Journals cannot contain completion records.", `${path}.completion`));
 	if (value.status === "completing" && (!completion.value || completion.value.phase === "archived")) diagnostics.push(diagnostic("invalid-run", "Completing Runs require a non-archived completion record.", `${path}.completion`));
 	if (value.status === "completed" && (!completion.value || completion.value.phase !== "archived" || tasks.some((task) => task.phase !== "completed" || task.attention !== "none"))) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots require archived completion and completed attention-free Tasks.", path));
+	if (value.status === "cancelled" && completion.value) diagnostics.push(diagnostic("invalid-run", "Cancelled Run snapshots cannot contain completion records.", `${path}.completion`));
 	const orderedCodeTasks = tasks.filter((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"));
 	const allCodeIntegrated = orderedCodeTasks.every((task) => task.integration?.phase === "integrated");
 	const allTasksReadyForFinalVerification = tasks.every((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit") ? task.integration?.phase === "integrated" : task.phase === "completed");
@@ -3655,14 +3908,14 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		&& isRecoverableFinalVerificationExecution(finalVerificationExecution.value)
 		&& (finalVerificationExecution.value.phase === "failed" || finalVerificationExecution.value.phase === "ambiguous")
 		&& tasks.every((task) => task.attention === "needs-user" && ["final-verification-ownership-unclear", "verification-dirtied-checkout", "final-verification-ambiguous"].includes(task.attentionReason ?? ""));
-	if (finalVerificationExecution.value && tasks.length > 1 && (!allTasksReadyForFinalVerification || !allCodeIntegrated || (!terminalMultiFinalVerificationAttention && tasks.some((task) => task.attention !== "none" || ["building", "reviewing", "reworking"].includes(task.phase))))) diagnostics.push(diagnostic("invalid-run", "Multi-Task final verification requires the complete ordered integration prefix and no active or attention Task.", `${path}.finalVerificationExecution`));
-	if (finalVerificationExecution.value && tasks.length === 1 && tasks[0] && (!tasks[0].integration || tasks[0].integration.phase !== "integrated")) diagnostics.push(diagnostic("invalid-run", "Final verification execution requires a completed exact integration.", `${path}.finalVerificationExecution`));
+	if (!cancelledRun && finalVerificationExecution.value && tasks.length > 1 && (!allTasksReadyForFinalVerification || !allCodeIntegrated || (!terminalMultiFinalVerificationAttention && tasks.some((task) => task.attention !== "none" || ["building", "reviewing", "reworking"].includes(task.phase))))) diagnostics.push(diagnostic("invalid-run", "Multi-Task final verification requires the complete ordered integration prefix and no active or attention Task.", `${path}.finalVerificationExecution`));
+	if (!cancelledRun && finalVerificationExecution.value && tasks.length === 1 && tasks[0] && (!tasks[0].integration || tasks[0].integration.phase !== "integrated")) diagnostics.push(diagnostic("invalid-run", "Final verification execution requires a completed exact integration.", `${path}.finalVerificationExecution`));
 	if (finalVerificationExecution.value && tasks[0]) {
 		if (isRecoverableFinalVerificationExecution(finalVerificationExecution.value)) {
 			for (const attempt of finalVerificationExecution.value.attempts) if (![attempt.paths.runtimeDirectory, attempt.paths.descriptorPath, attempt.paths.stdoutPath, attempt.paths.stderrPath, attempt.paths.candidateResultPath, attempt.paths.logPath, attempt.paths.resultPath].every((candidate) => candidate.includes(`/runs/${value.id}/completion/final-verification/${attempt.id}/`))) diagnostics.push(diagnostic("invalid-run", "Managed final verification paths must be deterministic inside this Run's completion directory.", `${path}.finalVerificationExecution`));
 		} else if (!finalVerificationExecution.value.logPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`) || !finalVerificationExecution.value.resultPath.includes(`/runs/${value.id}/completion/final-verification/verification-01/`)) diagnostics.push(diagnostic("invalid-run", "Final verification paths must be deterministic inside this Run's completion directory.", `${path}.finalVerificationExecution`));
 	}
-	if (finalVerificationExecution.value?.phase === "intended" && tasks.length === 1 && tasks[0] && (tasks[0].phase !== "integrating" || tasks[0].attention !== "none")) diagnostics.push(diagnostic("invalid-run", "Final verification intent requires an attention-free integrating Task.", `${path}.finalVerificationExecution`));
+	if (!cancelledRun && finalVerificationExecution.value?.phase === "intended" && tasks.length === 1 && tasks[0] && (tasks[0].phase !== "integrating" || tasks[0].attention !== "none")) diagnostics.push(diagnostic("invalid-run", "Final verification intent requires an attention-free integrating Task.", `${path}.finalVerificationExecution`));
 	if (finalVerificationExecution.value?.phase === "passed" && tasks[0]) {
 		const managedCheckout = isRecoverableFinalVerificationExecution(finalVerificationExecution.value) ? managedCompleteObservation(finalVerificationExecution.value)?.checkout : undefined;
 		const checkout = managedCheckout ?? (!isRecoverableFinalVerificationExecution(finalVerificationExecution.value) ? finalVerificationExecution.value.checkout : undefined);
@@ -3694,7 +3947,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 		}
 	}
 	if (value.status === "completed" && (!finalVerificationExecution.value || finalVerificationExecution.value.phase !== "passed")) diagnostics.push(diagnostic("invalid-run", "Completed Run snapshots require one passing final verification execution.", path));
-	if (finalVerificationExecution.value?.phase === "passed" && tasks[0]?.phase === "completed" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "A passed final verification cannot be detached from completion.", `${path}.finalVerificationExecution`));
+	if (!cancelledRun && finalVerificationExecution.value?.phase === "passed" && tasks[0]?.phase === "completed" && value.status !== "completing" && value.status !== "completed") diagnostics.push(diagnostic("invalid-run", "A passed final verification cannot be detached from completion.", `${path}.finalVerificationExecution`));
 	if (diagnostics.length > 0 || !base.value || !plans.value || !settings.value || !finalVerification.value || tasks.length !== (rawTasks?.length ?? 0)) return { diagnostics };
 	const id = value.id;
 	const declaredOutcome = value.declaredOutcome;
@@ -3719,6 +3972,7 @@ function validateRunRecord(value: unknown, path: string, options: { atActivePath
 			...(revisions.length > 0 ? { revisions } : {}),
 			...(finalVerificationExecution.value ? { finalVerificationExecution: finalVerificationExecution.value } : {}),
 			...(completion.value ? { completion: completion.value } : {}),
+			...(cancellation.value ? { cancellation: cancellation.value } : {}),
 			...(monitor.value ? { monitor: monitor.value } : {}),
 			...(monitors.value ? { monitors: monitors.value } : {}),
 		},
@@ -3991,6 +4245,7 @@ export function cloneRunJournal(journal: RunJournal): RunJournal {
 			...(journal.run.revisions ? { revisions: journal.run.revisions.map(cloneRunRevision) } : {}),
 			...(journal.run.finalVerificationExecution ? { finalVerificationExecution: cloneVerificationExecution(journal.run.finalVerificationExecution) } : {}),
 			...(journal.run.completion ? { completion: cloneCompletion(journal.run.completion) } : {}),
+			...(journal.run.cancellation ? { cancellation: cloneCancellation(journal.run.cancellation) } : {}),
 			...(journal.run.monitor ? { monitor: cloneMonitorCheckpoint(journal.run.monitor) } : {}),
 			...(journal.run.monitors ? { monitors: journal.run.monitors.map(cloneMonitorCheckpoint) } : {}),
 		},

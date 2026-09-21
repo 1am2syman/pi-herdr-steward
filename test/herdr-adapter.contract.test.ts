@@ -161,3 +161,54 @@ it.sequential("translates and rejects the exact Reviewer pane/start/prompt contr
 	const rejected = await rejectedPane.createReviewerPane!({ repositoryRoot: "/repo", sourcePaneId: "pane-1", worktreePath: "/tmp/builder", branch: "branch", agentName: "steward-r-abcdef12-01-02", workspaceId: "workspace-1" });
 	deepStrictEqual(rejected, { kind: "failed", stage: "pane-split", code: "malformed-response", message: "Herdr returned no valid pane_split envelope." });
 });
+
+it.sequential("uses the exact cleanup preflight/effect argv and rejects mismatched cleanup identities", async () => {
+	const calls: Array<{ command: string; args: string[]; options?: { cwd?: string; timeout?: number } }> = [];
+	const adapter = createHerdrAdapter(async (command, args, options) => {
+		calls.push({ command, args, options });
+		if (args[0] === "workspace") return result(JSON.stringify({ id: "cli:workspace:get", result: { type: "workspace_info", workspace: { workspace_id: "workspace-owned" } } }));
+		if (args[0] === "pane" && args[1] === "list") return result(JSON.stringify({ id: "cli:pane:list", result: { type: "pane_list", panes: [
+			{ workspace_id: "workspace-owned", pane_id: "pane-root", terminal_id: "terminal-root", root: true },
+			{ workspace_id: "workspace-owned", pane_id: "pane-reviewer", terminal_id: "terminal-reviewer", root: false },
+		] } }));
+		if (args[0] === "worktree" && args[1] === "list") return result(JSON.stringify({ id: "cli:worktree:list", result: { type: "worktree_list", worktrees: [{ workspace_id: "workspace-owned", path: "/repo/.steward-worktree", branch: "steward/run/task/attempt-01", root_pane_id: "pane-root" }] } }));
+		if (args[0] === "pane" && args[1] === "close") return result(JSON.stringify({ id: "cli:pane:close", result: { type: "pane_closed", pane: { workspace_id: "workspace-owned", pane_id: "pane-reviewer", terminal_id: "terminal-reviewer", root: false } } }));
+		if (args[0] === "worktree" && args[1] === "remove") return result(JSON.stringify({ id: "cli:worktree:remove", result: { type: "worktree_removed", worktree: { workspace_id: "workspace-owned", path: "/repo/.steward-worktree", branch: "steward/run/task/attempt-01", root_pane_id: "pane-root" } } }));
+		return result("", "unexpected cleanup argv", 1);
+	});
+	const preflight = await adapter.preflightCleanupWorkspace!({ repositoryRoot: "/repo", workspaceId: "workspace-owned" });
+	deepStrictEqual(preflight, {
+		kind: "ready",
+		workspaceId: "workspace-owned",
+		panes: [
+			{ workspaceId: "workspace-owned", paneId: "pane-root", terminalId: "terminal-root", root: true },
+			{ workspaceId: "workspace-owned", paneId: "pane-reviewer", terminalId: "terminal-reviewer", root: false },
+		],
+		worktrees: [{ workspaceId: "workspace-owned", path: "/repo/.steward-worktree", branch: "steward/run/task/attempt-01", rootPaneId: "pane-root" }],
+	});
+	deepStrictEqual(await adapter.closeCleanupPane!({ repositoryRoot: "/repo", workspaceId: "workspace-owned", paneId: "pane-reviewer", terminalId: "terminal-reviewer" }), { kind: "completed", resourceId: "pane-reviewer" });
+	deepStrictEqual(await adapter.removeCleanupWorktree!({ repositoryRoot: "/repo", workspaceId: "workspace-owned", path: "/repo/.steward-worktree", branch: "steward/run/task/attempt-01" }), { kind: "completed", resourceId: "/repo/.steward-worktree" });
+	deepStrictEqual(calls, [
+		{ command: "herdr", args: ["workspace", "get", "workspace-owned"], options: { cwd: "/repo", timeout: 5000 } },
+		{ command: "herdr", args: ["pane", "list", "--workspace", "workspace-owned"], options: { cwd: "/repo", timeout: 5000 } },
+		{ command: "herdr", args: ["worktree", "list", "--workspace", "workspace-owned"], options: { cwd: "/repo", timeout: 5000 } },
+		{ command: "herdr", args: ["pane", "close", "pane-reviewer"], options: { cwd: "/repo", timeout: 5000 } },
+		{ command: "herdr", args: ["worktree", "remove", "--workspace", "workspace-owned"], options: { cwd: "/repo", timeout: 30000 } },
+	]);
+	ok(!calls.flatMap((call) => call.args).includes("--force"));
+
+	const malformed = createHerdrAdapter(async () => result("not-json"));
+	const malformedResult = await malformed.preflightCleanupWorkspace!({ repositoryRoot: "/repo", workspaceId: "workspace-owned" });
+	ok(malformedResult.kind === "ambiguous");
+	const foreign = createHerdrAdapter(async (_command, args) => args[0] === "workspace"
+		? result(JSON.stringify({ id: "cli:workspace:get", result: { type: "workspace_info", workspace: { workspace_id: "workspace-other" } } }))
+		: result());
+	const foreignResult = await foreign.preflightCleanupWorkspace!({ repositoryRoot: "/repo", workspaceId: "workspace-owned" });
+	ok(foreignResult.kind === "ambiguous");
+	const killed = createHerdrAdapter(async () => result("", "", 0, true));
+	const killedResult = await killed.removeCleanupWorktree!({ repositoryRoot: "/repo", workspaceId: "workspace-owned", path: "/repo/.steward-worktree", branch: "steward/run/task/attempt-01" });
+	ok(killedResult.kind === "ambiguous");
+	const rootClose = createHerdrAdapter(async () => result(JSON.stringify({ id: "cli:pane:close", result: { type: "pane_closed", pane: { workspace_id: "workspace-owned", pane_id: "pane-root", terminal_id: "terminal-root", root: true } } })));
+	const rootCloseResult = await rootClose.closeCleanupPane!({ repositoryRoot: "/repo", workspaceId: "workspace-owned", paneId: "pane-root", terminalId: "terminal-root" });
+	ok(rootCloseResult.kind === "ambiguous");
+});

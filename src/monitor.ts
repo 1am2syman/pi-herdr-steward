@@ -64,7 +64,7 @@ export function createStewardSessionMonitor(input: StewardSessionMonitorInput): 
 	}
 
 	function passWithNotification(result: MonitorPassResult): MonitorPassResult {
-		if (result.condition === "ordinary" || result.condition === "completed") return result;
+		if (result.condition === "ordinary" || result.condition === "completed" || result.condition === "cancelled") return result;
 		const journalId = result.journal?.run.id ?? "none";
 		const revision = result.journal?.journalRevision ?? 0;
 		const key = `${journalId}:${result.condition}:${revision}:${result.diagnostic ?? result.note}`;
@@ -142,7 +142,7 @@ export function createStewardSessionMonitor(input: StewardSessionMonitorInput): 
 			compactionFailurePending = false;
 			return;
 		}
-		if (!isCurrent(value) || !safeIdle() || observed.condition === "degraded" || observed.action === "approval-required" || observed.action === "blocked") return;
+		if (!isCurrent(value) || !safeIdle() || observed.condition === "cancelled" || observed.condition === "degraded" || observed.action === "approval-required" || observed.action === "blocked") return;
 		const advanced = await input.steward.advanceNext(input.repositoryRoot, input.controllerSessionId, { interactive: false, maximumActions: 1 });
 		if (!isCurrent(value)) return;
 		const hasDurableProgress = observed.journal?.journalRevision !== undefined
@@ -155,7 +155,7 @@ export function createStewardSessionMonitor(input: StewardSessionMonitorInput): 
 			bounded = { ...withoutCompletion, action: "none", note: `${advanced.note} No durable Journal progress was recorded; waiting for a later lifecycle or fallback signal.` };
 		}
 		await present(bounded, value);
-		if (bounded.completed || bounded.condition === "completed") {
+		if (bounded.completed || bounded.condition === "completed" || bounded.condition === "cancelled") {
 			completedDormant = true;
 			closed = true;
 			generation += 1;

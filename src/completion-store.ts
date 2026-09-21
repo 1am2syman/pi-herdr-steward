@@ -116,6 +116,35 @@ export type ArchiveCompletedRunResult =
 	| { kind: "published" | "existing-match"; paths: CompletionPaths; manifestBytes: Buffer; deletedActive: true; deletedPrevious: true }
 	| { kind: "conflict" | "race" | "storage-error"; paths: CompletionPaths; message: string; deletedActive: false; deletedPrevious: false };
 
+export interface ArchiveCancelledRunInput {
+	repositoryRoot: string;
+	runId: string;
+	run: RunJournal;
+	previousRunBytes: Buffer | string;
+	activeRunBytes: Buffer | string;
+	archivedAt: string;
+	reports: readonly CompletionReportSource[];
+	configDirName?: string;
+}
+
+export type ArchiveCancelledRunRequest = Omit<ArchiveCancelledRunInput, "activeRunBytes" | "previousRunBytes">;
+
+export type ArchiveCancelledRunResult =
+	| { kind: "published" | "existing-match"; paths: CompletionPaths; manifestBytes: Buffer; deletedActive: true; deletedPrevious: true }
+	| { kind: "conflict" | "race" | "storage-error"; paths: CompletionPaths; message: string; deletedActive: false; deletedPrevious: false };
+
+export interface TerminalArchiveSnapshot {
+	kind: "completed" | "cancelled";
+	run: RunJournal;
+	archiveDirectory: string;
+	runSha256: string;
+	manifestSha256: string;
+}
+
+export type TerminalArchiveListingResult =
+	| { kind: "loaded"; archives: TerminalArchiveSnapshot[] }
+	| { kind: "unavailable"; message: string };
+
 interface ArchiveManifest {
 	schemaVersion: 1;
 	runId: string;
@@ -123,6 +152,16 @@ interface ArchiveManifest {
 	previousRunSha256: string;
 	archivedAt: string;
 	verification: ArchiveVerificationPointer;
+	reports: CompletionReportSource[];
+}
+
+interface CancelledArchiveManifest {
+	schemaVersion: 1;
+	terminal: "cancelled";
+	runId: string;
+	activeRunSha256: string;
+	previousRunSha256: string;
+	archivedAt: string;
 	reports: CompletionReportSource[];
 }
 
@@ -440,7 +479,7 @@ function reportDestination(paths: CompletionPaths, report: CompletionReportSourc
 	return full;
 }
 
-async function loadReports(paths: CompletionPaths, reports: readonly CompletionReportSource[]): Promise<Buffer[]> {
+async function loadReports(paths: CompletionPaths, reports: readonly CompletionReportSource[], allowEmpty = false): Promise<Buffer[]> {
 	const bytes: Buffer[] = [];
 	const identities = new Set<string>();
 	for (const report of reports) {
@@ -453,7 +492,7 @@ async function loadReports(paths: CompletionPaths, reports: readonly CompletionR
 		if (!loaded || loaded.size !== report.size || loaded.sha256 !== report.sha256) throw new Error(`Protected report changed or is missing: ${report.sourcePath}`);
 		bytes.push(loaded.bytes);
 	}
-	if (reports.length === 0) throw new Error("Archive report inventory cannot be empty.");
+	if (!allowEmpty && reports.length === 0) throw new Error("Archive report inventory cannot be empty.");
 	return bytes;
 }
 
@@ -576,5 +615,162 @@ export async function archiveCompletedRun(input: ArchiveCompletedRunInput): Prom
 		}
 	} catch (error: unknown) {
 		return { kind: "storage-error", paths, message: errorText(error).slice(0, 2_000), deletedActive: false, deletedPrevious: false };
+	}
+}
+
+function cancelledArchiveManifest(input: ArchiveCancelledRunInput, active: Buffer, previous: Buffer): { value: CancelledArchiveManifest; bytes: Buffer } {
+	const value: CancelledArchiveManifest = {
+		schemaVersion: 1,
+		terminal: "cancelled",
+		runId: input.runId,
+		activeRunSha256: hash(active),
+		previousRunSha256: hash(previous),
+		archivedAt: input.archivedAt,
+		reports: input.reports.map((report) => ({ ...report })),
+	};
+	return { value, bytes: Buffer.from(`${JSON.stringify(value, null, 2)}\n`, "utf8") };
+}
+
+function validateCancelledArchiveInput(input: ArchiveCancelledRunInput, paths: CompletionPaths, active: Buffer, previous: Buffer): string | undefined {
+	if (input.run.run.id !== input.runId || input.run.run.status !== "cancelled" || input.run.run.completion || input.run.run.cancellation?.phase !== "archived") return "Archive Run snapshot is not a strict cancelled archived Journal.";
+	const archive = input.run.run.cancellation.archive;
+	if (archive.archiveDirectory !== paths.archiveDirectory || archive.runPath !== paths.archiveRunPath || archive.previousRunPath !== paths.archivePreviousRunPath || archive.manifestPath !== paths.archiveManifestPath || archive.activeJournalSha256 !== hash(active) || archive.previousJournalSha256 !== hash(previous) || input.archivedAt !== input.run.run.cancellation.archivedAt || archive.intendedAt > input.archivedAt) return "Cancelled archive paths, hashes, or timestamps do not bind the exact live Journal predecessor chain.";
+	if (!sameReportInventory(archive.reports, input.reports)) return "Cancelled archive report inventory does not match the protected report inputs.";
+	return undefined;
+}
+
+export async function archiveCancelledRun(input: ArchiveCancelledRunInput): Promise<ArchiveCancelledRunResult> {
+	const paths = resolveCompletionPaths(input.repositoryRoot, input.runId, input.configDirName);
+	const active = buffer(input.activeRunBytes);
+	const previous = buffer(input.previousRunBytes);
+	try {
+		const validated = validateRunJournal(input.run, paths.archiveRunPath);
+		if (!validated.value || validated.diagnostics.length > 0 || validated.value.run.status !== "cancelled" || validated.value.run.cancellation?.phase !== "archived") return { kind: "storage-error", paths, message: "Archive Run snapshot is not a strict cancelled archived Journal.", deletedActive: false, deletedPrevious: false };
+		const activeJournal = deserializeRunJournal(active.toString("utf8"), join(dirname(paths.archiveDirectory), "..", "active-run.json"));
+		const previousJournal = deserializeRunJournal(previous.toString("utf8"), join(dirname(paths.archiveDirectory), "..", "active-run.previous.json"));
+		if (!activeJournal.value || !previousJournal.value || activeJournal.value.run.id !== input.runId || previousJournal.value.run.id !== input.runId || activeJournal.value.run.status !== "cancelled" || activeJournal.value.run.cancellation?.phase !== "archive-intended" || previousJournal.value.run.status !== "cancelled" || previousJournal.value.run.cancellation?.phase !== "stops-complete" || input.run.journalRevision !== activeJournal.value.journalRevision + 1 || activeJournal.value.journalRevision !== previousJournal.value.journalRevision + 1) return { kind: "storage-error", paths, message: "Archive pointers are not the exact cancelled Run predecessor chain.", deletedActive: false, deletedPrevious: false };
+		const bindingError = validateCancelledArchiveInput(input, paths, active, previous);
+		if (bindingError) return { kind: "storage-error", paths, message: bindingError, deletedActive: false, deletedPrevious: false };
+		if (!safeAbsolute(paths.archiveDirectory) || !canonicalTimestamp(input.archivedAt)) return { kind: "storage-error", paths, message: "Cancelled archive intent contains invalid exact paths or time.", deletedActive: false, deletedPrevious: false };
+		const runBytes = Buffer.from(serializeRunJournalAtPath(validated.value, paths.archiveRunPath), "utf8");
+		const reportBytes = await loadReports(paths, input.reports, true);
+		const manifest = cancelledArchiveManifest(input, active, previous);
+		const expected = expectedArchiveFiles(paths, runBytes, previous, manifest.bytes, input.reports, reportBytes);
+		const existing = await lstat(paths.archiveDirectory).catch((error: unknown) => (missing(error) ? undefined : Promise.reject(error)));
+		if (existing) {
+			if (!existing.isDirectory() || existing.isSymbolicLink() || !(await compareArchive(paths.archiveDirectory, expected))) return { kind: "conflict", paths, message: "Existing cancelled archive differs; no archive bytes were overwritten.", deletedActive: false, deletedPrevious: false };
+			const deletion = await deleteMatchingPointers(paths, active, previous);
+			if (deletion === "race") return { kind: "race", paths, message: "Live Journal pointers changed before conditional cancelled archive cleanup.", deletedActive: false, deletedPrevious: false };
+			return { kind: "existing-match", paths, manifestBytes: manifest.bytes, deletedActive: true, deletedPrevious: true };
+		}
+		const state = resolveProjectStatePaths(input.repositoryRoot, input.configDirName);
+		await ensureOwnedDirectory(state.stewardDirectory);
+		await ensureOwnedDirectory(join(state.stewardDirectory, "archives"));
+		const temporary = await createOwnedTemporaryDirectory(join(state.stewardDirectory, "archives"), "cancelled-archive");
+		try {
+			if (input.reports.length > 0) await ensureOwnedDirectory(join(temporary, "reports"));
+			await writeImmutableFile(join(temporary, "run.json"), runBytes);
+			await writeImmutableFile(join(temporary, "previous-run.json"), previous);
+			await writeImmutableFile(join(temporary, "manifest.json"), manifest.bytes);
+			for (let index = 0; index < input.reports.length; index += 1) {
+				const report = input.reports[index]!;
+				const destination = reportDestination(paths, report);
+				const relativePath = relative(paths.archiveDirectory, destination);
+				const destinationDirectory = dirname(join(temporary, relativePath));
+				await mkdir(destinationDirectory, { recursive: true, mode: 0o700 });
+				await writeImmutableFile(join(temporary, relativePath), reportBytes[index]!);
+			}
+			if (!(await reportsUnchanged(paths, input.reports, reportBytes))) return { kind: "storage-error", paths, message: "A protected report changed before cancelled archive publication; no archive or pointer was changed.", deletedActive: false, deletedPrevious: false };
+			if (input.reports.length > 0) await chmod(join(temporary, "reports"), 0o500).catch(() => undefined);
+			await chmod(temporary, 0o500).catch(() => undefined);
+			await syncDirectory(temporary);
+			try { await rename(temporary, paths.archiveDirectory); }
+			catch (error: unknown) {
+				if (!exists(error)) throw error;
+				if (!(await compareArchive(paths.archiveDirectory, expected))) return { kind: "conflict", paths, message: "Cancelled archive publication raced with different bytes; no archive bytes were overwritten.", deletedActive: false, deletedPrevious: false };
+			}
+			await syncDirectory(dirname(paths.archiveDirectory));
+			const deletion = await deleteMatchingPointers(paths, active, previous);
+			if (deletion === "race") return { kind: "race", paths, message: "Live Journal pointers changed before conditional cancelled archive cleanup.", deletedActive: false, deletedPrevious: false };
+			return { kind: "published", paths, manifestBytes: manifest.bytes, deletedActive: true, deletedPrevious: true };
+		} finally {
+			await removeKnownTemporaryDirectory(temporary).catch(() => undefined);
+		}
+	} catch (error: unknown) {
+		return { kind: "storage-error", paths, message: errorText(error).slice(0, 2_000), deletedActive: false, deletedPrevious: false };
+	}
+}
+
+function plainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function archiveReportShape(value: unknown): value is CompletionReportSource {
+	if (!plainObject(value) || Object.keys(value).sort().join("\0") !== ["attemptId", "destinationPath", "role", "sha256", "size", "sourcePath", "taskId"].join("\0")) return false;
+	return typeof value.taskId === "string" && safeIdentifier(value.taskId) && typeof value.attemptId === "string" && safeIdentifier(value.attemptId) && (value.role === "builder" || value.role === "reviewer") && typeof value.sourcePath === "string" && safeAbsolute(value.sourcePath) && typeof value.destinationPath === "string" && value.destinationPath === `reports/${value.taskId}/${value.attemptId}-${value.role}.md` && !isAbsolute(value.destinationPath) && /^reports\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*-(?:builder|reviewer)\.md$/.test(value.destinationPath) && typeof value.size === "number" && Number.isSafeInteger(value.size) && value.size >= 0 && typeof value.sha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.sha256);
+}
+
+function archiveVerificationShape(value: unknown): value is ArchiveVerificationPointer {
+	return plainObject(value)
+		&& Object.keys(value).sort().join("\0") === ["logPath", "resultPath", "logSha256", "resultSha256"].sort().join("\0")
+		&& typeof value.logPath === "string" && safeAbsolute(value.logPath)
+		&& typeof value.resultPath === "string" && safeAbsolute(value.resultPath)
+		&& typeof value.logSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.logSha256)
+		&& typeof value.resultSha256 === "string" && /^sha256:[0-9a-f]{64}$/.test(value.resultSha256);
+}
+
+export async function listTerminalArchives(repositoryRoot: string, configDirName = CONFIG_DIR_NAME): Promise<TerminalArchiveListingResult> {
+	try {
+		const state = resolveProjectStatePaths(repositoryRoot, configDirName);
+		const archivesDirectory = join(state.stewardDirectory, "archives");
+		const root = await lstat(archivesDirectory).catch((error: unknown) => (missing(error) ? undefined : Promise.reject(error)));
+		if (!root) return { kind: "loaded", archives: [] };
+		if (!root.isDirectory() || root.isSymbolicLink()) return { kind: "unavailable", message: "Steward archive root is not a regular directory." };
+		const entries = await readdir(archivesDirectory, { withFileTypes: true });
+		const archives: TerminalArchiveSnapshot[] = [];
+		for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+			if (!entry.isDirectory() || entry.isSymbolicLink() || !safeIdentifier(entry.name) || !entry.name.startsWith("run-")) return { kind: "unavailable", message: `Unsafe terminal archive entry: ${entry.name}.` };
+			const directory = join(archivesDirectory, entry.name);
+			const runPath = join(directory, "run.json");
+			const previousPath = join(directory, "previous-run.json");
+			const manifestPath = join(directory, "manifest.json");
+			const runBytes = await stableFile(runPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+			const previousBytes = await stableFile(previousPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+			const manifestBytes = await stableFile(manifestPath, MAX_VERIFICATION_OUTPUT_BYTES * 2);
+			if (!runBytes || !previousBytes || !manifestBytes) return { kind: "unavailable", message: `Terminal archive ${entry.name} is missing a strict regular snapshot file.` };
+			const decoded = deserializeRunJournal(runBytes.bytes.toString("utf8"), runPath);
+			const previous = deserializeRunJournal(previousBytes.bytes.toString("utf8"), previousPath);
+			if (!decoded.value || decoded.diagnostics.length > 0 || !previous.value || previous.diagnostics.length > 0 || decoded.value.run.id !== entry.name || (decoded.value.run.status !== "completed" && decoded.value.run.status !== "cancelled")) return { kind: "unavailable", message: `Terminal archive ${entry.name} contains an invalid or unsupported Run snapshot.` };
+			let manifest: Record<string, unknown>;
+			try { const parsed = JSON.parse(manifestBytes.bytes.toString("utf8")) as unknown; if (!plainObject(parsed)) throw new Error(); manifest = parsed; } catch { return { kind: "unavailable", message: `Terminal archive ${entry.name} contains malformed manifest JSON.` }; }
+			const reportsValue = manifest.reports;
+			const terminal = decoded.value.run.status;
+			const expectedManifestKeys = terminal === "completed"
+				? ["schemaVersion", "runId", "activeRunSha256", "previousRunSha256", "archivedAt", "verification", "reports"]
+				: ["schemaVersion", "terminal", "runId", "activeRunSha256", "previousRunSha256", "archivedAt", "reports"];
+			if (JSON.stringify(Object.keys(manifest).sort()) !== JSON.stringify([...expectedManifestKeys].sort()) || manifest.schemaVersion !== 1 || manifest.runId !== entry.name || typeof manifest.activeRunSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(manifest.activeRunSha256) || typeof manifest.previousRunSha256 !== "string" || !/^sha256:[0-9a-f]{64}$/.test(manifest.previousRunSha256) || typeof manifest.archivedAt !== "string" || !canonicalTimestamp(manifest.archivedAt) || !Array.isArray(reportsValue) || reportsValue.some((report) => !archiveReportShape(report))) return { kind: "unavailable", message: `Terminal archive ${entry.name} contains an unsafe manifest.` };
+			const reportItems = reportsValue as CompletionReportSource[];
+			const reportIdentities = reportItems.map((report) => `${report.taskId}/${report.attemptId}/${report.role}`);
+			if (new Set(reportIdentities).size !== reportIdentities.length || new Set(reportItems.map((report) => report.destinationPath)).size !== reportItems.length) return { kind: "unavailable", message: `Terminal archive ${entry.name} contains duplicate report identities.` };
+			const terminalArchive = terminal === "completed" ? decoded.value.run.completion : decoded.value.run.cancellation;
+			if (!terminalArchive || terminalArchive.phase !== "archived" || terminalArchive.archive.archiveDirectory !== directory || terminalArchive.archive.runPath !== runPath || terminalArchive.archive.previousRunPath !== previousPath || terminalArchive.archive.manifestPath !== manifestPath || terminalArchive.archive.activeJournalSha256 !== manifest.activeRunSha256 || terminalArchive.archive.previousJournalSha256 !== manifest.previousRunSha256 || manifest.archivedAt !== terminalArchive.archivedAt || reportItems.some((report) => !contained(join(state.stewardDirectory, "runs", entry.name), report.sourcePath))) return { kind: "unavailable", message: `Terminal archive ${entry.name} has incompatible ownership or archive facts.` };
+			const expectedReportPaths = new Set(["run.json", "previous-run.json", "manifest.json", ...reportItems.map((report) => report.destinationPath)]);
+			let actualFiles: string[];
+			try { actualFiles = await listFiles(directory); } catch (error: unknown) { return { kind: "unavailable", message: errorText(error).slice(0, 2_000) }; }
+			if (JSON.stringify(actualFiles) !== JSON.stringify([...expectedReportPaths].sort())) return { kind: "unavailable", message: `Terminal archive ${entry.name} contains unexpected files.` };
+			if (manifest.previousRunSha256 !== hash(previousBytes.bytes)) return { kind: "unavailable", message: `Terminal archive ${entry.name} has a previous Journal hash mismatch.` };
+			if (decoded.value.journalRevision !== previous.value.journalRevision + 2) return { kind: "unavailable", message: `Terminal archive ${entry.name} has a broken terminal Journal revision chain.` };
+			if (terminal === "completed") {
+				if (!archiveVerificationShape(manifest.verification) || decoded.value.run.completion?.phase !== "archived" || JSON.stringify(decoded.value.run.completion.archive.verification) !== JSON.stringify(manifest.verification) || JSON.stringify(decoded.value.run.completion.archive.reports) !== JSON.stringify(reportItems) || previous.value.run.status !== "completing" || previous.value.run.completion?.phase !== "archive-intended") return { kind: "unavailable", message: `Completed archive ${entry.name} has incompatible terminal manifest facts.` };
+			} else if (manifest.terminal !== "cancelled" || decoded.value.run.cancellation?.phase !== "archived" || JSON.stringify(decoded.value.run.cancellation.archive.reports) !== JSON.stringify(reportItems) || previous.value.run.status !== "cancelled" || previous.value.run.cancellation?.phase !== "stops-complete") return { kind: "unavailable", message: `Cancelled archive ${entry.name} has incompatible terminal manifest facts.` };
+			for (const report of reportItems) {
+				const bytes = await stableFile(join(directory, report.destinationPath), MAX_VERIFICATION_OUTPUT_BYTES);
+				if (!bytes || bytes.size !== report.size || bytes.sha256 !== report.sha256) return { kind: "unavailable", message: `Terminal archive ${entry.name} has a report hash mismatch.` };
+			}
+			archives.push({ kind: terminal, run: decoded.value, archiveDirectory: directory, runSha256: hash(runBytes.bytes), manifestSha256: hash(manifestBytes.bytes) });
+		}
+		return { kind: "loaded", archives };
+	} catch (error: unknown) {
+		return { kind: "unavailable", message: errorText(error).slice(0, 2_000) };
 	}
 }

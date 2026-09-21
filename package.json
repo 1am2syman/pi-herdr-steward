@@ -29,6 +29,7 @@
     "test:resume": "vitest run test/resume.functional.test.ts test/herdr-reconciliation.contract.test.ts --maxWorkers=1",
     "test:retry": "vitest run test/retry.functional.test.ts test/retry-policy.contract.test.ts test/retry-storage.contract.test.ts test/herdr-retry.contract.test.ts --maxWorkers=1",
     "test:completion": "vitest run test/completion.functional.test.ts",
+    "test:cancel-cleanup": "vitest run test/cancel-cleanup.functional.test.ts test/herdr-adapter.contract.test.ts test/completion-storage.contract.test.ts --maxWorkers=1",
     "test:integration-git": "vitest run test/integration-git.contract.test.ts",
     "test:completion-storage": "vitest run test/completion-storage.contract.test.ts",
     "test:process": "vitest run test/process-adapter.contract.test.ts test/process-observer.contract.test.ts",

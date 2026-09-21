@@ -50,6 +50,10 @@ import type {
 	HerdrInputResult,
 	HerdrPromptResult,
 	SilenceProcessObservation,
+	HerdrCleanupPreflightResult,
+	HerdrCleanupEffectResult,
+	HerdrCleanupPaneObservation,
+	HerdrCleanupWorktreeObservation,
 } from "./steward.ts";
 import type { ReviewerChoiceInspection } from "./review.ts";
 import { parseTaskFactRequest, type TaskFactRequestResult } from "./reconciliation.ts";
@@ -115,6 +119,8 @@ export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJourna
 		finalizeVerificationResult: runStore.finalizeVerificationResult,
 		inspectFinalVerificationResult: runStore.inspectFinalVerificationResult,
 		archiveCompletedRun: runStore.archiveCompletedRun,
+		archiveCancelledRun: runStore.archiveCancelledRun,
+		listTerminalArchives: runStore.listTerminalArchives,
 		loadCompletionJournalPointers: runStore.loadCompletionJournalPointers,
 		loadRecoveryDefaults: () => configStore.loadRecoveryDefaults(),
 		loadModelPlans: (repositoryRoot) => configStore.loadModelPlans(repositoryRoot),
@@ -482,6 +488,36 @@ function unavailableManagedAgent(diagnostic: string): ManagedAgentInspection {
 	return value;
 }
 
+function cleanupError(result: ExecResult, expectedId: string): { kind: "missing" } | { kind: "failed"; message: string } | undefined {
+	const error = safeErrorEnvelope(result);
+	if (result.killed) return { kind: "failed", message: "Herdr cleanup command was killed." };
+	if (error?.id === expectedId && ["workspace_not_found", "pane_not_found", "worktree_not_found"].includes(error.code)) return { kind: "missing" };
+	if (result.code !== 0 || result.stderr.length > 0) return { kind: "failed", message: error?.id === expectedId ? error.message : "Herdr cleanup command exited without an exact successful result." };
+	if (error?.id === expectedId) return { kind: "failed", message: error.message };
+	return undefined;
+}
+
+function cleanupIdentity(value: JsonObject | undefined): { workspaceId: string; paneId: string; terminalId: string; root: boolean } | undefined {
+	if (!value || !safeIdentity(value.workspace_id) || !safeIdentity(value.pane_id) || !safeIdentity(value.terminal_id)) return undefined;
+	if (typeof value.root === "boolean" && typeof value.is_root === "boolean" && value.root !== value.is_root) return undefined;
+	const root = typeof value.root === "boolean" ? value.root : typeof value.is_root === "boolean" ? value.is_root : undefined;
+	return root === undefined ? undefined : { workspaceId: value.workspace_id, paneId: value.pane_id, terminalId: value.terminal_id, root };
+}
+
+function cleanupWorktree(value: JsonObject | undefined): { workspaceId: string; path: string; branch: string; rootPaneId?: string } | undefined {
+	if (!value || !safeIdentity(value.workspace_id) || typeof value.path !== "string" || !isAbsolute(value.path) || value.path !== value.path.trim() || !safeIdentity(value.branch)) return undefined;
+	if ("root_pane_id" in value && !safeIdentity(value.root_pane_id)) return undefined;
+	return { workspaceId: value.workspace_id, path: value.path, branch: value.branch, ...(safeIdentity(value.root_pane_id) ? { rootPaneId: value.root_pane_id } : {}) };
+}
+
+function cleanupWorkspaceId(value: JsonObject | undefined): string | undefined {
+	return value && safeIdentity(value.workspace_id) ? value.workspace_id : undefined;
+}
+
+function cleanupList(value: unknown): JsonObject[] | undefined {
+	return Array.isArray(value) && value.every((item) => objectValue(item)) ? value as JsonObject[] : undefined;
+}
+
 export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerdrAdapter {
 	return {
 		async checkAvailability(repositoryRoot) {
@@ -762,6 +798,80 @@ export function createHerdrAdapter(exec: CommandRunner | undefined): StewardHerd
 				const result = await exec("herdr", ["agent", "prompt", input.identity.name, input.assignmentPrompt], { cwd: input.repositoryRoot, timeout: 30_000 });
 				return exactPromptAcknowledgement(result, input.identity) ?? { kind: "failed", stage: "agent-prompt", code: result.killed ? "killed" : "ambiguous-response", message: "Herdr returned no exact replacement prompt acknowledgement." };
 			} catch (error: unknown) { return { kind: "failed", stage: "agent-prompt", code: "runner-error", message: error instanceof Error ? error.message : "Replacement prompt failed." }; }
+		},
+		async preflightCleanupWorkspace(input) {
+			if (!exec || !safeIdentity(input.workspaceId)) return { kind: "ambiguous", message: "The cleanup workspace identity or command runner is unavailable." };
+			try {
+				const workspaceResult = await exec("herdr", ["workspace", "get", input.workspaceId], { cwd: input.repositoryRoot, timeout: 5_000 });
+				const workspaceError = cleanupError(workspaceResult, "cli:workspace:get");
+				if (workspaceError?.kind === "missing") return { kind: "missing", resource: "workspace", workspaceId: input.workspaceId };
+				if (workspaceError) return { kind: "ambiguous", message: workspaceError.message };
+				const workspaceEnvelope = safeEnvelope(workspaceResult);
+				const workspaceValue = resultObject(workspaceEnvelope);
+				const workspace = objectValue(workspaceValue?.workspace) ?? workspaceValue;
+				if (workspaceEnvelope?.id !== "cli:workspace:get" || workspaceValue?.type !== "workspace_info" || cleanupWorkspaceId(workspace) !== input.workspaceId) return { kind: "ambiguous", message: "Herdr returned no exact cleanup workspace identity." };
+
+				const paneResult = await exec("herdr", ["pane", "list", "--workspace", input.workspaceId], { cwd: input.repositoryRoot, timeout: 5_000 });
+				const paneError = cleanupError(paneResult, "cli:pane:list");
+				if (paneError?.kind === "missing") return { kind: "missing", resource: "workspace", workspaceId: input.workspaceId };
+				if (paneError) return { kind: "ambiguous", message: paneError.message };
+				const paneEnvelope = safeEnvelope(paneResult);
+				const paneValue = resultObject(paneEnvelope);
+				const paneRows = cleanupList(paneValue?.panes);
+				if (paneEnvelope?.id !== "cli:pane:list" || paneValue?.type !== "pane_list" || !paneRows) return { kind: "ambiguous", message: "Herdr returned no exact cleanup pane inventory." };
+				const panes: HerdrCleanupPaneObservation[] = [];
+				for (const row of paneRows) {
+					const pane = cleanupIdentity(row);
+					if (!pane || pane.workspaceId !== input.workspaceId) return { kind: "ambiguous", message: "Herdr returned a malformed or foreign cleanup pane identity." };
+					panes.push(pane);
+				}
+
+				const worktreeResult = await exec("herdr", ["worktree", "list", "--workspace", input.workspaceId], { cwd: input.repositoryRoot, timeout: 5_000 });
+				const worktreeError = cleanupError(worktreeResult, "cli:worktree:list");
+				if (worktreeError?.kind === "missing") return { kind: "missing", resource: "workspace", workspaceId: input.workspaceId };
+				if (worktreeError) return { kind: "ambiguous", message: worktreeError.message };
+				const worktreeEnvelope = safeEnvelope(worktreeResult);
+				const worktreeValue = resultObject(worktreeEnvelope);
+				const worktreeRows = cleanupList(worktreeValue?.worktrees);
+				if (worktreeEnvelope?.id !== "cli:worktree:list" || worktreeValue?.type !== "worktree_list" || !worktreeRows) return { kind: "ambiguous", message: "Herdr returned no exact cleanup worktree inventory." };
+				const worktrees: HerdrCleanupWorktreeObservation[] = [];
+				for (const row of worktreeRows) {
+					const worktree = cleanupWorktree(row);
+					if (!worktree || worktree.workspaceId !== input.workspaceId) return { kind: "ambiguous", message: "Herdr returned a malformed or foreign cleanup worktree identity." };
+					worktrees.push(worktree);
+				}
+				return { kind: "ready", workspaceId: input.workspaceId, panes, worktrees };
+			} catch (error: unknown) {
+				return { kind: "ambiguous", message: error instanceof Error ? error.message : "Cleanup workspace preflight failed." };
+			}
+		},
+		async closeCleanupPane(input) {
+			if (!exec || !safeIdentity(input.workspaceId) || !safeIdentity(input.paneId) || !safeIdentity(input.terminalId)) return { kind: "ambiguous", resourceId: input.paneId, message: "The cleanup pane identity or command runner is unavailable." };
+			try {
+				const result = await exec("herdr", ["pane", "close", input.paneId], { cwd: input.repositoryRoot, timeout: 5_000 });
+				const error = cleanupError(result, "cli:pane:close");
+				if (error?.kind === "missing") return { kind: "missing", resourceId: input.paneId };
+				if (error) return { kind: "ambiguous", resourceId: input.paneId, message: error.message };
+				const envelope = safeEnvelope(result);
+				const value = resultObject(envelope);
+				const pane = cleanupIdentity(objectValue(value?.pane));
+				if (envelope?.id !== "cli:pane:close" || value?.type !== "pane_closed" || !pane || pane.workspaceId !== input.workspaceId || pane.paneId !== input.paneId || pane.terminalId !== input.terminalId || pane.root) return { kind: "ambiguous", resourceId: input.paneId, message: "Herdr returned no exact non-root cleanup pane-close acknowledgement." };
+				return { kind: "completed", resourceId: input.paneId };
+			} catch (error: unknown) { return { kind: "ambiguous", resourceId: input.paneId, message: error instanceof Error ? error.message : "Cleanup pane close failed." }; }
+		},
+		async removeCleanupWorktree(input) {
+			if (!exec || !safeIdentity(input.workspaceId) || !safeIdentity(input.path) || !isAbsolute(input.path) || !safeIdentity(input.branch)) return { kind: "ambiguous", resourceId: input.path, message: "The cleanup worktree identity or command runner is unavailable." };
+			try {
+				const result = await exec("herdr", ["worktree", "remove", "--workspace", input.workspaceId], { cwd: input.repositoryRoot, timeout: 30_000 });
+				const error = cleanupError(result, "cli:worktree:remove");
+				if (error?.kind === "missing") return { kind: "missing", resourceId: input.path };
+				if (error) return { kind: "ambiguous", resourceId: input.path, message: error.message };
+				const envelope = safeEnvelope(result);
+				const value = resultObject(envelope);
+				const worktree = cleanupWorktree(objectValue(value?.worktree));
+				if (envelope?.id !== "cli:worktree:remove" || value?.type !== "worktree_removed" || !worktree || worktree.workspaceId !== input.workspaceId || worktree.path !== input.path || worktree.branch !== input.branch) return { kind: "ambiguous", resourceId: input.path, message: "Herdr returned no exact cleanup worktree-remove acknowledgement." };
+				return { kind: "completed", resourceId: input.path };
+			} catch (error: unknown) { return { kind: "ambiguous", resourceId: input.path, message: error instanceof Error ? error.message : "Cleanup worktree removal failed." }; }
 		},
 	};
 }
@@ -1477,6 +1587,14 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		ui.notify(result.message, result.kind === "started" || result.kind === "started-and-dispatched" ? "info" : result.kind === "started-with-warning" || result.kind === "started-and-dispatched-with-warning" || result.kind === "started-dispatch-pending" ? "warning" : result.kind === "cancelled" ? "info" : "error");
 	}
 
+	function presentCancellationResult(result: import("./steward.ts").CancellationResult): void {
+		ui.notify(result.message, result.kind === "cancelled" || result.kind === "archived" || result.kind === "declined" ? "info" : result.kind === "incomplete" ? "warning" : "error");
+	}
+
+	function presentCleanupResult(result: import("./steward.ts").CleanupResult): void {
+		ui.notify(result.message, result.kind === "completed" || result.kind === "noop" || result.kind === "declined" ? "info" : result.kind === "partial" ? "warning" : "error");
+	}
+
 	function presentResumeResult(result: import("./steward.ts").ResumeResult): void {
 		const message = result.kind === "reconciled" ? result.result.note : result.message;
 		ui.notify(message, result.kind === "reconciled" && result.result.condition === "ordinary" ? "info" : "warning");
@@ -1511,8 +1629,12 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		confirmRunRevision: (summary) => ui.confirm!("Confirm Steward Run revision", summary.markdown),
 		presentRevisionResult,
 		confirmSameFamilyReview,
-			presentStartResult,
-			presentResumeResult,
+		confirmCancellation: (summary) => ui.confirm!("Cancel Steward Run", summary.markdown),
+		presentCancellationResult,
+		confirmCleanup: (summary) => ui.confirm!("Clean up Steward resources", summary.markdown),
+		presentCleanupResult,
+		presentStartResult,
+		presentResumeResult,
 		notifyCompletion,
 		presentMonitorCondition,
 	};

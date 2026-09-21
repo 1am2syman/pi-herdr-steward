@@ -6,7 +6,7 @@ import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
 import { createAttemptEvidenceStore, type BuilderEvidenceInputRequest, type BuilderEvidenceInputs, type FinalizeBuilderEvidenceRequest, type FinalizeBuilderEvidenceResult, type ReferencedEvidenceRequest, type ReferencedEvidenceResult, type ReviewerEvidenceInputRequest, type ReviewerEvidenceInputs, type ReferencedReviewerEvidenceRequest, type ReferencedReviewerEvidenceResult, type FinalizeReviewerEvidenceRequest, type FinalizeReviewerEvidenceResult, type FinalizedManifestLoadResult } from "./attempt-evidence-store.ts";
-import { archiveCompletedRun, finalizeVerificationResult, inspectFinalVerificationResult, resolveCompletionPaths, type ArchiveCompletedRunRequest, type ArchiveCompletedRunResult, type CompletionJournalPointers, type CompletionPaths, type FinalVerificationResultInspection, type VerificationEvidenceInput, type VerificationFinalizeResult } from "./completion-store.ts";
+import { archiveCancelledRun, archiveCompletedRun, finalizeVerificationResult, inspectFinalVerificationResult, listTerminalArchives, resolveCompletionPaths, type ArchiveCancelledRunRequest, type ArchiveCancelledRunResult, type ArchiveCompletedRunRequest, type ArchiveCompletedRunResult, type CompletionJournalPointers, type CompletionPaths, type FinalVerificationResultInspection, type TerminalArchiveListingResult, type VerificationEvidenceInput, type VerificationFinalizeResult } from "./completion-store.ts";
 import {
 	ensureProjectStateDirectory,
 	ensureOwnedDirectory,
@@ -91,6 +91,8 @@ export interface RunJournalStore {
 	finalizeVerificationResult(input: VerificationEvidenceInput): Promise<VerificationFinalizeResult>;
 	inspectFinalVerificationResult(input: { repositoryRoot: string; runId: string; command: string; cwd: string; attemptId: import("./run.ts").FinalVerificationAttemptId; executionNonce?: string; argvSha256?: string }): Promise<FinalVerificationResultInspection>;
 	archiveCompletedRun(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult>;
+	archiveCancelledRun(input: ArchiveCancelledRunRequest): Promise<ArchiveCancelledRunResult>;
+	listTerminalArchives(repositoryRoot: string): Promise<TerminalArchiveListingResult>;
 	loadCompletionJournalPointers(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: CompletionJournalPointers } | { kind: "unavailable"; message: string }>;
 }
 
@@ -492,6 +494,17 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		return archiveCompletedRun({ ...input, activeRunBytes: Buffer.from(active.bytes, "utf8"), previousRunBytes: Buffer.from(previous.bytes, "utf8"), configDirName });
 	}
 
+	async function archiveCancelled(input: ArchiveCancelledRunRequest): Promise<ArchiveCancelledRunResult> {
+		const paths = resolvePaths(input.repositoryRoot);
+		const active = await readJournalFile(paths.activePath);
+		const previous = await readJournalFile(paths.previousPath);
+		if (active.kind !== "loaded" || previous.kind !== "loaded") {
+			const completionPaths = resolveCompletionPaths(input.repositoryRoot, input.runId, configDirName);
+			return { kind: "storage-error", paths: completionPaths, message: "Both active and previous Journal pointers must be loaded before cancelled archive publication.", deletedActive: false, deletedPrevious: false };
+		}
+		return archiveCancelledRun({ ...input, activeRunBytes: Buffer.from(active.bytes, "utf8"), previousRunBytes: Buffer.from(previous.bytes, "utf8"), configDirName });
+	}
+
 	async function loadCompletionJournalPointers(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: CompletionJournalPointers } | { kind: "unavailable"; message: string }> {
 		const paths = resolvePaths(repositoryRoot);
 		try {
@@ -527,6 +540,8 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		finalizeVerificationResult,
 		inspectFinalVerificationResult: (input) => inspectFinalVerificationResult({ ...input, configDirName }),
 		archiveCompletedRun: archiveRun,
+		archiveCancelledRun: archiveCancelled,
+		listTerminalArchives: (repositoryRoot) => listTerminalArchives(repositoryRoot, configDirName),
 		loadCompletionJournalPointers,
 	};
 }

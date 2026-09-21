@@ -93,6 +93,11 @@ import {
 	type AnyCompletionGateFacts,
 	type CompletionArchiveIntent,
 	type CompletionRecord,
+	type CancellationRecord,
+	type StewardOwnedPane,
+	type StewardOwnedWorktree,
+	type CancellationAgentStop,
+	type CancellationArchiveIntent,
 	type MonitorCheckpoint,
 	type MonitorDigest,
 	type MonitorLifecycle,
@@ -144,6 +149,8 @@ import {
 	type EvidencePaths,
 } from "./attempt-evidence-store.ts";
 import type {
+	ArchiveCancelledRunRequest,
+	ArchiveCancelledRunResult,
 	ArchiveCompletedRunRequest,
 	ArchiveCompletedRunResult,
 	CompletionPaths,
@@ -201,6 +208,11 @@ function currentAttemptForTask(task: TaskRecord): AttemptRecord | undefined {
 	return currentAttempt(task);
 }
 
+function runAllowsWorkflowAdvance(run: RunJournal["run"] | RunJournal): boolean {
+	const record = "run" in run ? run.run : run;
+	return record.status !== "cancelled" && record.cancellation === undefined;
+}
+
 function attemptIdentity(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
 	if (!hasProvenAgentIdentity(attempt)) return undefined;
 	const dispatch = attempt.dispatch;
@@ -236,6 +248,8 @@ export interface RunJournalAdapter {
 	finalizeVerificationResult?(input: VerificationEvidenceInput): Promise<VerificationFinalizeResult>;
 	inspectFinalVerificationResult?(input: { repositoryRoot: string; runId: string; command: string; cwd: string; attemptId: import("./run.ts").FinalVerificationAttemptId; executionNonce?: string; argvSha256?: string }): Promise<import("./completion-store.ts").FinalVerificationResultInspection>;
 	archiveCompletedRun?(input: ArchiveCompletedRunRequest): Promise<ArchiveCompletedRunResult>;
+	archiveCancelledRun?(input: ArchiveCancelledRunRequest): Promise<ArchiveCancelledRunResult>;
+	listTerminalArchives?(repositoryRoot: string): Promise<import("./completion-store.ts").TerminalArchiveListingResult>;
 	loadCompletionJournalPointers?(repositoryRoot: string): Promise<{ kind: "loaded"; pointers: import("./completion-store.ts").CompletionJournalPointers } | { kind: "unavailable"; message: string }>;
 	loadRecoveryDefaults(): Promise<ConfigLoadResult<RecoveryDefaults>>;
 	loadModelPlans(repositoryRoot: string): Promise<ConfigLoadResult<ProjectModelPlans>>;
@@ -284,6 +298,10 @@ export interface StewardUiAdapter {
 	confirmRunRevision?(summary: RunRevisionConfirmationSummary): Promise<boolean>;
 	presentRevisionResult?(result: RevisionResult): void;
 	confirmSameFamilyReview?(input: { builderModel: import("./config.ts").ModelChoice; reviewerModel: import("./config.ts").ModelChoice; subject: ReviewSubject; provider: string }): Promise<boolean>;
+	confirmCancellation?(summary: CancellationConfirmationSummary): Promise<boolean>;
+	presentCancellationResult?(result: CancellationResult): void;
+	confirmCleanup?(summary: CleanupConfirmationSummary): Promise<boolean>;
+	presentCleanupResult?(result: CleanupResult): void;
 	presentStartResult(result: StartResult): void;
 	presentResumeResult?(result: ResumeResult): void;
 	notifyCompletion?(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void;
@@ -318,6 +336,9 @@ export interface StewardHerdrAdapter {
 	createRecoveryPane?(input: { repositoryRoot: string; sourcePaneId: string; workspaceId: string; worktreePath: string; branch: string; agentName: string }): Promise<HerdrReviewerPaneResult>;
 	startReplacementAgent?(input: { repositoryRoot: string; name: string; paneId: string; model: import("./config.ts").ModelChoice }): Promise<HerdrAgentStartResult>;
 	promptReplacementAgent?(input: { repositoryRoot: string; identity: ManagedAgentIdentity; assignmentPrompt: string }): Promise<HerdrPromptResult>;
+	preflightCleanupWorkspace?(input: { repositoryRoot: string; workspaceId: string }): Promise<HerdrCleanupPreflightResult>;
+	closeCleanupPane?(input: { repositoryRoot: string; workspaceId: string; paneId: string; terminalId: string }): Promise<HerdrCleanupEffectResult>;
+	removeCleanupWorktree?(input: { repositoryRoot: string; workspaceId: string; path: string; branch: string }): Promise<HerdrCleanupEffectResult>;
 }
 
 export type HerdrWorktreeCreateResult =
@@ -353,6 +374,30 @@ export type HerdrInputResult =
 export type HerdrAvailability =
 	| { kind: "available"; status: string; running: true; compatible: true; endpointCompatible: true; protocol?: number }
 	| { kind: "unavailable"; message: string };
+
+export interface HerdrCleanupPaneObservation {
+	workspaceId: string;
+	paneId: string;
+	terminalId: string;
+	root: boolean;
+}
+
+export interface HerdrCleanupWorktreeObservation {
+	workspaceId: string;
+	path: string;
+	branch: string;
+	rootPaneId?: string;
+}
+
+export type HerdrCleanupPreflightResult =
+	| { kind: "ready"; workspaceId: string; panes: HerdrCleanupPaneObservation[]; worktrees: HerdrCleanupWorktreeObservation[] }
+	| { kind: "missing"; resource: "workspace"; workspaceId: string }
+	| { kind: "blocked" | "ambiguous"; message: string };
+
+export type HerdrCleanupEffectResult =
+	| { kind: "completed"; resourceId: string }
+	| { kind: "missing"; resourceId: string }
+	| { kind: "failed" | "ambiguous"; message: string };
 
 export interface StewardGitAdapter {
 	inspectIntegrationBase(repositoryRoot: string): Promise<IntegrationBaseInspection>;
@@ -475,7 +520,7 @@ export type MonitorTrigger = "start" | "lifecycle" | "fallback" | "settled" | "t
 
 export type MonitorWorkflowAction = "record-observation" | "finalize-builder-evidence" | "invalidate-approval" | "dispatch-builder" | "dispatch-reviewer" | "finalize-reviewer-evidence" | "request-reviewer-report-repair" | "dispatch-rework-builder" | "integrate-approved-range" | "run-final-verification" | "pass-completion-gate" | "stop-next-agent" | "publish-completion-archive" | "silence-nudge" | "silence-interrupt" | "silence-resume" | "reserve-silent-replacement" | "reserve-transient-replacement" | "none" | "approval-required" | "blocked" | "degraded";
 
-export type MonitorCondition = "completed" | "approval-required" | "blocked" | "degraded" | "ordinary";
+export type MonitorCondition = "completed" | "cancelled" | "approval-required" | "blocked" | "degraded" | "ordinary";
 
 export interface MonitorConditionInput {
 	condition: MonitorCondition;
@@ -509,11 +554,11 @@ export type ResumeResult =
 
 export type ControllerSessionRestoreResult =
 	| { kind: "restored"; journal: RunJournal }
-	| { kind: "dormant"; reason: "missing" | "invalid" | "foreign-session" | "completed"; message: string; journal?: RunJournal };
+	| { kind: "dormant"; reason: "missing" | "invalid" | "foreign-session" | "completed" | "cancelled"; message: string; journal?: RunJournal };
 
 export type CompactionContinuityResult =
 	| { kind: "prepared"; journal: RunJournal; runId: string; journalRevision: number; controllerSessionId: string; pendingAction: ControllerPendingAction; block: string }
-	| { kind: "missing" | "invalid" | "foreign-session" | "completed" | "stale"; message: string };
+	| { kind: "missing" | "invalid" | "foreign-session" | "completed" | "cancelled" | "stale"; message: string };
 
 export interface CompactionFailureDetails {
 	reason: "manual" | "threshold" | "overflow";
@@ -592,7 +637,33 @@ export interface CompletedStatusView {
 	footer: EmptyFooterView;
 }
 
-export type StatusView = EmptyStatusView | ActiveStatusView | CompletedStatusView;
+export type StatusView = EmptyStatusView | ActiveStatusView | CompletedStatusView | CancelledStatusView;
+
+export interface CancelledStatusView {
+	kind: "present";
+	cancelled: true;
+	markdown: string;
+	footer: ActiveFooterView;
+}
+
+export type CancellationConfirmationSummary = { runId: string; markdown: string };
+
+export type CancellationResult =
+	| { kind: "declined"; message: string }
+	| { kind: "refused" | "stale" | "storage-error"; message: string }
+	| { kind: "cancelled" | "archived" | "incomplete"; journal?: RunJournal; message: string };
+
+export interface CleanupConfirmationSummary {
+	markdown: string;
+	archives: Array<{ runId: string; archiveDirectory: string; runSha256: string; manifestSha256: string }>;
+	panes: StewardOwnedPane[];
+	worktrees: StewardOwnedWorktree[];
+}
+
+export type CleanupResult =
+	| { kind: "declined"; message: string }
+	| { kind: "refused" | "stale" | "blocked" | "partial" | "storage-error"; message: string }
+	| { kind: "noop" | "completed"; message: string };
 
 export type ConfigureResult =
 	| { kind: "cancelled"; scope?: ConfigurationScope; path?: string; message: string }
@@ -629,6 +700,8 @@ export interface Steward {
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
 	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
 	revise(repositoryRoot: string, controllerSessionId: string): Promise<RevisionResult>;
+	cancel(repositoryRoot: string, controllerSessionId: string): Promise<CancellationResult>;
+	cleanup(repositoryRoot: string, controllerSessionId: string): Promise<CleanupResult>;
 	waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult>;
 	observeMonitorProgress(repositoryRoot: string, controllerSessionId: string, trigger: MonitorTrigger): Promise<MonitorPassResult>;
 	advanceNext(repositoryRoot: string, controllerSessionId: string, options: MonitorAdvanceOptions): Promise<MonitorPassResult>;
@@ -710,7 +783,14 @@ function presentCompletedStatus(journal: RunJournal, note?: string): CompletedSt
 	return { kind: "present", completed: true, markdown: [`Run ${journal.run.id}: completed`, ...(gate ? [`Integrated head: ${gate.integratedHead}`] : []), ...(completion?.phase === "archived" ? [`Archive: ${completion.archive.archiveDirectory}`, `Verification result: ${completion.archive.verification.resultPath}`, `Verification output: ${completion.archive.verification.logPath}`] : []), ...(note ? [note] : [])].join("\n"), footer: { run: "none", attentionCount: 0, text: "steward: no active Run" } };
 }
 
+function presentCancelledStatus(journal: RunJournal, note?: string): CancelledStatusView {
+	const cancellation = journal.run.cancellation;
+	const lines = [`Run ${journal.run.id}: cancelled`, `Cancellation: ${cancellation?.phase ?? "invalid"}`, ...(cancellation ? [`Cancelled at: ${cancellation.cancelledAt}`, `Owned panes retained: ${cancellation.panes.length}`, `Owned Builder worktrees retained: ${cancellation.worktrees.length}`, `Stop records: ${cancellation.stops.map((stop) => `${stop.role}/${stop.attemptId}/${stop.state}${stop.state === "not-required" ? ` (${stop.reason})` : ""}`).join(", ") || "none"}`, ...(cancellation.phase === "stops-incomplete" ? [`Stop failure: ${cancellation.failure.diagnostic}`] : []), ...(cancellation.phase === "archived" ? [`Archive: ${cancellation.archive.archiveDirectory}`] : [])] : []), "Normal advancement, replacement, integration, and verification are dormant; evidence is retained.", ...(note ? [note] : [])];
+	return { kind: "present", cancelled: true, markdown: lines.join("\n"), footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · cancelled` } };
+}
+
 function presentStatusForJournal(journal: RunJournal, note?: string): StatusView {
+	if (journal.run.status === "cancelled" || journal.run.cancellation) return presentCancelledStatus(journal, note);
 	if (journal.run.tasks.length > 1) return presentMultiTaskStatus(journal, note);
 	if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return presentCompletedStatus(journal, note);
 	if (journal.run.status === "completing" || journal.run.tasks.some((candidate) => candidate.phase === "integrating" || candidate.phase === "completed")) return presentCompletionStatus(journal, note);
@@ -812,6 +892,7 @@ function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatu
 }
 
 function pendingControllerAction(journal: RunJournal): ControllerPendingAction {
+	if (journal.run.status === "cancelled" || journal.run.cancellation) return { kind: "none" };
 	const finalExecution = journal.run.finalVerificationExecution;
 	if (finalExecution && isRecoverableFinalVerificationExecution(finalExecution) && (finalExecution.phase === "executing" || finalExecution.phase === "failed")) return { kind: "final-verification" };
 	for (const task of journal.run.tasks) {
@@ -1451,6 +1532,7 @@ function reviewSnapshotsExact(left: import("./run.ts").ReviewWorktreeSnapshot, r
 }
 
 async function dispatchReviewer(repositoryRoot: string, controllerSessionId: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, subject: ReviewSubject, manifestPath: string, manifestSha256: string, baseline: import("./run.ts").ReviewWorktreeSnapshot, reviewerModel: import("./config.ts").ModelChoice, independence: ReviewerIndependence, dependencies: StewardDependencies): Promise<ReviewDecision> {
+	if (!runAllowsWorkflowAdvance(journalInput)) return { journal: journalInput, note: "The Run is cancelled; Reviewer dispatch is dormant and no Herdr effect was attempted." };
 	let journal = journalInput;
 	if (!hasProvenAgentIdentity(candidate.builder)) return { journal, note: "Reviewer dispatch is waiting for a fully proven Builder identity; no Reviewer effect was attempted." };
 	const builderDispatch = candidate.builder.dispatch;
@@ -1622,6 +1704,7 @@ async function persistReviewApprovalRequired(repositoryRoot: string, journal: Ru
 }
 
 async function advanceEligibleReview(repositoryRoot: string, controllerSessionId: string, journal: RunJournal, dependencies: StewardDependencies, automatic = false, minimumIndex = 0): Promise<ReviewDecision> {
+	if (!runAllowsWorkflowAdvance(journal)) return { journal, note: "The Run is cancelled; Review advancement is dormant and no Herdr effect was attempted." };
 	const reviewerSelected = reviewerTaskCandidate(journal, minimumIndex);
 	if (reviewerSelected) {
 		if (automatic && dependencies.runJournal.inspectAttemptReport) {
@@ -1746,6 +1829,7 @@ function monitorChangedSources(previous: MonitorCheckpoint | undefined, next: Mo
 
 function monitorFooter(journal: RunJournal, condition: MonitorCondition, diagnostic?: string): string {
 	if (condition === "completed") return "steward: no active Run";
+	if (condition === "cancelled") return `steward: ${journal.run.id} · cancelled`;
 	const task = journal.run.tasks.find((candidate) => candidate.attention !== "none") ?? journal.run.tasks[0];
 	const attention = journal.run.tasks.filter((candidate) => candidate.attention !== "none").length;
 	const phase = task?.phase ?? journal.run.status;
@@ -2259,6 +2343,7 @@ async function appendManagedRecoveryAttempt(repositoryRoot: string, journal: Run
 }
 
 async function launchManagedFinalVerification(repositoryRoot: string, journal: RunJournal, execution: RecoverableFinalVerificationExecution, dependencies: StewardDependencies): Promise<CompletionDecision> {
+	if (!runAllowsWorkflowAdvance(journal)) return { journal, note: "The Run is cancelled; final verification is dormant and no process was launched." };
 	const attempt = managedExecutionLast(execution);
 	const nonce = managedVerificationNonce(journal.run.id, attempt.id, execution.command, execution.cwd);
 	const input: ManagedVerificationInput = { repositoryRoot, runId: journal.run.id, attemptId: attempt.id, command: execution.command, cwd: execution.cwd, executionNonce: nonce, paths: attempt.paths };
@@ -2486,6 +2571,7 @@ async function persistStopFailure(repositoryRoot: string, journal: RunJournal, t
 
 async function advanceMultiTaskIntegration(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies): Promise<CompletionDecision> {
 	let journal = journalInput;
+	if (!runAllowsWorkflowAdvance(journalInput)) return { journal: journalInput, note: "The Run is cancelled; ordered integration is dormant and no Git effect was attempted." };
 	const queue = selectIntegrationQueueHead(journal.run);
 	if (queue.kind !== "ready") {
 		if (queue.kind === "waiting" && (queue.reason === "integration" || queue.reason === "attention")) {
@@ -2544,6 +2630,7 @@ async function advanceMultiTaskIntegration(repositoryRoot: string, journalInput:
 
 async function advanceMultiTaskFinalization(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies, oneAction: boolean): Promise<CompletionDecision> {
 	let journal = journalInput;
+	if (!runAllowsWorkflowAdvance(journalInput)) return { journal: journalInput, note: "The Run is cancelled; final verification is dormant and no process was launched." };
 	if (!allRequiredTasksIntegrated(journal.run) || journal.run.tasks.some((task) => task.attention !== "none" || ["building", "reviewing", "reworking"].includes(task.phase))) return { journal, note: "Final verification is gated until every Task is complete, attention-free, and every ordered code integration is durable." };
 	if (journal.run.finalVerification.kind !== "command") return { journal, note: "Final verification is criteria-only; no process was launched." };
 	const codeTasks = journal.run.tasks.filter((task) => task.contract.expectedArtifacts.some((artifact) => artifact.kind === "git-commit"));
@@ -2622,6 +2709,7 @@ async function advanceMultiTaskCompletion(repositoryRoot: string, journal: RunJo
 }
 
 async function advanceApprovedCompletion(repositoryRoot: string, journalInput: RunJournal, dependencies: StewardDependencies, oneAction = false): Promise<CompletionDecision> {
+	if (!runAllowsWorkflowAdvance(journalInput)) return { journal: journalInput, note: "The Run is cancelled; completion advancement is dormant and no effect was attempted." };
 	let journal = journalInput;
 	if (journal.run.status === "completing") return advanceCompletionLifecycle(repositoryRoot, journal, dependencies, oneAction);
 	if (journal.run.status !== "active") return { journal, note: "" };
@@ -2963,6 +3051,7 @@ function isIntegrationReworkDispatchForSteward(dispatch: AttemptRecord["dispatch
 }
 
 async function dispatchReworkBuilder(repositoryRoot: string, journalInput: RunJournal, candidate: { index: number; task: TaskRecord; builder: BuilderAttemptRecord }, reviewer: ReviewerAttemptRecord, findings: import("./review.ts").ReviewerFinding[], dependencies: StewardDependencies): Promise<ReviewDecision> {
+	if (!runAllowsWorkflowAdvance(journalInput)) return { journal: journalInput, note: "The Run is cancelled; Builder rework is dormant and no Herdr effect was attempted." };
 	let journal = journalInput;
 	const previousDispatch = candidate.builder.dispatch;
 	if ((previousDispatch.phase !== "prompted" && previousDispatch.phase !== "reconciled-active") || !dependencies.git.inspectBuilderWorktree || !dependencies.herdr.promptBuilder) return pauseReview(repositoryRoot, candidate, journal, dependencies, "Rework requires the original proven Builder identity and read-only worktree/prompt adapters; no replacement Builder was created.");
@@ -3056,6 +3145,7 @@ async function dispatchInitialBuilder(input: {
 }): Promise<DispatchOutcome> {
 	const { repositoryRoot, dependencies } = input;
 	let journal = input.journal;
+	if (!runAllowsWorkflowAdvance(journal)) return { kind: "pending", journal, message: "The Run is cancelled; Builder dispatch is dormant and no Herdr effect was attempted.", warnings: [] };
 	const warnings: string[] = [];
 	const pending = (message: string): DispatchOutcome => ({ kind: "pending", journal, message, warnings });
 	const note = async (event: string, message: string): Promise<void> => {
@@ -4261,6 +4351,162 @@ function silenceProcessChanged(left: SilenceProcessObservation | undefined, righ
 	return left.kind !== right.kind;
 }
 
+type CancellationAttemptPlan = {
+	taskId: string;
+	attemptId: string;
+	role: "builder" | "reviewer";
+	identity?: ManagedAgentIdentity;
+	duplicateIdentity?: boolean;
+	ownershipGap?: "worktree-intended" | "pane-intended" | "replacement-pane-intended";
+};
+
+type CancellationOwnership = {
+	priorTasks: import("./run.ts").CancellationPriorTask[];
+	panes: StewardOwnedPane[];
+	worktrees: StewardOwnedWorktree[];
+	attempts: CancellationAttemptPlan[];
+};
+
+function dispatchIdentityFor(attempt: AttemptRecord): ManagedAgentIdentity | undefined {
+	const dispatch = attempt.dispatch as unknown as Record<string, unknown>;
+	if (!["agentName", "workspaceId", "paneId", "terminalId"].every((key) => typeof dispatch[key] === "string" && (dispatch[key] as string).trim().length > 0)) return undefined;
+	return { name: dispatch.agentName as string, workspaceId: dispatch.workspaceId as string, paneId: dispatch.paneId as string, terminalId: dispatch.terminalId as string };
+}
+
+function dispatchPathFacts(attempt: AttemptRecord): { branch?: string; worktreePath?: string } {
+	const dispatch = attempt.dispatch as unknown as Record<string, unknown>;
+	return {
+		...(typeof dispatch.branch === "string" ? { branch: dispatch.branch } : {}),
+		...(typeof dispatch.worktreePath === "string" ? { worktreePath: dispatch.worktreePath } : {}),
+	};
+}
+
+function cancellationOwnershipFor(journal: RunJournal): CancellationOwnership {
+	const panes: StewardOwnedPane[] = [];
+	const worktrees: StewardOwnedWorktree[] = [];
+	const paneById = new Map<string, StewardOwnedPane>();
+	const worktreeByPath = new Map<string, StewardOwnedWorktree>();
+	const worktreeByBranch = new Map<string, StewardOwnedWorktree>();
+	const worktreeByRootPane = new Map<string, StewardOwnedWorktree>();
+	const agentKeys = new Set<string>();
+	const attempts: CancellationAttemptPlan[] = [];
+	const priorTasks: import("./run.ts").CancellationPriorTask[] = [];
+	for (const task of journal.run.tasks) {
+		const changing = task.attempts.filter((attempt) => ["prepared", "active", "awaiting-report"].includes(attempt.state));
+		if (task.phase !== "completed") priorTasks.push({ taskId: task.contract.id, phase: task.phase as Exclude<import("./run.ts").TaskPhase, "cancelled" | "completed">, attention: task.attention, attempts: changing.map((attempt) => ({ attemptId: attempt.id, state: attempt.state as "prepared" | "active" | "awaiting-report" })) });
+		for (const attempt of task.attempts) {
+			const identity = dispatchIdentityFor(attempt);
+			const pathFacts = dispatchPathFacts(attempt);
+			if (identity) {
+				const paneKey = `${identity.workspaceId}/${identity.paneId}`;
+				const kind: StewardOwnedPane["kind"] = attempt.role === "builder" ? "builder-root" : attempt.replacement ? "recovery" : "reviewer";
+				const pane: StewardOwnedPane = { runId: journal.run.id, taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, kind, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId };
+				const priorPane = paneById.get(paneKey);
+				if (priorPane && (priorPane.terminalId !== pane.terminalId || priorPane.role !== pane.role || priorPane.kind !== pane.kind)) throw new Error(`Conflicting recorded pane identity for ${paneKey}.`);
+				if (!priorPane) { paneById.set(paneKey, pane); panes.push(pane); }
+			}
+			if (attempt.role === "reviewer" && "workspaceId" in attempt.dispatch && "paneId" in attempt.dispatch && "terminalId" in attempt.dispatch && typeof attempt.dispatch.workspaceId === "string" && typeof attempt.dispatch.paneId === "string" && typeof attempt.dispatch.terminalId === "string") {
+				const paneKey = `${attempt.dispatch.workspaceId}/${attempt.dispatch.paneId}`;
+				const pane: StewardOwnedPane = { runId: journal.run.id, taskId: task.contract.id, attemptId: attempt.id, role: "reviewer", kind: attempt.replacement ? "recovery" : "reviewer", workspaceId: attempt.dispatch.workspaceId, paneId: attempt.dispatch.paneId, terminalId: attempt.dispatch.terminalId };
+				const priorPane = paneById.get(paneKey);
+				if (priorPane && (priorPane.terminalId !== pane.terminalId || priorPane.role !== pane.role || priorPane.kind !== pane.kind)) throw new Error(`Conflicting recorded pane identity for ${paneKey}.`);
+				if (!priorPane) { paneById.set(paneKey, pane); panes.push(pane); }
+			}
+			if (attempt.role === "builder" && identity && pathFacts.branch && pathFacts.worktreePath) {
+				const worktreeKey = pathFacts.worktreePath;
+				const worktree: StewardOwnedWorktree = { runId: journal.run.id, taskId: task.contract.id, attemptId: attempt.id, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, branch: pathFacts.branch, path: pathFacts.worktreePath };
+				const priorByPath = worktreeByPath.get(worktree.path);
+				const priorByBranch = worktreeByBranch.get(worktree.branch);
+				const priorByRootPane = worktreeByRootPane.get(`${worktree.workspaceId}/${worktree.paneId}`);
+				const priorFacts = [...new Set([priorByPath, priorByBranch, priorByRootPane].filter((candidate): candidate is StewardOwnedWorktree => candidate !== undefined))];
+				if (priorFacts.some((priorWorktree) => priorWorktree.workspaceId !== worktree.workspaceId || priorWorktree.path !== worktree.path || priorWorktree.branch !== worktree.branch || priorWorktree.paneId !== worktree.paneId || priorWorktree.terminalId !== worktree.terminalId)) throw new Error(`Conflicting recorded Builder worktree identity for ${worktreeKey}.`);
+				if (priorFacts.length === 0) { worktreeByPath.set(worktree.path, worktree); worktreeByBranch.set(worktree.branch, worktree); worktreeByRootPane.set(`${worktree.workspaceId}/${worktree.paneId}`, worktree); worktrees.push(worktree); }
+			}
+		}
+		for (const attempt of task.attempts) {
+			const identity = dispatchIdentityFor(attempt);
+			if (!identity && !changing.includes(attempt)) continue;
+			const dispatchPhase = (attempt.dispatch as { phase?: unknown }).phase;
+			const ownershipGap = !identity && (dispatchPhase === "worktree-intended" || dispatchPhase === "pane-intended" || dispatchPhase === "replacement-pane-intended") ? dispatchPhase : undefined;
+			const key = identity ? `${attempt.role}/${identity.name}/${identity.workspaceId}/${identity.paneId}/${identity.terminalId}` : undefined;
+			const duplicateIdentity = Boolean(key && agentKeys.has(key));
+			if (key) agentKeys.add(key);
+			if (changing.includes(attempt)) attempts.push({ taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, ...(identity ? { identity } : {}), ...(duplicateIdentity ? { duplicateIdentity: true } : {}), ...(ownershipGap ? { ownershipGap } : {}) });
+		}
+	}
+	panes.sort((left, right) => `${left.workspaceId}/${left.paneId}/${left.terminalId}/${left.taskId}/${left.attemptId}`.localeCompare(`${right.workspaceId}/${right.paneId}/${right.terminalId}/${right.taskId}/${right.attemptId}`));
+	worktrees.sort((left, right) => `${left.workspaceId}/${left.path}/${left.branch}/${left.taskId}/${left.attemptId}`.localeCompare(`${right.workspaceId}/${right.path}/${right.branch}/${right.taskId}/${right.attemptId}`));
+	return { priorTasks, panes, worktrees, attempts };
+}
+
+async function collectCancellationReports(repositoryRoot: string, journal: RunJournal, dependencies: StewardDependencies): Promise<import("./completion-store.ts").CompletionReportSource[] | { message: string }> {
+	if (!dependencies.runJournal.inspectAttemptReport) return { message: "Attempt Report inspection is unavailable; cancelled archive publication was not attempted." };
+	const reports: import("./completion-store.ts").CompletionReportSource[] = [];
+	for (const task of journal.run.tasks) for (const attempt of task.attempts) {
+		let inspection: AttemptReportInspection;
+		try { inspection = await dependencies.runJournal.inspectAttemptReport(repositoryRoot, attempt.reportPath); }
+		catch (error: unknown) { return { message: `Attempt Report inspection failed; cancelled archive publication was not attempted. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }; }
+		if (inspection.kind === "unavailable") return { message: `Attempt Report inspection was unavailable; cancelled archive publication was not attempted. ${inspection.diagnostic}` };
+		if (inspection.kind === "present") reports.push({ taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, sourcePath: attempt.reportPath, destinationPath: `reports/${task.contract.id}/${attempt.id}-${attempt.role}.md`, size: inspection.size, sha256: inspection.sha256 });
+	}
+	return reports;
+}
+
+type CleanupInventory = {
+	archives: Array<{ runId: string; archiveDirectory: string; runSha256: string; manifestSha256: string }>;
+	panes: StewardOwnedPane[];
+	worktrees: StewardOwnedWorktree[];
+};
+
+function cleanupInventoryForArchives(archives: readonly import("./completion-store.ts").TerminalArchiveSnapshot[]): CleanupInventory {
+	const panes = new Map<string, StewardOwnedPane>();
+	const worktrees = new Map<string, StewardOwnedWorktree>();
+	const worktreesByBranch = new Map<string, StewardOwnedWorktree>();
+	const worktreesByRootPane = new Map<string, StewardOwnedWorktree>();
+	const addPane = (pane: StewardOwnedPane): void => {
+		const key = `${pane.workspaceId}/${pane.paneId}`;
+		const prior = panes.get(key);
+		if (prior && (prior.terminalId !== pane.terminalId || prior.role !== pane.role || prior.kind !== pane.kind)) throw new Error(`Conflicting archived pane ownership for ${key}.`);
+		if (!prior) panes.set(key, pane);
+	};
+	const addWorktree = (worktree: StewardOwnedWorktree): void => {
+		const priorByPath = worktrees.get(worktree.path);
+		const priorByBranch = worktreesByBranch.get(worktree.branch);
+		const priorByRootPane = worktreesByRootPane.get(`${worktree.workspaceId}/${worktree.paneId}`);
+		const priorFacts = [...new Set([priorByPath, priorByBranch, priorByRootPane].filter((candidate): candidate is StewardOwnedWorktree => candidate !== undefined))];
+		if (priorFacts.some((prior) => prior.workspaceId !== worktree.workspaceId || prior.path !== worktree.path || prior.branch !== worktree.branch || prior.paneId !== worktree.paneId || prior.terminalId !== worktree.terminalId)) throw new Error(`Conflicting archived worktree ownership for ${worktree.path}.`);
+		if (priorFacts.length === 0) { worktrees.set(worktree.path, worktree); worktreesByBranch.set(worktree.branch, worktree); worktreesByRootPane.set(`${worktree.workspaceId}/${worktree.paneId}`, worktree); }
+	};
+	for (const archive of archives) {
+		if (archive.kind === "cancelled") {
+			const cancellation = archive.run.run.cancellation;
+			if (!cancellation || cancellation.phase !== "archived") throw new Error(`Cancelled archive ${archive.run.run.id} has no archived cancellation facts.`);
+			for (const pane of cancellation.panes) addPane({ ...pane });
+			for (const worktree of cancellation.worktrees) addWorktree({ ...worktree });
+			continue;
+		}
+		const completion = archive.run.run.completion;
+		if (!completion || completion.phase !== "archived") throw new Error(`Completed archive ${archive.run.run.id} has no archived completion facts.`);
+		for (const resource of completion.resources) {
+			const attempt = archive.run.run.tasks.flatMap((task) => task.attempts.map((candidate) => ({ task, candidate }))).find(({ candidate }) => candidate.role === resource.role && dispatchIdentityFor(candidate)?.name === resource.agentName && dispatchIdentityFor(candidate)?.workspaceId === resource.workspaceId && dispatchIdentityFor(candidate)?.paneId === resource.paneId && dispatchIdentityFor(candidate)?.terminalId === resource.terminalId);
+			if (!attempt) throw new Error(`Completed archive ${archive.run.run.id} has a resource without matching persisted Attempt dispatch.`);
+			addPane({ runId: archive.run.run.id, taskId: attempt.task.contract.id, attemptId: attempt.candidate.id, role: resource.role, kind: resource.role === "builder" ? "builder-root" : attempt.candidate.replacement ? "recovery" : "reviewer", workspaceId: resource.workspaceId, paneId: resource.paneId, terminalId: resource.terminalId });
+		}
+		for (const task of archive.run.run.tasks) for (const attempt of task.attempts) {
+			if (attempt.role !== "builder") continue;
+			const identity = dispatchIdentityFor(attempt);
+			const pathFacts = dispatchPathFacts(attempt);
+			if (!identity || !pathFacts.branch || !pathFacts.worktreePath) continue;
+			addWorktree({ runId: archive.run.run.id, taskId: task.contract.id, attemptId: attempt.id, workspaceId: identity.workspaceId, paneId: identity.paneId, terminalId: identity.terminalId, branch: pathFacts.branch, path: pathFacts.worktreePath });
+		}
+	}
+	return {
+		archives: archives.map((archive) => ({ runId: archive.run.run.id, archiveDirectory: archive.archiveDirectory, runSha256: archive.runSha256, manifestSha256: archive.manifestSha256 })).sort((left, right) => left.runId.localeCompare(right.runId)),
+		panes: [...panes.values()].sort((left, right) => `${left.workspaceId}/${left.paneId}/${left.terminalId}`.localeCompare(`${right.workspaceId}/${right.paneId}/${right.terminalId}`)),
+		worktrees: [...worktrees.values()].sort((left, right) => `${left.workspaceId}/${left.path}/${left.branch}`.localeCompare(`${right.workspaceId}/${right.path}/${right.branch}`)),
+	};
+}
+
 async function inspectSilenceAttempt(repositoryRoot: string, task: TaskRecord, attempt: AttemptRecord, identity: ManagedAgentIdentity, dependencies: StewardDependencies): Promise<SilenceInspectionResult> {
 	const inspectedAgent = dependencies.herdr.inspectManagedAgent ? await dependencies.herdr.inspectManagedAgent(identity).catch((error: unknown) => ({ kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr inspection failed." } as ManagedAgentInspection)) : { kind: "unclear", diagnostic: "Herdr inspection adapter is unavailable." } as ManagedAgentInspection;
 	const lifecycle = inspectedAgent.kind === "observed" && exactIdentity(inspectedAgent.identity, identity) ? inspectedAgent.lifecycle : "unavailable";
@@ -4316,10 +4562,267 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return facts;
 	}
 
+	function presentCancellation(result: CancellationResult): CancellationResult {
+		ui.presentCancellationResult?.(result);
+		return result;
+	}
+
+	async function cancel(repositoryRoot: string, controllerSessionId: string): Promise<CancellationResult> {
+		let loaded: ActiveRunLoadResult;
+		try { loaded = await runJournal.loadActive(repositoryRoot); }
+		catch (error: unknown) { return presentCancellation({ kind: "storage-error", message: `Cancellation could not inspect the active Run; no external effect was attempted. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
+		if (loaded.kind === "missing") return presentCancellation({ kind: "refused", message: "No active Steward Run exists; cancellation performed no mutation." });
+		if (loaded.kind === "invalid") return presentCancellation({ kind: "refused", message: `Active Steward Run is invalid at ${loaded.paths.activePath}; cancellation performed no mutation.` });
+		const basis = loaded.journal;
+		if (basis.run.status === "cancelled" || basis.run.cancellation) return presentCancellation({ kind: "refused", message: `Run ${basis.run.id} is already cancelled; inspect status for the durable stop/archive phase.` });
+		if (basis.run.status !== "active") return presentCancellation({ kind: "refused", message: `Run ${basis.run.id} is ${basis.run.status}; cancellation is only available for an active Run.` });
+		if (!controllerIdentityMatches(basis, controllerSessionId)) return presentCancellation({ kind: "refused", message: `Run ${basis.run.id} belongs to Controller Session ${basis.run.controllerSessionId}; cancellation performed no mutation.` });
+		if (!ui.confirmCancellation) return presentCancellation({ kind: "refused", message: "Cancellation confirmation UI is unavailable; no mutation occurred." });
+		let confirmed: boolean;
+		try { confirmed = await ui.confirmCancellation({ runId: basis.run.id, markdown: `Cancel Steward Run ${basis.run.id}?\n\nCancellation makes the Run terminal before any Herdr inspection or /quit. Existing work, Assignments, reports, evidence, activity, verification files, branches, commits, and ownership facts are preserved for inspection and explicit cleanup.` }); }
+		catch (error: unknown) { return presentCancellation({ kind: "refused", message: `Cancellation confirmation failed; no mutation occurred. ${error instanceof Error ? error.message : "Interactive confirmation failed."}` }); }
+		if (!confirmed) return presentCancellation({ kind: "declined", message: `Cancellation declined; Run ${basis.run.id} and all evidence remain byte-for-byte unchanged.` });
+		let confirmedRun: ActiveRunLoadResult;
+		try { confirmedRun = await runJournal.loadActive(repositoryRoot); }
+		catch (error: unknown) { return presentCancellation({ kind: "stale", message: `The active Run could not be rechecked after confirmation; no external effect was attempted. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
+		if (confirmedRun.kind !== "loaded" || confirmedRun.journal.run.id !== basis.run.id || confirmedRun.journal.journalRevision !== basis.journalRevision || confirmedRun.journal.run.controllerSessionId !== basis.run.controllerSessionId || JSON.stringify(confirmedRun.journal.run.controllerLease) !== JSON.stringify(basis.run.controllerLease)) return presentCancellation({ kind: "stale", message: "The active Run, Journal revision, Controller Session, or lease changed during confirmation; no external effect was attempted." });
+		let ownership: CancellationOwnership;
+		try { ownership = cancellationOwnershipFor(confirmedRun.journal); }
+		catch (error: unknown) { return presentCancellation({ kind: "refused", message: `Recorded ownership is conflicting; no cancellation or Herdr effect was attempted. ${error instanceof Error ? error.message : "Ownership facts are not exact."}` }); }
+		const cancelledAt = transitionTimestamp(confirmedRun.journal, clock.now());
+		const initialStops: CancellationAgentStop[] = ownership.attempts.map((target) => target.duplicateIdentity && target.identity
+			? { taskId: target.taskId, attemptId: target.attemptId, role: target.role, state: "not-required", reason: "already-stopped", agent: { role: target.role, agentName: target.identity.name, workspaceId: target.identity.workspaceId, paneId: target.identity.paneId, terminalId: target.identity.terminalId } }
+			: target.identity
+			? { taskId: target.taskId, attemptId: target.attemptId, role: target.role, state: "intended", agent: { role: target.role, agentName: target.identity.name, workspaceId: target.identity.workspaceId, paneId: target.identity.paneId, terminalId: target.identity.terminalId }, intendedAt: cancelledAt }
+			: target.ownershipGap
+			? { taskId: target.taskId, attemptId: target.attemptId, role: target.role, state: "not-required", reason: "ownership-gap" }
+			: { taskId: target.taskId, attemptId: target.attemptId, role: target.role, state: "not-required", reason: "never-started" });
+		let durable: RunJournal;
+		try {
+			durable = advanceRunJournal(confirmedRun.journal, clock.now(), (next) => {
+				for (const task of next.run.tasks) {
+					if (task.phase === "completed") continue;
+					task.phase = "cancelled";
+					for (const attempt of task.attempts) if (["prepared", "active", "awaiting-report"].includes(attempt.state)) attempt.state = "cancelled";
+				}
+				next.run.status = "cancelled";
+				next.run.cancellation = {
+					phase: "stops-intended",
+					cancelledAt,
+					controllerSessionId,
+					...(next.run.controllerLease ? { controllerLease: { sessionId: next.run.controllerLease.sessionId, leaseId: next.run.controllerLease.leaseId } } : {}),
+					priorTasks: ownership.priorTasks.map((task) => ({ ...task, attempts: task.attempts.map((attempt) => ({ ...attempt })) })),
+					panes: ownership.panes.map((pane) => ({ ...pane })),
+					worktrees: ownership.worktrees.map((worktree) => ({ ...worktree })),
+					stops: initialStops,
+				};
+			});
+		} catch (error: unknown) { return presentCancellation({ kind: "storage-error", message: `Cancellation could not build the durable terminal transition; no Herdr inspection or /quit was attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }); }
+		let replaced: import("./run-journal-store.ts").ReplaceActiveResult;
+		try { replaced = await runJournal.replaceActive(repositoryRoot, durable); }
+		catch (error: unknown) { return presentCancellation({ kind: "storage-error", message: `Cancellation could not persist before interruption; no Herdr inspection or /quit was attempted. ${error instanceof Error ? error.message : "Journal storage failed."}` }); }
+		if (replaced.kind !== "replaced") return presentCancellation({ kind: "storage-error", message: "Cancellation lost the active Journal compare-and-swap before interruption; no Herdr inspection or /quit was attempted." });
+		let journal = replaced.journal;
+		await runJournal.appendActivity(repositoryRoot, { timestamp: journal.run.updatedAt, runId: journal.run.id, event: "run-cancelled", message: `Run ${journal.run.id} became durably cancelled before Herdr inspection or graceful stop.` }).catch(() => undefined);
+		const persistStop = async (index: number, state: CancellationAgentStop, failure?: import("./run.ts").CancellationStopFailure): Promise<RunJournal | undefined> => {
+			try {
+				const candidate = advanceRunJournal(journal, clock.now(), (next) => {
+					const current = next.run.cancellation;
+					if (!current || (current.phase !== "stops-intended" && current.phase !== "stops-incomplete")) throw new Error("Cancellation stop state disappeared.");
+					current.stops[index] = state;
+					if (failure) next.run.cancellation = { ...current, phase: "stops-incomplete", failure };
+				});
+				const result = await runJournal.replaceActive(repositoryRoot, candidate);
+				return result.kind === "replaced" ? result.journal : undefined;
+			} catch { return undefined; }
+		};
+
+		const stops = journal.run.cancellation?.stops ?? [];
+		for (let index = 0; index < stops.length; index += 1) {
+			const stop = stops[index]!;
+			if (stop.state === "not-required" || stop.state === "acknowledged") continue;
+			if (stop.state !== "intended") return presentCancellation({ kind: "incomplete", journal, message: `Cancellation remains incomplete at ${stop.taskId}/${stop.attemptId}; no stop was resent and no archive or cleanup was attempted.` });
+			const identity = { name: stop.agent.agentName, workspaceId: stop.agent.workspaceId, paneId: stop.agent.paneId, terminalId: stop.agent.terminalId };
+			let inspection: ManagedAgentInspection;
+			try { inspection = herdr.inspectManagedAgent ? await herdr.inspectManagedAgent(identity) : { kind: "unclear", diagnostic: "Herdr inspection adapter is unavailable." }; }
+			catch (error: unknown) { inspection = { kind: "unclear", diagnostic: error instanceof Error ? error.message : "Herdr inspection failed." }; }
+			if (inspection.kind === "missing") {
+				const missingStop: CancellationAgentStop = { taskId: stop.taskId, attemptId: stop.attemptId, role: stop.role, state: "not-required", reason: "already-missing", agent: { ...stop.agent } };
+				const persistedMissing = await persistStop(index, missingStop);
+				if (!persistedMissing) return presentCancellation({ kind: "incomplete", journal, message: `Agent ${identity.name} was already missing, but that no-op could not be retained; no stop was resent.` });
+				journal = persistedMissing;
+				continue;
+			}
+			if (inspection.kind !== "observed" || !exactIdentity(inspection.identity, identity)) {
+				const diagnostic = inspection.kind === "unclear" ? inspection.diagnostic : "Herdr returned a foreign Agent identity.";
+				const failure: import("./run.ts").CancellationStopFailure = { taskId: stop.taskId, attemptId: stop.attemptId, role: stop.role, state: "ambiguous", observedAt: transitionTimestamp(journal, clock.now()), diagnostic: diagnostic.slice(0, 2_000) };
+				const failedStop: CancellationAgentStop = { ...stop, state: "ambiguous", observedAt: failure.observedAt, diagnostic: failure.diagnostic };
+				const persistedFailure = await persistStop(index, failedStop, failure);
+				return presentCancellation({ kind: "incomplete", journal: persistedFailure ?? journal, message: `Cancellation stop is ambiguous for ${identity.name}; no /quit resend, archive, or cleanup was attempted.` });
+			}
+			if (!herdr.stopAgentGracefully) {
+				const diagnostic = "Graceful Agent stop adapter is unavailable.";
+				const failure: import("./run.ts").CancellationStopFailure = { taskId: stop.taskId, attemptId: stop.attemptId, role: stop.role, state: "failed", observedAt: transitionTimestamp(journal, clock.now()), diagnostic };
+				const failedStop: CancellationAgentStop = { ...stop, state: "failed", observedAt: failure.observedAt, diagnostic };
+				const persistedFailure = await persistStop(index, failedStop, failure);
+				return presentCancellation({ kind: "incomplete", journal: persistedFailure ?? journal, message: `Cancellation could not gracefully stop ${identity.name}; no archive or cleanup was attempted.` });
+			}
+			let stopped: HerdrStopResult;
+			try { stopped = await herdr.stopAgentGracefully({ repositoryRoot, ...identity }); }
+			catch (error: unknown) { stopped = { kind: "ambiguous", message: error instanceof Error ? error.message : "Graceful /quit failed." }; }
+			if (stopped.kind !== "acknowledged" || stopped.name !== identity.name || stopped.workspaceId !== identity.workspaceId || stopped.paneId !== identity.paneId || stopped.terminalId !== identity.terminalId || !validIdentity(stopped.tabId)) {
+				const diagnostic = stopped.kind === "acknowledged" ? "Graceful stop returned a foreign or incomplete Agent identity." : stopped.message;
+				const failure: import("./run.ts").CancellationStopFailure = { taskId: stop.taskId, attemptId: stop.attemptId, role: stop.role, state: stopped.kind === "ambiguous" ? "ambiguous" : "failed", observedAt: transitionTimestamp(journal, clock.now()), diagnostic: diagnostic.slice(0, 2_000) };
+				const failedStop: CancellationAgentStop = { ...stop, state: failure.state, observedAt: failure.observedAt, diagnostic: failure.diagnostic };
+				const persistedFailure = await persistStop(index, failedStop, failure);
+				return presentCancellation({ kind: "incomplete", journal: persistedFailure ?? journal, message: `Cancellation stop for ${identity.name} is ${failure.state}; no resend, archive, or cleanup was attempted.` });
+			}
+			const acknowledged: CancellationAgentStop = { ...stop, state: "acknowledged", acknowledgedAt: transitionTimestamp(journal, clock.now()), acknowledgement: { name: stopped.name, workspaceId: stopped.workspaceId, tabId: stopped.tabId, paneId: stopped.paneId, terminalId: stopped.terminalId } };
+			const persistedAcknowledgement = await persistStop(index, acknowledged);
+			if (!persistedAcknowledgement) return presentCancellation({ kind: "incomplete", journal, message: `Graceful stop for ${identity.name} succeeded but its acknowledgement could not be persisted; no /quit resend was attempted.` });
+			journal = persistedAcknowledgement;
+			await runJournal.appendActivity(repositoryRoot, { timestamp: journal.run.updatedAt, runId: journal.run.id, event: "run-cancel-stop-acknowledged", message: `Gracefully stopped exact Agent ${identity.name} for ${stop.taskId}/${stop.attemptId}.` }).catch(() => undefined);
+		}
+		let stopsComplete: RunJournal;
+		try {
+			stopsComplete = advanceRunJournal(journal, clock.now(), (next) => {
+				const current = next.run.cancellation;
+				if (!current || current.phase !== "stops-intended" || current.stops.some((stop) => stop.state !== "acknowledged" && stop.state !== "not-required")) throw new Error("Cancellation stops are not conclusive.");
+				next.run.cancellation = { ...current, phase: "stops-complete" };
+			});
+		} catch (error: unknown) { return presentCancellation({ kind: "incomplete", journal, message: `Cancellation stops are conclusive in memory but could not be retained; archive was not attempted. ${error instanceof Error ? error.message : "Journal validation failed."}` }); }
+		const persistedComplete = await persistReviewJournal(repositoryRoot, stopsComplete, { runJournal, herdr, git, process, model, clock, ui });
+		if (!persistedComplete) return presentCancellation({ kind: "incomplete", journal, message: "Cancellation stops are conclusive in memory but could not be persisted; archive was not attempted." });
+		journal = persistedComplete;
+		const reports = await collectCancellationReports(repositoryRoot, journal, { runJournal, herdr, git, process, model, clock, ui });
+		if ("message" in reports) return presentCancellation({ kind: "incomplete", journal, message: reports.message });
+		if (!runJournal.resolveCompletionPaths || !runJournal.loadCompletionJournalPointers || !runJournal.archiveCancelledRun) return presentCancellation({ kind: "incomplete", journal, message: "Cancelled archive storage adapters are unavailable; the cancelled Run and evidence remain active for inspection." });
+		const paths = runJournal.resolveCompletionPaths(repositoryRoot, journal.run.id);
+		const pointers = await runJournal.loadCompletionJournalPointers(repositoryRoot);
+		if (pointers.kind !== "loaded") return presentCancellation({ kind: "incomplete", journal, message: `Cancelled archive publication was not attempted: ${pointers.message}` });
+		const archive: CancellationArchiveIntent = { intendedAt: transitionTimestamp(journal, clock.now()), archiveDirectory: paths.archiveDirectory, runPath: paths.archiveRunPath, previousRunPath: paths.archivePreviousRunPath, manifestPath: paths.archiveManifestPath, activeJournalSha256: sha256Bytes(pointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(pointers.pointers.previousBytes), reports: reports.map((report) => ({ ...report })) };
+		let archiveIntent: RunJournal;
+		try { archiveIntent = advanceRunJournal(journal, clock.now(), (next) => { const current = next.run.cancellation; if (!current || current.phase !== "stops-complete") throw new Error("Cancellation stops-complete state disappeared before archive intent."); next.run.cancellation = { ...current, phase: "archive-intended", archive: { ...archive, reports: archive.reports.map((report) => ({ ...report })) } }; }); }
+		catch (error: unknown) { return presentCancellation({ kind: "incomplete", journal, message: `Cancelled archive intent could not be persisted; evidence was preserved. ${error instanceof Error ? error.message : "Journal validation failed."}` }); }
+		const persistedIntent = await persistReviewJournal(repositoryRoot, archiveIntent, { runJournal, herdr, git, process, model, clock, ui });
+		if (!persistedIntent) return presentCancellation({ kind: "incomplete", journal, message: "Cancelled archive intent could not be persisted; evidence was preserved." });
+		journal = persistedIntent;
+		const finalPointers = await runJournal.loadCompletionJournalPointers(repositoryRoot);
+		if (finalPointers.kind !== "loaded") return presentCancellation({ kind: "incomplete", journal, message: `Cancelled archive publication was not attempted: ${finalPointers.message}` });
+		let archived: RunJournal;
+		const archivedAt = transitionTimestamp(journal, clock.now());
+		try { archived = advanceRunJournal(journal, clock.now(), (next) => { const current = next.run.cancellation; if (!current || current.phase !== "archive-intended") throw new Error("Cancellation archive intent disappeared before final snapshot."); next.run.cancellation = { ...current, phase: "archived", archive: { ...current.archive, activeJournalSha256: sha256Bytes(finalPointers.pointers.activeBytes), previousJournalSha256: sha256Bytes(finalPointers.pointers.previousBytes), reports: current.archive.reports.map((report) => ({ ...report })) }, archivedAt }; }); }
+		catch (error: unknown) { return presentCancellation({ kind: "incomplete", journal, message: `Cancelled archive snapshot could not be built; live evidence was preserved. ${error instanceof Error ? error.message : "Journal validation failed."}` }); }
+		const published = await runJournal.archiveCancelledRun({ repositoryRoot, runId: journal.run.id, run: archived, archivedAt, reports });
+		if (published.kind !== "published" && published.kind !== "existing-match") return presentCancellation({ kind: "incomplete", journal, message: `Cancelled archive was not published; active Journal and evidence remain authoritative. ${"message" in published ? published.message : "Archive storage failed."}` });
+		await runJournal.appendActivity(repositoryRoot, { timestamp: archived.run.updatedAt, runId: archived.run.id, event: "run-cancelled-archived", message: `Cancelled Run ${archived.run.id} was published at ${paths.archiveDirectory}; historical evidence was retained.` }).catch(() => undefined);
+		return presentCancellation({ kind: "archived", journal: archived, message: `Run ${archived.run.id} was cancelled, gracefully stopped where exact identities were available, and archived at ${paths.archiveDirectory}. Evidence and ownership facts were retained.` });
+	}
+
+	function presentCleanup(result: CleanupResult): CleanupResult {
+		ui.presentCleanupResult?.(result);
+		return result;
+	}
+
+	function cleanupSummary(inventory: CleanupInventory): CleanupConfirmationSummary {
+		const lines = ["Clean up only these exact Steward-owned Herdr resources?", "", ...inventory.archives.map((archive) => `Archive ${archive.runId}: ${archive.archiveDirectory} (${archive.runSha256}, manifest ${archive.manifestSha256})`), "", "Owned panes:", ...(inventory.panes.length > 0 ? inventory.panes.map((pane) => `- ${pane.runId} ${pane.kind}: workspace=${pane.workspaceId} pane=${pane.paneId} terminal=${pane.terminalId}`) : ["- none"]), "", "Builder worktrees:", ...(inventory.worktrees.length > 0 ? inventory.worktrees.map((worktree) => `- ${worktree.runId}: workspace=${worktree.workspaceId} branch=${worktree.branch} path=${worktree.path}`) : ["- none"]), "", "Archives, Assignments, Attempt Reports, evidence, activity logs, verification logs/results, branches, and commits are retained. Unrelated or mismatched resources will block the whole cleanup."];
+		return { markdown: lines.join("\n"), archives: inventory.archives.map((archive) => ({ ...archive })), panes: inventory.panes.map((pane) => ({ ...pane })), worktrees: inventory.worktrees.map((worktree) => ({ ...worktree })) };
+	}
+
+	async function cleanup(repositoryRoot: string, _controllerSessionId: string): Promise<CleanupResult> {
+		let active: ActiveRunLoadResult;
+		try { active = await runJournal.loadActive(repositoryRoot); }
+		catch (error: unknown) { return presentCleanup({ kind: "refused", message: `Cleanup could not inspect the active Run; no Herdr effect was attempted. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
+		if (active.kind === "loaded") return presentCleanup({ kind: "refused", message: active.journal.run.status === "cancelled" ? `Run ${active.journal.run.id} is still present as a cancelled active pointer; inspect status and finish its stop/archive lifecycle before cleanup.` : `A nonterminal active Run ${active.journal.run.id} exists; cleanup will not interleave with live orchestration.` });
+		if (active.kind === "invalid") return presentCleanup({ kind: "refused", message: `The active Run Journal is invalid at ${active.paths.activePath}; cleanup has no ownership authority.` });
+		if (!runJournal.listTerminalArchives) return presentCleanup({ kind: "refused", message: "Terminal archive listing is unavailable; no cleanup effect was attempted." });
+		const listed = await runJournal.listTerminalArchives(repositoryRoot);
+		if (listed.kind !== "loaded") return presentCleanup({ kind: "refused", message: `Terminal archives are not a strict cleanup basis; no Herdr effect was attempted. ${listed.message}` });
+		let inventory: CleanupInventory;
+		try { inventory = cleanupInventoryForArchives(listed.archives); }
+		catch (error: unknown) { return presentCleanup({ kind: "refused", message: `Terminal archive ownership is conflicting; no Herdr effect was attempted. ${error instanceof Error ? error.message : "Exact ownership derivation failed."}` }); }
+		if (inventory.panes.length === 0 && inventory.worktrees.length === 0) return presentCleanup({ kind: "noop", message: listed.archives.length > 0 ? "No exact Steward-owned panes or Builder worktrees were recorded; cleanup was a no-op and all evidence remains retained." : "No terminal Steward archives exist; cleanup was a no-op." });
+		if (!ui.confirmCleanup) return presentCleanup({ kind: "refused", message: "Cleanup confirmation UI is unavailable; no Herdr effect was attempted." });
+		let confirmed: boolean;
+		try { confirmed = await ui.confirmCleanup(cleanupSummary(inventory)); }
+		catch (error: unknown) { return presentCleanup({ kind: "declined", message: `Cleanup confirmation failed; no Herdr effect was attempted. ${error instanceof Error ? error.message : "Interactive confirmation failed."}` }); }
+		if (!confirmed) return presentCleanup({ kind: "declined", message: "Cleanup declined; archives, ownership evidence, and live resources remain unchanged." });
+		const freshActive = await runJournal.loadActive(repositoryRoot);
+		if (freshActive.kind !== "missing") return presentCleanup({ kind: "stale", message: "The active Run state changed after cleanup confirmation; no Herdr effect was attempted." });
+		const freshListed = await runJournal.listTerminalArchives(repositoryRoot);
+		if (freshListed.kind !== "loaded") return presentCleanup({ kind: "stale", message: `Terminal archive ownership changed or became unavailable after cleanup confirmation; no Herdr effect was attempted. ${freshListed.message}` });
+		let freshInventory: CleanupInventory;
+		try { freshInventory = cleanupInventoryForArchives(freshListed.archives); }
+		catch (error: unknown) { return presentCleanup({ kind: "stale", message: `Terminal archive ownership changed after cleanup confirmation; no Herdr effect was attempted. ${error instanceof Error ? error.message : "Exact ownership derivation failed."}` }); }
+		if (JSON.stringify(freshInventory) !== JSON.stringify(inventory)) return presentCleanup({ kind: "stale", message: "The exact archive hashes or ownership inventory changed after cleanup confirmation; no Herdr effect was attempted." });
+		if (!herdr.preflightCleanupWorkspace || !herdr.closeCleanupPane || !herdr.removeCleanupWorktree) return presentCleanup({ kind: "blocked", message: "Strict Herdr cleanup preflight/effect adapters are unavailable; no cleanup effect was attempted." });
+		const workspaceIds = [...new Set([...inventory.panes.map((pane) => pane.workspaceId), ...inventory.worktrees.map((worktree) => worktree.workspaceId)])].sort();
+		const paneByWorkspace = new Map<string, StewardOwnedPane[]>();
+		for (const pane of inventory.panes) paneByWorkspace.set(pane.workspaceId, [...(paneByWorkspace.get(pane.workspaceId) ?? []), pane]);
+		const worktreeByWorkspace = new Map<string, StewardOwnedWorktree[]>();
+		for (const worktree of inventory.worktrees) worktreeByWorkspace.set(worktree.workspaceId, [...(worktreeByWorkspace.get(worktree.workspaceId) ?? []), worktree]);
+		const preflight = new Map<string, Extract<HerdrCleanupPreflightResult, { kind: "ready" }> | Extract<HerdrCleanupPreflightResult, { kind: "missing" }>>();
+		for (const workspaceId of workspaceIds) {
+			let result: HerdrCleanupPreflightResult;
+			try { result = await herdr.preflightCleanupWorkspace({ repositoryRoot, workspaceId }); }
+			catch (error: unknown) { return presentCleanup({ kind: "blocked", message: `Cleanup preflight failed for workspace ${workspaceId}; zero cleanup effects were attempted. ${error instanceof Error ? error.message : "Herdr preflight failed."}` }); }
+			if (result.kind === "missing") { preflight.set(workspaceId, result); continue; }
+			if (result.kind !== "ready") return presentCleanup({ kind: "blocked", message: `Cleanup preflight is ${result.kind} for workspace ${workspaceId}; zero cleanup effects were attempted. ${result.message}` });
+			const recordedPanes = paneByWorkspace.get(workspaceId) ?? [];
+			const recordedWorktrees = worktreeByWorkspace.get(workspaceId) ?? [];
+			const livePaneKeys = new Set<string>();
+			for (const pane of result.panes) {
+				const paneKey = `${pane.paneId}/${pane.terminalId}`;
+				if (livePaneKeys.has(paneKey)) return presentCleanup({ kind: "blocked", message: `Cleanup preflight found a duplicated pane identity in workspace ${workspaceId}; zero cleanup effects were attempted.` });
+				livePaneKeys.add(paneKey);
+				const owned = recordedPanes.find((candidate) => candidate.paneId === pane.paneId);
+				if (!owned || pane.workspaceId !== workspaceId || owned.terminalId !== pane.terminalId || (owned.kind === "builder-root") !== pane.root) return presentCleanup({ kind: "blocked", message: `Cleanup preflight found an unrecognized, reused, or contradictory pane in workspace ${workspaceId}; zero cleanup effects were attempted.` });
+			}
+			const liveWorktreeKeys = new Set<string>();
+			for (const worktree of result.worktrees) {
+				const worktreeKey = `${worktree.path}/${worktree.branch}`;
+				if (liveWorktreeKeys.has(worktreeKey)) return presentCleanup({ kind: "blocked", message: `Cleanup preflight found a duplicated worktree identity in workspace ${workspaceId}; zero cleanup effects were attempted.` });
+				liveWorktreeKeys.add(worktreeKey);
+				const owned = recordedWorktrees.find((candidate) => candidate.path === worktree.path && candidate.branch === worktree.branch);
+				const rootPane = result.panes.find((pane) => pane.paneId === worktree.rootPaneId);
+				if (!owned || worktree.workspaceId !== workspaceId || worktree.rootPaneId !== owned.paneId || !rootPane || !rootPane.root) return presentCleanup({ kind: "blocked", message: `Cleanup preflight found an unrecognized, foreign, or contradictory worktree in workspace ${workspaceId}; zero cleanup effects were attempted.` });
+			}
+			preflight.set(workspaceId, result);
+		}
+		const closed: string[] = [];
+		for (const pane of inventory.panes) {
+			const state = preflight.get(pane.workspaceId);
+			if (!state || state.kind === "missing") continue;
+			const live = state.panes.find((candidate) => candidate.paneId === pane.paneId && candidate.terminalId === pane.terminalId);
+			if (!live || live.root) continue;
+			let effect: HerdrCleanupEffectResult;
+			try { effect = await herdr.closeCleanupPane({ repositoryRoot, workspaceId: pane.workspaceId, paneId: pane.paneId, terminalId: pane.terminalId }); }
+			catch (error: unknown) { return presentCleanup({ kind: "partial", message: `Cleanup closed ${closed.length} pane(s), then failed ambiguously at pane ${pane.paneId}; no later resource was touched. ${error instanceof Error ? error.message : "Pane close failed."}` }); }
+			if (effect.kind === "missing") continue;
+			if (effect.kind !== "completed") return presentCleanup({ kind: "partial", message: `Cleanup closed ${closed.length} pane(s), then failed at pane ${pane.paneId}; no later resource was touched. ${effect.message}` });
+			closed.push(pane.paneId);
+		}
+		const removed: string[] = [];
+		for (const worktree of inventory.worktrees) {
+			const state = preflight.get(worktree.workspaceId);
+			if (!state || state.kind === "missing") continue;
+			const live = state.worktrees.find((candidate) => candidate.path === worktree.path && candidate.branch === worktree.branch);
+			if (!live) continue;
+			let effect: HerdrCleanupEffectResult;
+			try { effect = await herdr.removeCleanupWorktree({ repositoryRoot, workspaceId: worktree.workspaceId, path: worktree.path, branch: worktree.branch }); }
+			catch (error: unknown) { return presentCleanup({ kind: "partial", message: `Cleanup closed ${closed.length} pane(s) and removed ${removed.length} worktree(s), then failed ambiguously at ${worktree.path}; no later resource was touched. ${error instanceof Error ? error.message : "Worktree removal failed."}` }); }
+			if (effect.kind === "missing") continue;
+			if (effect.kind !== "completed") return presentCleanup({ kind: "partial", message: `Cleanup closed ${closed.length} pane(s) and removed ${removed.length} worktree(s), then failed at ${worktree.path}; no later resource was touched. ${effect.message}` });
+			removed.push(worktree.path);
+		}
+		return presentCleanup({ kind: "completed", message: `Cleanup completed for ${closed.length} non-root pane(s) and ${removed.length} Builder worktree(s). Archives and all historical evidence remain retained.` });
+	}
+
 	async function takeover(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult> {
 		const initial = await runJournal.loadActive(repositoryRoot);
 		if (initial.kind === "missing") return { kind: "missing", message: "No active Steward Run exists in this repository." };
 		if (initial.kind === "invalid") return { kind: "invalid", message: `Active Steward Run state is invalid at ${initial.paths.activePath}; takeover is read-only.` };
+		if (initial.journal.run.status === "cancelled" || initial.journal.run.cancellation) return { kind: "stale", message: "The active Steward Run is cancelled; takeover is dormant." };
 		if (initial.journal.run.status === "completed" || initial.journal.run.completion?.phase === "archived") return { kind: "stale", message: "The active Steward Run is completed; takeover is dormant." };
 		if (controllerIdentityMatches(initial.journal, controllerSessionId)) return { kind: "already-owner", currentSessionId: controllerSessionId, message: "This Controller Session already owns the active Steward Run; use plain resume." };
 		const basis = initial.journal;
@@ -4373,6 +4876,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind === "missing") return { kind: "dormant", reason: "missing", message: "No active Steward Run exists; Controller monitoring is dormant." };
 		if (loaded.kind === "invalid") return { kind: "dormant", reason: "invalid", message: "Active Steward Run state is invalid; Controller monitoring is dormant." };
+		if (loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation) return { kind: "dormant", reason: "cancelled", message: "The Steward Run is cancelled; Controller monitoring is dormant.", journal: loaded.journal };
 		if (loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "dormant", reason: "completed", message: "The Steward Run is completed; Controller monitoring is dormant.", journal: loaded.journal };
 		if (!controllerIdentityMatches(loaded.journal, controllerSessionId)) return { kind: "dormant", reason: "foreign-session", message: `This Pi Session is foreign to Controller Session ${loaded.journal.run.controllerSessionId}; run /steward resume --takeover to claim it.`, journal: loaded.journal };
 		return { kind: "restored", journal: loaded.journal };
@@ -4382,6 +4886,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const first = await runJournal.loadActive(repositoryRoot);
 		if (first.kind === "missing") return { kind: "missing", message: "No active Steward Run exists; normal Pi compaction remains available." };
 		if (first.kind === "invalid") return { kind: "invalid", message: "Active Steward Run state is invalid; normal Pi compaction remains available." };
+		if (first.journal.run.status === "cancelled" || first.journal.run.cancellation) return { kind: "cancelled", message: "The Steward Run is cancelled; normal Pi compaction remains available." };
 		if (first.journal.run.status === "completed" || first.journal.run.completion?.phase === "archived") return { kind: "completed", message: "The Steward Run is completed; normal Pi compaction remains available." };
 		if (!controllerIdentityMatches(first.journal, controllerSessionId)) return { kind: "foreign-session", message: `This Pi Session is foreign to Controller Session ${first.journal.run.controllerSessionId}; normal Pi compaction remains available.` };
 		const pendingAction = pendingControllerAction(first.journal);
@@ -4392,7 +4897,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	async function recordCompactionFailure(repositoryRoot: string, controllerSessionId: string, details: CompactionFailureDetails): Promise<{ kind: "recorded" | "ignored" | "degraded"; message: string }> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
-		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "ignored", message: "Compaction failure was not recorded because this session is not the active Controller." };
+		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "ignored", message: "Compaction failure was not recorded because this session is not an active non-cancelled Controller." };
 		const safeError = details.errorMessage?.replace(/[\u0000\r\n]+/g, " ").slice(0, 500);
 		const message = `Compaction failed (${details.reason}; aborted=${details.aborted}; willRetry=${details.willRetry}; fromExtension=${details.fromExtension})${safeError ? `: ${safeError}` : ""}. Task state remains authoritative and unchanged.`;
 		try {
@@ -4403,6 +4908,11 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	async function status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
+		if (loaded.kind === "loaded" && (loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation)) {
+			const statusView = presentCancelledStatus(loaded.journal);
+			ui.presentStatus(statusView, target);
+			return statusView;
+		}
 		let statusView: StatusView = loaded.kind === "missing"
 			? EMPTY_STATUS
 			: loaded.kind === "invalid"
@@ -4469,6 +4979,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		let result: ResumeResult;
 		if (loaded.kind === "missing") result = { kind: "missing", message: "No active Steward Run exists in this repository." };
 		else if (loaded.kind === "invalid") result = { kind: "invalid", message: `Active Steward Run state is invalid at ${loaded.paths.activePath}; resume is read-only. ${loaded.diagnostics.map((item) => item.message).join(" ")}` };
+		else if (loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation) result = { kind: "stale", message: `Run ${loaded.journal.run.id} is cancelled; resume is dormant and performed no workflow effect.` };
 		else if (!controllerIdentityMatches(loaded.journal, controllerSessionId)) result = { kind: "foreign-session", recordedSessionId: loaded.journal.run.controllerSessionId, currentSessionId: controllerSessionId, message: `The active Steward Run belongs to Controller Session ${loaded.journal.run.controllerSessionId}; resume performed no mutation. Run /steward resume --takeover to reconcile and claim ownership.` };
 		else {
 			const pass = await advanceNext(repositoryRoot, controllerSessionId, { interactive: true, maximumActions: 1, source: "resume" });
@@ -5169,7 +5680,8 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	function monitorResult(action: MonitorWorkflowAction, journal: RunJournal | undefined, note: string, diagnostic?: string, completed = false, changedSources?: readonly string[], notification?: boolean): MonitorPassResult {
 		let condition: MonitorCondition;
-		if (completed || journal?.run.status === "completed" || journal?.run.completion?.phase === "archived") condition = "completed";
+		if (journal?.run.status === "cancelled" || journal?.run.cancellation) condition = "cancelled";
+		else if (completed || journal?.run.status === "completed" || journal?.run.completion?.phase === "archived") condition = "completed";
 		else if (journal?.run.tasks.some((task) => task.attention === "needs-user" && task.attentionReason === "review-approval-required") || action === "approval-required") condition = "approval-required";
 		else if (journal?.run.tasks.some((task) => task.attention !== "none") || action === "blocked") condition = "blocked";
 		else if (diagnostic || action === "degraded") condition = "degraded";
@@ -5186,6 +5698,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; monitoring is dormant." : "Active Run state is invalid; monitoring is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
 		const journal = loaded.journal;
 		if (!controllerIdentityMatches(journal, controllerSessionId)) return monitorResult("none", journal, "Controller Session does not match; monitor observation is read-only.");
+		if (journal.run.status === "cancelled" || journal.run.cancellation) return monitorResult("none", journal, "Run is cancelled; monitoring is dormant.");
 		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; monitoring is dormant.", undefined, true);
 		const selected = currentMonitorAttempts(journal);
 		if (selected.length === 0) return monitorResult("none", journal, "No current prompted Steward Attempt is available for monitoring.");
@@ -5240,7 +5753,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
-		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active Controller-owned Run is available for a lifecycle wait." };
+		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active non-cancelled Controller-owned Run is available for a lifecycle wait." };
 		const finalExecution = loaded.journal.run.finalVerificationExecution;
 		if (finalExecution && isRecoverableFinalVerificationExecution(finalExecution) && finalExecution.phase === "executing" && finalExecution.attempts.at(-1)?.process && process.waitApprovedVerification) {
 			const attempt = finalExecution.attempts.at(-1)!;
@@ -5324,6 +5837,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; advancement is dormant." : "Active Run state is invalid; advancement is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
 		let journal = loaded.journal;
 		if (!controllerIdentityMatches(journal, controllerSessionId)) return monitorResult("none", journal, "Controller Session does not match; advancement is read-only.");
+		if (journal.run.status === "cancelled" || journal.run.cancellation) return monitorResult("none", journal, "Run is cancelled; advancement is dormant.");
 		if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return monitorResult("none", journal, "Run is completed; advancement is dormant.", undefined, true);
 		const revisionStops = await reconcileRevisionStops(repositoryRoot, journal, controllerSessionId);
 		if (revisionStops.ambiguous) return monitorResult("blocked", revisionStops.journal, revisionStops.note, revisionStops.note);
@@ -5435,5 +5949,5 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (target === "command" && journal) ui.presentStatus(presentStatusForJournal(journal, result.note), "command");
 	}
 
-	return { status, resume, takeover, restoreControllerSession, prepareCompactionContinuity, recordCompactionFailure, configure, start, revise, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
+	return { status, resume, takeover, restoreControllerSession, prepareCompactionContinuity, recordCompactionFailure, configure, start, revise, cancel, cleanup, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
 }

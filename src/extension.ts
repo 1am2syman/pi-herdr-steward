@@ -228,16 +228,17 @@ export function registerStewardExtension(
 	});
 
 	pi.registerCommand("steward", {
-		description: "Inspect, configure, start, revise, or resume Steward Runs.",
+		description: "Inspect, configure, start, revise, resume, cancel, or clean up Steward Runs.",
 		handler: async (args, ctx) => {
 			const command = args.trim();
 			if (command === "start" && ctx.mode !== "tui") throw new Error("Steward start requires interactive TUI mode.");
 			if (command === "config" && ctx.mode !== "tui") throw new Error("Steward configuration requires interactive TUI mode.");
 			if (command === "revise" && ctx.mode !== "tui") throw new Error("Steward revise requires interactive TUI mode.");
 			if ((command === "resume" || command === "resume --takeover") && ctx.mode !== "tui") throw new Error("Steward resume requires interactive TUI mode.");
+			if ((command === "cancel" || command === "cleanup") && ctx.mode !== "tui") throw new Error(`Steward ${command} requires interactive TUI mode.`);
 			if (ctx.mode !== "tui") return;
-			if (!new Set(["status", "config", "start", "revise", "resume", "resume --takeover"]).has(command)) {
-				ctx.ui.notify("Usage: /steward status | /steward config | /steward start | /steward revise | /steward resume [--takeover]", "info");
+			if (!new Set(["status", "config", "start", "revise", "resume", "resume --takeover", "cancel", "cleanup"]).has(command)) {
+				ctx.ui.notify("Usage: /steward status | /steward config | /steward start | /steward revise | /steward resume [--takeover] | /steward cancel | /steward cleanup", "info");
 				return;
 			}
 			if (!runtimeBoundToSessionLifecycle || !sameRuntime(runtime, ctx)) {
@@ -270,8 +271,21 @@ export function registerStewardExtension(
 					await commandSteward.resume(ctx.cwd, controllerSessionId, command === "resume --takeover");
 					return;
 				}
+				if (command === "cancel") {
+					await commandSteward.cancel(ctx.cwd, controllerSessionId);
+					return;
+				}
+				if (command === "cleanup") {
+					await commandSteward.cleanup(ctx.cwd, controllerSessionId);
+					return;
+				}
 			});
-			if (!current.monitorStarted && runtimeBoundToSessionLifecycle) {
+			if (command === "cleanup" || command === "cancel") {
+				await current.monitor.stop();
+				current.monitorStarted = false;
+				runtimeBoundToSessionLifecycle = false;
+			}
+			if (command !== "cleanup" && command !== "cancel" && !current.monitorStarted && runtimeBoundToSessionLifecycle) {
 				const restored = await current.steward.restoreControllerSession(ctx.cwd, ctx.sessionManager.getSessionId());
 				if (restored.kind === "restored") {
 					current.monitor.start();
