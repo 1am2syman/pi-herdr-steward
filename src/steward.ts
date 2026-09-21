@@ -4423,15 +4423,18 @@ function cancellationOwnershipFor(journal: RunJournal): CancellationOwnership {
 				if (priorFacts.length === 0) { worktreeByPath.set(worktree.path, worktree); worktreeByBranch.set(worktree.branch, worktree); worktreeByRootPane.set(`${worktree.workspaceId}/${worktree.paneId}`, worktree); worktrees.push(worktree); }
 			}
 		}
-		for (const attempt of task.attempts) {
+		for (const attempt of changing) {
 			const identity = dispatchIdentityFor(attempt);
-			if (!identity && !changing.includes(attempt)) continue;
-			const dispatchPhase = (attempt.dispatch as { phase?: unknown }).phase;
-			const ownershipGap = !identity && (dispatchPhase === "worktree-intended" || dispatchPhase === "pane-intended" || dispatchPhase === "replacement-pane-intended") ? dispatchPhase : undefined;
-			const key = identity ? `${attempt.role}/${identity.name}/${identity.workspaceId}/${identity.paneId}/${identity.terminalId}` : undefined;
-			const duplicateIdentity = Boolean(key && agentKeys.has(key));
-			if (key) agentKeys.add(key);
-			if (changing.includes(attempt)) attempts.push({ taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, ...(identity ? { identity } : {}), ...(duplicateIdentity ? { duplicateIdentity: true } : {}), ...(ownershipGap ? { ownershipGap } : {}) });
+			if (!identity) {
+				const dispatchPhase = (attempt.dispatch as { phase?: unknown }).phase;
+				const ownershipGap = dispatchPhase === "worktree-intended" || dispatchPhase === "pane-intended" || dispatchPhase === "replacement-pane-intended" ? dispatchPhase : undefined;
+				attempts.push({ taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, ...(ownershipGap ? { ownershipGap } : {}) });
+				continue;
+			}
+			const key = `${attempt.role}/${identity.name}/${identity.workspaceId}/${identity.paneId}/${identity.terminalId}`;
+			const duplicateIdentity = agentKeys.has(key);
+			agentKeys.add(key);
+			attempts.push({ taskId: task.contract.id, attemptId: attempt.id, role: attempt.role, identity, ...(duplicateIdentity ? { duplicateIdentity: true } : {}) });
 		}
 	}
 	panes.sort((left, right) => `${left.workspaceId}/${left.paneId}/${left.terminalId}/${left.taskId}/${left.attemptId}`.localeCompare(`${right.workspaceId}/${right.paneId}/${right.terminalId}/${right.taskId}/${right.attemptId}`));

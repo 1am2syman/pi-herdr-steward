@@ -9,6 +9,7 @@ import { registerStewardExtension, type StewardCommandContext, type StewardComma
 import { builderAssignmentSha256, type RunDraft, type RunJournal } from "../src/run.ts";
 import { resolveRunJournalPaths } from "../src/run-journal-store.ts";
 import { serializeBuilderAttemptReport, type BuilderAttemptReport } from "../src/attempt-report.ts";
+import { deserializeReviewerAssignment, serializeReviewerAttemptReport, type ReviewerAttemptReport } from "../src/review.ts";
 import type { ProjectModelPlans, RecoveryDefaults } from "../src/config.ts";
 import type { CancellationResult, CleanupResult, HerdrStopResult, RunJournalAdapter, StewardDependencies, StewardUiAdapter, StatusView } from "../src/steward.ts";
 
@@ -149,7 +150,7 @@ it.sequential("registered cancel durably precedes stop and cleanup removes only 
 					if (live.kind === "loaded") {
 						expect(live.journal.run.status).toBe("cancelled");
 						expect(live.journal.run.cancellation?.phase).toBe("stops-intended");
-						expect(live.journal.run.cancellation?.stops.some((stop) => stop.state === "intended" && stop.agent.agentName === identity.name && stop.agent.workspaceId === identity.workspaceId && stop.agent.paneId === identity.paneId && stop.agent.terminalId === identity.terminalId)).toBe(true);
+						expect(live.journal.run.cancellation?.stops.filter((stop) => stop.state === "intended" && stop.agent.agentName === identity.name && stop.agent.workspaceId === identity.workspaceId && stop.agent.paneId === identity.paneId && stop.agent.terminalId === identity.terminalId)).toHaveLength(1);
 					}
 				}
 				return { kind: "observed", identity: { ...identity }, lifecycle: "working", stateChangeSequence: 1 };
@@ -243,6 +244,39 @@ it.sequential("registered cancel durably precedes stop and cleanup removes only 
 	const evidenceSnapshot = await readFile(evidencePath);
 	const activityPath = join(root, ".pi", "steward", "runs", reviewing.journal.run.id, "activity.log");
 	const activitySnapshot = await readFile(activityPath);
+	const reviewerAssignmentBytes = await readFile(reviewer.assignmentPath);
+	const reviewerAssignment = deserializeReviewerAssignment(reviewerAssignmentBytes.toString("utf8"));
+	expect(reviewerAssignment.value).toBeDefined();
+	if (!reviewerAssignment.value) return;
+	await writeFile(reviewer.reportPath, serializeReviewerAttemptReport({
+		schemaVersion: 1,
+		identity: { runId: reviewing.journal.run.id, taskId: reviewing.journal.run.tasks[0]!.contract.id, attemptId: reviewer.id, role: "reviewer", specificationHash: reviewer.specificationHash, assignmentSha256: sha(reviewerAssignmentBytes) },
+		status: "completed",
+		summary: "The active Builder needs one bounded correction.",
+		blockers: [],
+		actualModel: reviewer.actualModel,
+		reviewedSubject: reviewerAssignment.value.assignment.subject,
+		verdict: "changes-required",
+		findings: [{ id: "finding-1", severity: "major", summary: "The bounded change needs correction.", detail: "Correct the bounded change before relying on the result." }],
+		checks: [],
+		logReferences: [],
+	} satisfies ReviewerAttemptReport));
+	await handler("status", context(root));
+	await handler("status", context(root));
+	const reworking = await runJournal.loadActive(root);
+	expect(reworking.kind).toBe("loaded");
+	if (reworking.kind !== "loaded") return;
+	const reworkTask = reworking.journal.run.tasks[0]!;
+	const reworkBuilder = reworkTask.attempts.at(-1)!;
+	expect(reworkTask.phase).toBe("reworking");
+	expect(reworkBuilder.role).toBe("builder");
+	expect(reworkBuilder.state).toBe("active");
+	if (reworkBuilder.role !== "builder" || builder.role !== "builder") return;
+	if (!("workspaceId" in reworkBuilder.dispatch) || !("workspaceId" in builder.dispatch) || !("paneId" in reworkBuilder.dispatch) || !("paneId" in builder.dispatch) || !("terminalId" in reworkBuilder.dispatch) || !("terminalId" in builder.dispatch)) return;
+	expect(reworkBuilder.dispatch.agentName).toBe(builder.dispatch.agentName);
+	expect(reworkBuilder.dispatch.workspaceId).toBe(builder.dispatch.workspaceId);
+	expect(reworkBuilder.dispatch.paneId).toBe(builder.dispatch.paneId);
+	expect(reworkBuilder.dispatch.terminalId).toBe(builder.dispatch.terminalId);
 			const activeBeforeDecline = await readFile(resolveRunJournalPaths(root).activePath);
 
 	await handler("cancel", context(root));
@@ -253,7 +287,8 @@ it.sequential("registered cancel durably precedes stop and cleanup removes only 
 	allowCancellation = true;
 	await handler("cancel", context(root));
 	expect(cancellationResult?.kind).toBe("archived");
-	expect(effects.stops).toEqual(["steward-r-01234567-01-02"]);
+	expect(effects.inspections).toEqual([builder.dispatch.agentName]);
+	expect(effects.stops).toEqual([builder.dispatch.agentName]);
 	const terminalArchives = await runJournal.listTerminalArchives!(root);
 	expect(terminalArchives.kind).toBe("loaded");
 	if (terminalArchives.kind !== "loaded") return;
@@ -264,7 +299,14 @@ it.sequential("registered cancel durably precedes stop and cleanup removes only 
 		expect(archive.run.run.tasks).toHaveLength(2);
 		expect(archive.run.run.tasks[1]?.phase).toBe("cancelled");
 		expect(archive.run.run.cancellation?.priorTasks.map((task) => task.taskId)).toEqual(["task-01", "task-02"]);
-		expect(archive.run.run.cancellation?.stops.some((stop) => stop.state === "acknowledged" && stop.agent.agentName === effects.stops[0])).toBe(true);
+		expect(archive.run.run.cancellation?.stops).toHaveLength(1);
+		expect(archive.run.run.cancellation?.stops[0]?.state).toBe("acknowledged");
+		expect(archive.run.run.cancellation?.stops[0]?.attemptId).toBe(reworkBuilder.id);
+		const archivedStop = archive.run.run.cancellation?.stops[0];
+		expect(archivedStop?.state).toBe("acknowledged");
+		if (!archivedStop || archivedStop.state !== "acknowledged") return;
+		expect(archivedStop.agent.agentName).toBe(effects.stops[0]);
+		expect(archive.run.run.cancellation?.stops.some((stop) => stop.state === "not-required" && stop.reason === "already-stopped" && stop.attemptId === reworkBuilder.id)).toBe(false);
 
 	const promptsBeforeDormancy = { builder: effects.builderPrompts, reviewer: effects.reviewerPrompts, starts: effects.reviewerStarts };
 	await handler("status", context(root));
