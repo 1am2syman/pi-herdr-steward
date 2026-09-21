@@ -19,32 +19,70 @@ uses fake adapters, and makes no provider request.
 
 ## Installation
 
+### From the public Git repository
+
+The canonical public remote is `https://github.com/1am2syman/pi-herdr-steward`.
+For reproducible installs, pin a release tag or full commit SHA:
+
+```bash
+git clone https://github.com/1am2syman/pi-herdr-steward.git
+cd pi-herdr-steward
+git checkout <tag-or-full-commit-sha>
+pi install git:github.com/1am2syman/pi-herdr-steward@<tag-or-full-commit-sha> -l
+```
+
+To install the current default branch directly (convenient, but not
+reproducible), run:
+
+```bash
+pi install git:github.com/1am2syman/pi-herdr-steward@main -l
+```
+
+### From npm
+
 After publication, the pinned npm source is:
 
 ```bash
 pi install npm:pi-herdr-steward@0.1.0 -l
 ```
 
-The version must exist in the npm registry. The supported immutable Git source
-shape is:
+The version must exist in the npm registry. The Git source accepts a release
+tag, branch, or full commit SHA; use a tag or SHA when reproducibility matters.
+
+### From a local checkout
 
 ```bash
-pi install git:<host>/<owner>/pi-herdr-steward@<immutable-ref> -l
+git clone https://github.com/1am2syman/pi-herdr-steward.git
+cd pi-herdr-steward
+pi install "$PWD" -l
 ```
 
-Replace `<host>/<owner>` with the eventual canonical remote and use a release
-tag or full commit SHA; an unpinned branch is not reproducible. This checkout
-has no configured Git remote, so the example is intentionally parameterized and
-is not claimed to resolve here.
-
-For local validation, install the current checkout by absolute path:
+For a local checkout that is already present, use its absolute path directly:
 
 ```bash
 pi install /absolute/path/to/pi-herdr-steward -l
 ```
 
-This local-checkout form is the only end-to-end install source available before publication. `-l` writes project-local Pi package configuration in `.pi`; omit
-it only when a user-global installation is intended.
+`-l` writes project-local Pi package configuration in `.pi`; omit it only when
+a user-global installation is intended.
+
+### Source-checkout verification
+
+From the cloned checkout, the minimal install/documentation checks are:
+
+```bash
+npm install
+npm run typecheck
+npm run test:install-docs
+npm run test:install-functional
+```
+
+The optional real Herdr smoke requires a running endpoint-compatible Herdr
+server:
+
+```bash
+npm run smoke:herdr-real
+```
 
 ## Command surface
 
@@ -110,13 +148,13 @@ inspect it before sharing, and do not export full logs casually.
 
 ## Safety limits
 
-The Steward may create its own Herdr panes and worktrees, start only its own Pi
-agents, make local commits, integrate approved ranges locally, run approved
-deterministic checks, and gracefully stop its own agents.
+The Steward extension may create its own Herdr panes and worktrees, start only
+its own Pi agents, make local commits, integrate approved ranges locally, run
+approved deterministic checks, and gracefully stop its own agents.
 
-It never pushes or deploys, force-resets, stashes or incorporates unrelated
-changes, discards or reverts unexplained work, deletes or adopts foreign
-resources, substitutes a provider or model outside the confirmed plan, or
-changes accounts, credentials, or security settings without separate explicit
-authorization. Cleanup retains archives, reports, Assignments, verification
+The extension itself never pushes or deploys, force-resets, stashes or incorporates unrelated
+changes, discards or reverts unexplained work, deletes
+or adopts foreign resources, substitutes a provider or model outside the
+confirmed plan, or changes accounts, credentials, or security settings without
+separate explicit authorization. Cleanup retains archives, reports, Assignments, verification
 evidence, branches, commits, and Pi sessions as described by the implementation.

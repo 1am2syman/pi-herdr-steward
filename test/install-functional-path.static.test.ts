@@ -45,7 +45,7 @@ describe("ticket-20 install and documentation contract", () => {
 		}
 		for (const command of [
 			"pi install npm:pi-herdr-steward@0.1.0 -l",
-			"pi install git:<host>/<owner>/pi-herdr-steward@<immutable-ref> -l",
+			"pi install git:github.com/1am2syman/pi-herdr-steward@<tag-or-full-commit-sha> -l",
 			"pi install /absolute/path/to/pi-herdr-steward -l",
 			"/steward status",
 			"/steward config",
@@ -65,8 +65,8 @@ describe("ticket-20 install and documentation contract", () => {
 			"`pi`, `herdr`, and `git`",
 			"interactive Pi TUI",
 			"must exist in the npm registry",
-			"no configured Git remote",
-			"only end-to-end install source available before publication",
+			"canonical public remote",
+			"Source-checkout verification",
 			"Run Journal owns intended",
 			"Herdr owns live agent and process state",
 			"Git plus durable",
