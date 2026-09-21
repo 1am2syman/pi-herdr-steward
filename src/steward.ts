@@ -15,7 +15,7 @@ import {
 	type RecoveryDefaults,
 	type ThinkingLevel,
 } from "./config.ts";
-import type { ActiveRunLoadResult, ActivityAppendResult, AttemptReportInspection, CreateActiveResult } from "./run-journal-store.ts";
+import type { ActiveRunLoadResult, ActivityAppendResult, AttemptReportInspection, CreateActiveResult, ApplyRunJournalMigrationResult, ActiveJournalMode } from "./run-journal-store.ts";
 import type { TaskFactRequestResult } from "./reconciliation.ts";
 import type { AssignmentCreateResult, AssignmentPaths } from "./assignment-store.ts";
 import {
@@ -229,6 +229,7 @@ export type ActiveRunProbe = "missing" | "present";
 export interface RunJournalAdapter {
 	probeActive(repositoryRoot: string): ActiveRunProbe;
 	loadActive(repositoryRoot: string): Promise<ActiveRunLoadResult>;
+	applyMigration?(repositoryRoot: string, expected: Extract<ActiveRunLoadResult, { kind: "migration-ready" }>): Promise<ApplyRunJournalMigrationResult>;
 	createActive(repositoryRoot: string, journal: RunJournal): Promise<CreateActiveResult>;
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<import("./run-journal-store.ts").ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: import("./run.ts").ActivityEntry): Promise<ActivityAppendResult>;
@@ -544,6 +545,9 @@ export interface MonitorPassResult {
 export type ResumeResult =
 	| { kind: "missing"; message: string }
 	| { kind: "invalid"; message: string }
+	| { kind: "recovered"; message: string }
+	| { kind: "migration-applied"; journal: RunJournal; message: string }
+	| { kind: "migration-failed"; message: string }
 	| { kind: "foreign-session"; recordedSessionId: string; currentSessionId: string; message: string }
 	| { kind: "already-owner"; currentSessionId: string; message: string }
 	| { kind: "taken-over"; journal: RunJournal; message: string; pendingAction: ControllerPendingAction }
@@ -554,7 +558,7 @@ export type ResumeResult =
 
 export type ControllerSessionRestoreResult =
 	| { kind: "restored"; journal: RunJournal }
-	| { kind: "dormant"; reason: "missing" | "invalid" | "foreign-session" | "completed" | "cancelled"; message: string; journal?: RunJournal };
+	| { kind: "dormant"; reason: "missing" | "invalid" | "recovery" | "foreign-session" | "completed" | "cancelled"; message: string; journal?: RunJournal };
 
 export type CompactionContinuityResult =
 	| { kind: "prepared"; journal: RunJournal; runId: string; journalRevision: number; controllerSessionId: string; pendingAction: ControllerPendingAction; block: string }
@@ -625,6 +629,7 @@ export interface ActiveAttemptStatusView {
 
 export interface ActiveStatusView {
 	kind: "present";
+	journalRecovery: ActiveJournalMode;
 	markdown: string;
 	footer: ActiveFooterView;
 	activeAttempt?: ActiveAttemptStatusView;
@@ -633,6 +638,7 @@ export interface ActiveStatusView {
 export interface CompletedStatusView {
 	kind: "present";
 	completed: true;
+	journalRecovery?: ActiveJournalMode;
 	markdown: string;
 	footer: EmptyFooterView;
 }
@@ -642,6 +648,7 @@ export type StatusView = EmptyStatusView | ActiveStatusView | CompletedStatusVie
 export interface CancelledStatusView {
 	kind: "present";
 	cancelled: true;
+	journalRecovery?: ActiveJournalMode;
 	markdown: string;
 	footer: ActiveFooterView;
 }
@@ -720,7 +727,7 @@ const EMPTY_STATUS: EmptyStatusView = {
 
 function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusView {
 	const task = journal.run.tasks.find((candidate) => candidate.phase === "reviewing");
-	if (!task) return { kind: "present", markdown: `Run ${journal.run.id} is active; no Reviewer Task is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
+	if (!task) return { kind: "present", journalRecovery: "normal", markdown: `Run ${journal.run.id} is active; no Reviewer Task is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
 	const reviewer = latestReviewerAttempt(task);
 	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: reviewing`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, `Attention: ${task.attention}`];
 	if (reviewer) lines.push(...silenceStatusLines(journal, task, reviewer));
@@ -742,16 +749,16 @@ function presentReviewStatus(journal: RunJournal, note?: string): ActiveStatusVi
 	}
 	if (note) lines.push(note);
 	const attentionCount = task.attention === "none" ? 0 : 1;
-	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · reviewing · ${attentionCount} attention${reviewer?.recovery?.silence ? ` · silence ${reviewer.recovery.silence.phase}` : ""}` } };
+	return { kind: "present", journalRecovery: "normal", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · reviewing · ${attentionCount} attention${reviewer?.recovery?.silence ? ` · silence ${reviewer.recovery.silence.phase}` : ""}` } };
 }
 
 function presentApprovedStatus(journal: RunJournal, note?: string): ActiveStatusView {
 	const task = journal.run.tasks.find((candidate) => candidate.phase === "approved");
-	if (!task || !task.approval) return { kind: "present", markdown: `Run ${journal.run.id} is active; Approval state is unavailable.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
+	if (!task || !task.approval) return { kind: "present", journalRecovery: "normal", markdown: `Run ${journal.run.id} is active; Approval state is unavailable.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` } };
 	const lines = [`Run ${journal.run.id}: active`, `Task ${task.contract.id}: approved`, `Rework cycles: ${task.reworkCycles}/${journal.run.effectiveSettings.reworkCycleLimit}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : []), `Approval: ${task.approval.phase}`, `Builder Attempt: ${task.approval.builderAttemptId}`, `Reviewer Attempt: ${task.approval.reviewerAttemptId}`, `Reviewer manifest: ${task.approval.reviewerManifestPath} (${task.approval.reviewerManifestSha256})`, `Review subject: ${JSON.stringify(task.approval.subject)}`, `Clean snapshot: ${task.approval.worktreeSnapshot.head} (${task.approval.worktreeSnapshot.dirtyStateFingerprint})`];
 	if (note) lines.push(note);
 	const attentionCount = task.attention === "none" ? 0 : 1;
-	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · approved · ${attentionCount} attention` } };
+	return { kind: "present", journalRecovery: "normal", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · approved · ${attentionCount} attention` } };
 }
 
 function integrationStatusLines(task: TaskRecord): string[] {
@@ -774,7 +781,7 @@ function presentCompletionStatus(journal: RunJournal, note?: string): ActiveStat
 	const verification = journal.run.finalVerificationExecution ? finalVerificationEvidencePointers(journal.run.finalVerificationExecution) : undefined;
 	const lines = [`Run ${journal.run.id}: ${journal.run.status}`, ...(task ? [`Task ${task.contract.id}: ${task.phase}`, `Attention: ${task.attention}`, ...(task.attentionReason ? [`Attention reason: ${task.attentionReason}`] : []), ...(task.attentionDiagnostic ? [`Attention diagnostic: ${task.attentionDiagnostic}`] : []), ...integrationStatusLines(task)] : []), ...(journal.run.finalVerificationExecution ? [`Final verification: ${journal.run.finalVerificationExecution.phase}`, ...(verification ? [`Verification result: ${verification.resultPath}`] : [])] : []), ...(completion ? [`Completion: ${completion.phase}`] : []), ...(note ? [note] : [])];
 	const attentionCount = task && task.attention !== "none" ? 1 : 0;
-	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · ${journal.run.status} · ${attentionCount} attention` } };
+	return { kind: "present", journalRecovery: "normal", markdown: lines.join("\n"), footer: { run: "active", attentionCount, text: `steward: ${journal.run.id} · ${journal.run.status} · ${attentionCount} attention` } };
 }
 
 function presentCompletedStatus(journal: RunJournal, note?: string): CompletedStatusView {
@@ -789,7 +796,7 @@ function presentCancelledStatus(journal: RunJournal, note?: string): CancelledSt
 	return { kind: "present", cancelled: true, markdown: lines.join("\n"), footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · cancelled` } };
 }
 
-function presentStatusForJournal(journal: RunJournal, note?: string): StatusView {
+function presentStatusForJournalRaw(journal: RunJournal, note?: string): StatusView {
 	if (journal.run.status === "cancelled" || journal.run.cancellation) return presentCancelledStatus(journal, note);
 	if (journal.run.tasks.length > 1) return presentMultiTaskStatus(journal, note);
 	if (journal.run.status === "completed" || journal.run.completion?.phase === "archived") return presentCompletedStatus(journal, note);
@@ -801,11 +808,12 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 	if (!task || !attempt) {
 		return {
 			kind: "present",
+			journalRecovery: "normal",
 			markdown: [`Run ${journal.run.id} is active; no Builder Attempt has been dispatched.`, ...(note ? [note] : [])].join("\n"),
 			footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · active · 0 attention` },
 		};
 	}
-	if (attempt.role !== "builder") return { kind: "present", markdown: `Run ${journal.run.id} is active; Review is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · reviewing · 0 attention` } };
+	if (attempt.role !== "builder") return { kind: "present", journalRecovery: "normal", markdown: `Run ${journal.run.id} is active; Review is in progress.`, footer: { run: "active", attentionCount: 0, text: `steward: ${journal.run.id} · reviewing · 0 attention` } };
 	const dispatch = attempt.dispatch;
 	const actual = dispatch.phase === "worktree-intended" || dispatch.phase === "replacement-pane-intended" ? { worktreeBranch: dispatch.branch, ...(dispatch.phase === "replacement-pane-intended" ? { worktreePath: dispatch.worktreePath, agentName: dispatch.agentName } : {}) } : {
 		worktreeBranch: dispatch.branch,
@@ -858,10 +866,56 @@ function presentStatusForJournal(journal: RunJournal, note?: string): StatusView
 	];
 	return {
 		kind: "present",
+		journalRecovery: "normal",
 		markdown: lines.join("\n"),
 		footer: { run: "active", attentionCount: task.attention === "none" ? 0 : 1, text: `steward: ${journal.run.id} · ${task.phase} · ${task.attention === "none" ? 0 : 1} attention${attempt.recovery?.silence ? ` · silence ${attempt.recovery.silence.phase}` : ""}` },
 		activeAttempt,
 	};
+}
+
+function withJournalRecovery(view: StatusView, mode: ActiveJournalMode, banner?: string): StatusView {
+	if (view.kind === "empty") return view;
+	const markdown = banner ? `${banner}\n${view.markdown}` : view.markdown;
+	if ("completed" in view) return { ...view, journalRecovery: mode, markdown };
+	if ("cancelled" in view) return { ...view, journalRecovery: mode, markdown, footer: { ...view.footer, text: mode === "normal" ? view.footer.text : `${view.footer.text} · journal ${mode}` } };
+	return { ...view, journalRecovery: mode, markdown, footer: { ...view.footer, text: mode === "normal" ? view.footer.text : `${view.footer.text} · journal ${mode}` } };
+}
+
+function presentStatusForJournal(journal: RunJournal, note?: string): StatusView {
+	const view = presentStatusForJournalRaw(journal, note);
+	return withJournalRecovery(view, "normal", view.kind === "present" && !("completed" in view) && !("cancelled" in view) ? "Journal: active schema v1 snapshot" : undefined);
+}
+
+function journalRecoveryMessage(load: ActiveRunLoadResult): string {
+	if (load.kind === "recovered") {
+		return `Journal recovery: degraded; showing previous snapshot revision ${load.journal.journalRevision} because active is corrupt. Workflow is read-only and snapshots are unchanged.\nActive snapshot: ${load.active.path} (${load.active.sha256})\nPrevious snapshot: ${load.previous.path} (${load.previous.sha256})`;
+	}
+	if (load.kind === "migration-ready") {
+		return `Journal recovery: migration ready; source schema v${load.migration.fromVersion} can be normalized to schema v${load.migration.targetVersion} by exact migration ${load.migration.id}. Active snapshot: ${load.paths.activePath} (${load.migration.rawActiveSha256}); previous snapshot: ${load.paths.previousPath} is untouched. Migrated hash: ${load.migration.migratedSha256}. No workflow action has been taken; resume explicitly to apply schema-only normalization.`;
+	}
+	if (load.kind !== "invalid") return "";
+	const reason = load.reason === "newer-schema"
+		? "A newer schema was found; update Steward before changing snapshots."
+		: load.reason === "older-schema"
+			? "An older schema was found without an exact registered migration; snapshots remain read-only."
+			: load.reason === "migration-failed"
+				? "The exact schema migration failed validation; snapshots remain read-only."
+				: load.reason === "unsafe-snapshot"
+					? "A snapshot was not a stable regular file; snapshots remain read-only."
+					: "Neither snapshot is a valid current schema snapshot; snapshots remain read-only.";
+	return `Journal recovery: read-only; ${reason}\nActive snapshot: ${load.paths.activePath}\nPrevious snapshot: ${load.paths.previousPath}\n${load.diagnostics.map((item) => item.message).join(" ")}`;
+}
+
+function presentRecoveryStatus(load: Exclude<ActiveRunLoadResult, { kind: "missing" | "loaded" }>): StatusView {
+	if (load.kind === "invalid") {
+		return {
+			kind: "present",
+			journalRecovery: "read-only",
+			markdown: journalRecoveryMessage(load),
+			footer: { run: "active", attentionCount: 0, text: "steward: active Run · journal read-only recovery" },
+		};
+	}
+	return withJournalRecovery(presentStatusForJournalRaw(load.journal), load.mode, journalRecoveryMessage(load));
 }
 
 function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatusView | CompletedStatusView {
@@ -888,7 +942,7 @@ function presentMultiTaskStatus(journal: RunJournal, note?: string): ActiveStatu
 		if (detailAttempt.role === "builder" && detailAttempt.evidence?.phase !== "finalized") lines.push("Completion: not inferred from Herdr activity; awaiting a validated Attempt Report.");
 	}
 	if (note) lines.push(note);
-	return { kind: "present", markdown: lines.join("\n"), footer: { run: "active", attentionCount: attention, text: `steward: ${journal.run.id} · ${detail?.phase ?? journal.run.status} · ${attention} attention · ${active}/${journal.run.effectiveSettings.maximumActiveTasks} active` } };
+	return { kind: "present", journalRecovery: "normal", markdown: lines.join("\n"), footer: { run: "active", attentionCount: attention, text: `steward: ${journal.run.id} · ${detail?.phase ?? journal.run.status} · ${attention} attention · ${active}/${journal.run.effectiveSettings.maximumActiveTasks} active` } };
 }
 
 function pendingControllerAction(journal: RunJournal): ControllerPendingAction {
@@ -4575,7 +4629,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		try { loaded = await runJournal.loadActive(repositoryRoot); }
 		catch (error: unknown) { return presentCancellation({ kind: "storage-error", message: `Cancellation could not inspect the active Run; no external effect was attempted. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
 		if (loaded.kind === "missing") return presentCancellation({ kind: "refused", message: "No active Steward Run exists; cancellation performed no mutation." });
-		if (loaded.kind === "invalid") return presentCancellation({ kind: "refused", message: `Active Steward Run is invalid at ${loaded.paths.activePath}; cancellation performed no mutation.` });
+		if (loaded.kind !== "loaded") return presentCancellation({ kind: "refused", message: `${journalRecoveryMessage(loaded)} Cancellation performed no mutation or external effect.` });
 		const basis = loaded.journal;
 		if (basis.run.status === "cancelled" || basis.run.cancellation) return presentCancellation({ kind: "refused", message: `Run ${basis.run.id} is already cancelled; inspect status for the durable stop/archive phase.` });
 		if (basis.run.status !== "active") return presentCancellation({ kind: "refused", message: `Run ${basis.run.id} is ${basis.run.status}; cancellation is only available for an active Run.` });
@@ -4737,7 +4791,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		try { active = await runJournal.loadActive(repositoryRoot); }
 		catch (error: unknown) { return presentCleanup({ kind: "refused", message: `Cleanup could not inspect the active Run; no Herdr effect was attempted. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
 		if (active.kind === "loaded") return presentCleanup({ kind: "refused", message: active.journal.run.status === "cancelled" ? `Run ${active.journal.run.id} is still present as a cancelled active pointer; inspect status and finish its stop/archive lifecycle before cleanup.` : `A nonterminal active Run ${active.journal.run.id} exists; cleanup will not interleave with live orchestration.` });
-		if (active.kind === "invalid") return presentCleanup({ kind: "refused", message: `The active Run Journal is invalid at ${active.paths.activePath}; cleanup has no ownership authority.` });
+		if (active.kind !== "missing") return presentCleanup({ kind: "refused", message: `${journalRecoveryMessage(active)} Cleanup has no ownership authority and performed no Herdr effect.` });
 		if (!runJournal.listTerminalArchives) return presentCleanup({ kind: "refused", message: "Terminal archive listing is unavailable; no cleanup effect was attempted." });
 		const listed = await runJournal.listTerminalArchives(repositoryRoot);
 		if (listed.kind !== "loaded") return presentCleanup({ kind: "refused", message: `Terminal archives are not a strict cleanup basis; no Herdr effect was attempted. ${listed.message}` });
@@ -4824,7 +4878,9 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 	async function takeover(repositoryRoot: string, controllerSessionId: string): Promise<ResumeResult> {
 		const initial = await runJournal.loadActive(repositoryRoot);
 		if (initial.kind === "missing") return { kind: "missing", message: "No active Steward Run exists in this repository." };
-		if (initial.kind === "invalid") return { kind: "invalid", message: `Active Steward Run state is invalid at ${initial.paths.activePath}; takeover is read-only.` };
+		if (initial.kind === "migration-ready") return applyMigrationResume(repositoryRoot, initial);
+		if (initial.kind === "recovered") return { kind: "recovered", message: `${journalRecoveryMessage(initial)} Takeover is dormant; resume remains read-only until the active snapshot is repaired.` };
+		if (initial.kind === "invalid") return { kind: "invalid", message: `${journalRecoveryMessage(initial)} Takeover is read-only.` };
 		if (initial.journal.run.status === "cancelled" || initial.journal.run.cancellation) return { kind: "stale", message: "The active Steward Run is cancelled; takeover is dormant." };
 		if (initial.journal.run.status === "completed" || initial.journal.run.completion?.phase === "archived") return { kind: "stale", message: "The active Steward Run is completed; takeover is dormant." };
 		if (controllerIdentityMatches(initial.journal, controllerSessionId)) return { kind: "already-owner", currentSessionId: controllerSessionId, message: "This Controller Session already owns the active Steward Run; use plain resume." };
@@ -4875,9 +4931,19 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return { kind: "taken-over", journal: replaced.journal, pendingAction, message: `Controller ownership transferred to Session ${controllerSessionId}; the next serialized pass will reconcile before one workflow action.${warning}` };
 	}
 
+	async function applyMigrationResume(repositoryRoot: string, load: Extract<ActiveRunLoadResult, { kind: "migration-ready" }>): Promise<ResumeResult> {
+		if (!runJournal.applyMigration) return { kind: "migration-failed", message: `${journalRecoveryMessage(load)} This adapter cannot perform the explicit schema-only normalization; no snapshot or workflow fact changed.` };
+		let applied: ApplyRunJournalMigrationResult;
+		try { applied = await runJournal.applyMigration(repositoryRoot, load); }
+		catch (error: unknown) { return { kind: "migration-failed", message: `${journalRecoveryMessage(load)} Schema-only normalization failed without a workflow action. ${error instanceof Error ? error.message : "Migration storage failed."}` }; }
+		if (applied.kind === "applied") return { kind: "migration-applied", journal: applied.journal, message: `Only schema normalization ${applied.migration.id} was applied from v${applied.migration.fromVersion} to v${applied.migration.targetVersion}; no workflow reconciliation occurred. Resume again to continue normally.` };
+		return { kind: "migration-failed", message: `${journalRecoveryMessage(load)} Schema-only normalization was not applied; no workflow action occurred. ${applied.diagnostics.map((item) => item.message).join(" ")}` };
+	}
+
 	async function restoreControllerSession(repositoryRoot: string, controllerSessionId: string): Promise<ControllerSessionRestoreResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind === "missing") return { kind: "dormant", reason: "missing", message: "No active Steward Run exists; Controller monitoring is dormant." };
+		if (loaded.kind === "recovered" || loaded.kind === "migration-ready") return { kind: "dormant", reason: "recovery", message: `${journalRecoveryMessage(loaded)} Controller monitoring is dormant.` };
 		if (loaded.kind === "invalid") return { kind: "dormant", reason: "invalid", message: "Active Steward Run state is invalid; Controller monitoring is dormant." };
 		if (loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation) return { kind: "dormant", reason: "cancelled", message: "The Steward Run is cancelled; Controller monitoring is dormant.", journal: loaded.journal };
 		if (loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "dormant", reason: "completed", message: "The Steward Run is completed; Controller monitoring is dormant.", journal: loaded.journal };
@@ -4888,6 +4954,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 	async function prepareCompactionContinuity(repositoryRoot: string, controllerSessionId: string): Promise<CompactionContinuityResult> {
 		const first = await runJournal.loadActive(repositoryRoot);
 		if (first.kind === "missing") return { kind: "missing", message: "No active Steward Run exists; normal Pi compaction remains available." };
+		if (first.kind === "recovered" || first.kind === "migration-ready") return { kind: "invalid", message: `${journalRecoveryMessage(first)} normal Pi compaction remains available without Controller monitoring.` };
 		if (first.kind === "invalid") return { kind: "invalid", message: "Active Steward Run state is invalid; normal Pi compaction remains available." };
 		if (first.journal.run.status === "cancelled" || first.journal.run.cancellation) return { kind: "cancelled", message: "The Steward Run is cancelled; normal Pi compaction remains available." };
 		if (first.journal.run.status === "completed" || first.journal.run.completion?.phase === "archived") return { kind: "completed", message: "The Steward Run is completed; normal Pi compaction remains available." };
@@ -4912,18 +4979,14 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 	async function status(repositoryRoot: string, target: StatusTarget, controllerSessionId?: string): Promise<StatusView> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		if (loaded.kind === "loaded" && (loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation)) {
-			const statusView = presentCancelledStatus(loaded.journal);
+			const statusView = withJournalRecovery(presentCancelledStatus(loaded.journal), "normal");
 			ui.presentStatus(statusView, target);
 			return statusView;
 		}
 		let statusView: StatusView = loaded.kind === "missing"
 			? EMPTY_STATUS
-			: loaded.kind === "invalid"
-				? {
-					kind: "present" as const,
-					markdown: `Active Steward Run state is invalid at ${loaded.paths.activePath}; status is read-only. ${loaded.diagnostics.map((item) => item.message).join(" ")}`,
-					footer: { run: "active" as const, attentionCount: 0 as const, text: "steward: active Run needs recovery" },
-				}
+			: loaded.kind !== "loaded"
+				? presentRecoveryStatus(loaded)
 				: presentStatusForJournal(loaded.journal);
 		if (loaded.kind === "loaded" && target === "command" && controllerSessionId !== undefined && controllerIdentityMatches(loaded.journal, controllerSessionId)) {
 			let currentJournal = loaded.journal;
@@ -4981,7 +5044,9 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const loaded = await runJournal.loadActive(repositoryRoot);
 		let result: ResumeResult;
 		if (loaded.kind === "missing") result = { kind: "missing", message: "No active Steward Run exists in this repository." };
-		else if (loaded.kind === "invalid") result = { kind: "invalid", message: `Active Steward Run state is invalid at ${loaded.paths.activePath}; resume is read-only. ${loaded.diagnostics.map((item) => item.message).join(" ")}` };
+		else if (loaded.kind === "migration-ready") result = await applyMigrationResume(repositoryRoot, loaded);
+		else if (loaded.kind === "recovered") result = { kind: "recovered", message: `${journalRecoveryMessage(loaded)} Resume is read-only; repair or explicitly choose a schema-only migration before workflow continuation.` };
+		else if (loaded.kind === "invalid") result = { kind: "invalid", message: `${journalRecoveryMessage(loaded)} Resume is read-only; no workflow action occurred.` };
 		else if (loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation) result = { kind: "stale", message: `Run ${loaded.journal.run.id} is cancelled; resume is dormant and performed no workflow effect.` };
 		else if (!controllerIdentityMatches(loaded.journal, controllerSessionId)) result = { kind: "foreign-session", recordedSessionId: loaded.journal.run.controllerSessionId, currentSessionId: controllerSessionId, message: `The active Steward Run belongs to Controller Session ${loaded.journal.run.controllerSessionId}; resume performed no mutation. Run /steward resume --takeover to reconcile and claim ownership.` };
 		else {
@@ -5128,7 +5193,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			return refuse(`Run Journal could not be inspected; no Run was started. ${error instanceof Error ? error.message : "Read-only inspection failed."}`);
 		}
 		if (initialActive.kind === "loaded") return refuse(`An active Steward Run already exists at ${initialActive.paths.activePath}; use status, resume, cancel, or cleanup.`);
-		if (initialActive.kind === "invalid") return refuse(`Run start is disabled because the active Run Journal is invalid at ${initialActive.paths.activePath}. Recovery snapshots: ${initialActive.paths.activePath} and ${initialActive.paths.previousPath}.`);
+		if (initialActive.kind !== "missing") return refuse(`${journalRecoveryMessage(initialActive)} Run start is disabled; no workflow or external effect was attempted.`);
 
 		let availability: HerdrAvailability;
 		try {
@@ -5369,7 +5434,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		let loaded: ActiveRunLoadResult;
 		try { loaded = await runJournal.loadActive(repositoryRoot); } catch (error: unknown) { return presentRevision({ kind: "invalid", message: `Revision could not inspect the active Run; no mutation occurred. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
 		if (loaded.kind === "missing") return presentRevision({ kind: "missing", message: "No active Steward Run exists; revision performed no mutation." });
-		if (loaded.kind === "invalid") return presentRevision({ kind: "invalid", message: `Active Steward Run is invalid at ${loaded.paths.activePath}; revision performed no mutation.` });
+		if (loaded.kind !== "loaded") return presentRevision({ kind: "invalid", message: `${journalRecoveryMessage(loaded)} Revision performed no mutation or external effect.` });
 		const basis = loaded.journal;
 		if (basis.run.status !== "active" || basis.run.completion?.phase === "archived") return presentRevision({ kind: "refused", message: "Only an active, non-completing Steward Run can be revised; no mutation occurred." });
 		const finalExecution = basis.run.finalVerificationExecution;
@@ -5698,7 +5763,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	async function observeMonitorProgress(repositoryRoot: string, controllerSessionId: string, trigger: MonitorTrigger): Promise<MonitorPassResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
-		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; monitoring is dormant." : "Active Run state is invalid; monitoring is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
+		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "missing" ? "none" : "degraded", undefined, loaded.kind === "missing" ? "No active Run exists; monitoring is dormant." : `${journalRecoveryMessage(loaded)} Monitoring is dormant.`, loaded.kind === "missing" ? undefined : "Run Journal recovery is read-only.");
 		const journal = loaded.journal;
 		if (!controllerIdentityMatches(journal, controllerSessionId)) return monitorResult("none", journal, "Controller Session does not match; monitor observation is read-only.");
 		if (journal.run.status === "cancelled" || journal.run.cancellation) return monitorResult("none", journal, "Run is cancelled; monitoring is dormant.");
@@ -5756,7 +5821,8 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	async function waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
-		if (loaded.kind !== "loaded" || !controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active non-cancelled Controller-owned Run is available for a lifecycle wait." };
+		if (loaded.kind !== "loaded") return { kind: "unavailable", diagnostic: loaded.kind === "missing" ? "No active non-cancelled Controller-owned Run is available for a lifecycle wait." : `${journalRecoveryMessage(loaded)} Lifecycle wait is dormant.` };
+		if (!controllerIdentityMatches(loaded.journal, controllerSessionId) || loaded.journal.run.status === "cancelled" || loaded.journal.run.cancellation || loaded.journal.run.status === "completed" || loaded.journal.run.completion?.phase === "archived") return { kind: "unavailable", diagnostic: "No active non-cancelled Controller-owned Run is available for a lifecycle wait." };
 		const finalExecution = loaded.journal.run.finalVerificationExecution;
 		if (finalExecution && isRecoverableFinalVerificationExecution(finalExecution) && finalExecution.phase === "executing" && finalExecution.attempts.at(-1)?.process && process.waitApprovedVerification) {
 			const attempt = finalExecution.attempts.at(-1)!;
@@ -5837,7 +5903,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 
 	async function advanceNext(repositoryRoot: string, controllerSessionId: string, options: MonitorAdvanceOptions): Promise<MonitorPassResult> {
 		const loaded = await runJournal.loadActive(repositoryRoot);
-		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "invalid" ? "degraded" : "none", undefined, loaded.kind === "missing" ? "No active Run exists; advancement is dormant." : "Active Run state is invalid; advancement is read-only.", loaded.kind === "invalid" ? "Active Run Journal is invalid." : undefined);
+		if (loaded.kind !== "loaded") return monitorResult(loaded.kind === "missing" ? "none" : "degraded", undefined, loaded.kind === "missing" ? "No active Run exists; advancement is dormant." : `${journalRecoveryMessage(loaded)} Advancement is dormant.`, loaded.kind === "missing" ? undefined : "Run Journal recovery is read-only.");
 		let journal = loaded.journal;
 		if (!controllerIdentityMatches(journal, controllerSessionId)) return monitorResult("none", journal, "Controller Session does not match; advancement is read-only.");
 		if (journal.run.status === "cancelled" || journal.run.cancellation) return monitorResult("none", journal, "Run is cancelled; advancement is dormant.");

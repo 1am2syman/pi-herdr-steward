@@ -4003,6 +4003,29 @@ export function deserializeRunJournal(content: string, path?: string): { value?:
 	}
 }
 
+/**
+ * Classify only the outer schema envelope. This is deliberately weaker than
+ * Run Journal validation so recovery can distinguish an explicitly supported
+ * migration boundary from corruption without ever treating partial data as a
+ * usable Run Journal.
+ */
+export type RunJournalEnvelope =
+	| { kind: "malformed"; diagnostics: RunDiagnostic[] }
+	| { kind: "current" | "older" | "newer"; schemaVersion: number; value: unknown };
+
+export function classifyRunJournalEnvelope(content: string, path?: string): RunJournalEnvelope {
+	try {
+		const value = JSON.parse(content) as unknown;
+		if (!isRecord(value) || typeof value.schemaVersion !== "number" || !Number.isSafeInteger(value.schemaVersion)) {
+			return { kind: "malformed", diagnostics: [diagnostic("invalid-run", "Run Journal envelope must contain a safe integer schemaVersion.", path)] };
+		}
+		const kind = value.schemaVersion === RUN_JOURNAL_SCHEMA_VERSION ? "current" : value.schemaVersion < RUN_JOURNAL_SCHEMA_VERSION ? "older" : "newer";
+		return { kind, schemaVersion: value.schemaVersion, value };
+	} catch {
+		return { kind: "malformed", diagnostics: [diagnostic("invalid-run", "Run Journal contains malformed JSON.", path)] };
+	}
+}
+
 function validateAssignment(value: unknown, path = "assignment.json"): { value?: AssignmentDocument; diagnostics: RunDiagnostic[] } {
 	if (!isRecord(value) || !exactKeys(value, ["schemaVersion", "assignment"]) || value.schemaVersion !== 1 || !isRecord(value.assignment)) return { diagnostics: [diagnostic("invalid-task", "Assignment must contain exactly schemaVersion 1 and assignment.", path)] };
 	const assignment = value.assignment;

@@ -249,6 +249,7 @@ export function registerStewardExtension(
 			const current = runtime;
 			if (!current) return;
 			const commandSteward = current.steward;
+			let keepMonitorDormant = false;
 			await current.monitor.runExclusive(async () => {
 				const controllerSessionId = ctx.sessionManager.getSessionId();
 				if (command === "status") {
@@ -268,7 +269,8 @@ export function registerStewardExtension(
 					return;
 				}
 				if (command === "resume" || command === "resume --takeover") {
-					await commandSteward.resume(ctx.cwd, controllerSessionId, command === "resume --takeover");
+					const result = await commandSteward.resume(ctx.cwd, controllerSessionId, command === "resume --takeover");
+					keepMonitorDormant = result.kind === "migration-applied";
 					return;
 				}
 				if (command === "cancel") {
@@ -285,7 +287,7 @@ export function registerStewardExtension(
 				current.monitorStarted = false;
 				runtimeBoundToSessionLifecycle = false;
 			}
-			if (command !== "cleanup" && command !== "cancel" && !current.monitorStarted && runtimeBoundToSessionLifecycle) {
+			if (command !== "cleanup" && command !== "cancel" && !keepMonitorDormant && !current.monitorStarted && runtimeBoundToSessionLifecycle) {
 				const restored = await current.steward.restoreControllerSession(ctx.cwd, ctx.sessionManager.getSessionId());
 				if (restored.kind === "restored") {
 					current.monitor.start();

@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants, lstatSync } from "node:fs";
 import { chmod, link, lstat, open, readFile, realpath, rename, unlink, readdir } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 import { createAssignmentStore, resolveAssignmentPaths, type AssignmentCreateResult, type AssignmentPaths } from "./assignment-store.ts";
@@ -16,8 +16,10 @@ import {
 	syncDirectory,
 } from "./project-state.ts";
 import {
+	classifyRunJournalEnvelope,
 	deserializeRunJournal,
 	serializeRunJournal,
+	serializeRunJournalAtPath,
 	validateActivityEntry,
 	validateRunJournal,
 	type ActivityEntry,
@@ -25,6 +27,7 @@ import {
 	type RunJournal,
 	type AttemptRecord,
 	type MonitorReportObservation,
+	RUN_JOURNAL_SCHEMA_VERSION,
 } from "./run.ts";
 
 export interface RunJournalPaths {
@@ -34,10 +37,49 @@ export interface RunJournalPaths {
 	activityRoot: string;
 }
 
+export type ActiveJournalMode = "normal" | "recovered" | "read-only";
+
+export interface JournalSnapshotProvenance {
+	path: string;
+	sha256: string;
+	byteCount: number;
+}
+
+export interface RunJournalMigration {
+	id: string;
+	fromVersion: number;
+	targetVersion: typeof RUN_JOURNAL_SCHEMA_VERSION;
+	migrate(value: unknown): unknown;
+}
+
+export type RunJournalMigrationRegistry = ReadonlyMap<number, RunJournalMigration>;
+
+export interface JournalMigrationBasis {
+	id: string;
+	fromVersion: number;
+	targetVersion: typeof RUN_JOURNAL_SCHEMA_VERSION;
+	rawActiveSha256: string;
+	migratedSha256: string;
+}
+
 export type ActiveRunLoadResult =
 	| { kind: "missing"; paths: RunJournalPaths }
-	| { kind: "loaded"; journal: RunJournal; paths: RunJournalPaths }
-	| { kind: "invalid"; paths: RunJournalPaths; diagnostics: RunDiagnostic[] };
+	| { kind: "loaded"; mode: "normal"; journal: RunJournal; paths: RunJournalPaths; active: JournalSnapshotProvenance }
+	| { kind: "recovered"; mode: "recovered"; journal: RunJournal; paths: RunJournalPaths; active: JournalSnapshotProvenance; previous: JournalSnapshotProvenance; diagnostics: RunDiagnostic[] }
+	| { kind: "migration-ready"; mode: "recovered"; journal: RunJournal; paths: RunJournalPaths; active: JournalSnapshotProvenance; migration: JournalMigrationBasis }
+	| {
+			kind: "invalid";
+			mode: "read-only";
+			paths: RunJournalPaths;
+			reason: "invalid-snapshots" | "unsafe-snapshot" | "newer-schema" | "older-schema" | "migration-failed";
+			diagnostics: RunDiagnostic[];
+			active?: JournalSnapshotProvenance;
+			previous?: JournalSnapshotProvenance;
+	  };
+
+export type ApplyRunJournalMigrationResult =
+	| { kind: "applied"; journal: RunJournal; paths: RunJournalPaths; migration: JournalMigrationBasis }
+	| { kind: "refused" | "stale" | "storage-error"; paths: RunJournalPaths; diagnostics: RunDiagnostic[] };
 
 export type CreateActiveResult =
 	| { kind: "created"; journal: RunJournal; paths: RunJournalPaths }
@@ -72,6 +114,7 @@ export interface RunJournalStore {
 	resolvePaths(repositoryRoot: string): RunJournalPaths;
 	probeActive(repositoryRoot: string): "missing" | "present";
 	loadActive(repositoryRoot: string): Promise<ActiveRunLoadResult>;
+	applyMigration(repositoryRoot: string, expected: Extract<ActiveRunLoadResult, { kind: "migration-ready" }>): Promise<ApplyRunJournalMigrationResult>;
 	createActive(repositoryRoot: string, journal: RunJournal): Promise<CreateActiveResult>;
 	replaceActive(repositoryRoot: string, journal: RunJournal): Promise<ReplaceActiveResult>;
 	appendActivity(repositoryRoot: string, entry: ActivityEntry): Promise<ActivityAppendResult>;
@@ -126,34 +169,87 @@ function storageDiagnostics(path: string, error: unknown): RunDiagnostic[] {
 	return [diag("invalid-run", `${path}: ${filesystemErrorText(error)}`, path)];
 }
 
-async function regularFile(path: string): Promise<boolean> {
+interface StableRawSnapshot {
+	path: string;
+	bytes: Buffer;
+	text: string;
+	provenance: JournalSnapshotProvenance;
+}
+
+type JournalFileRead =
+	| { kind: "missing" }
+	| { kind: "unsafe"; diagnostics: RunDiagnostic[] }
+	| { kind: "invalid"; diagnostics: RunDiagnostic[]; snapshot: StableRawSnapshot }
+	| { kind: "newer"; schemaVersion: number; diagnostics: RunDiagnostic[]; snapshot: StableRawSnapshot }
+	| { kind: "older"; schemaVersion: number; value: unknown; diagnostics: RunDiagnostic[]; snapshot: StableRawSnapshot }
+	| { kind: "loaded"; journal: RunJournal; bytes: string; snapshot: StableRawSnapshot };
+
+function sameFileFacts(left: { dev: number; ino: number; size: number }, right: { dev: number; ino: number; size: number }): boolean {
+	return left.dev === right.dev && left.ino === right.ino && left.size === right.size;
+}
+
+function unsafeSnapshotDiagnostic(path: string, message: string): RunDiagnostic[] {
+	return [diag("invalid-run", `Unsafe Run Journal snapshot: ${message}`, path)];
+}
+
+async function readStableRawSnapshot(path: string): Promise<{ kind: "missing" } | { kind: "unsafe"; diagnostics: RunDiagnostic[] } | { kind: "read"; snapshot: StableRawSnapshot }> {
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	let initial: Awaited<ReturnType<typeof lstat>>;
 	try {
-		const info = await lstat(path);
-		return info.isFile();
+		try {
+			initial = await lstat(path);
+		} catch (error: unknown) {
+			if (missing(error)) return { kind: "missing" };
+			return { kind: "unsafe", diagnostics: storageDiagnostics(path, error) };
+		}
+		if (!initial.isFile() || initial.isSymbolicLink()) return { kind: "unsafe", diagnostics: unsafeSnapshotDiagnostic(path, "the path is not a regular non-symlink file.") };
+		try {
+			handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+		} catch (error: unknown) {
+			return { kind: "unsafe", diagnostics: unsafeSnapshotDiagnostic(path, filesystemErrorText(error).slice(0, 2_000)) };
+		}
+		const before = await handle.stat();
+		if (!before.isFile() || before.isSymbolicLink() || !sameFileFacts(initial, before)) return { kind: "unsafe", diagnostics: unsafeSnapshotDiagnostic(path, "the file changed before its descriptor was opened.") };
+		const bytes = await handle.readFile();
+		const after = await handle.stat();
+		if (!after.isFile() || after.isSymbolicLink() || !sameFileFacts(before, after) || bytes.length !== before.size) return { kind: "unsafe", diagnostics: unsafeSnapshotDiagnostic(path, "the file changed while it was read.") };
+		const sha256 = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+		return { kind: "read", snapshot: { path, bytes, text: bytes.toString("utf8"), provenance: { path, sha256, byteCount: bytes.length } } };
 	} catch (error: unknown) {
-		if (missing(error)) return false;
-		throw error;
+		return { kind: "unsafe", diagnostics: unsafeSnapshotDiagnostic(path, filesystemErrorText(error).slice(0, 2_000)) };
+	} finally {
+		await handle?.close().catch(() => undefined);
 	}
 }
 
-async function readJournalFile(path: string): Promise<{ kind: "missing" } | { kind: "invalid"; diagnostics: RunDiagnostic[] } | { kind: "loaded"; journal: RunJournal; bytes: string }> {
-	if (!(await regularFile(path))) {
-		try {
-			await lstat(path);
-			return { kind: "invalid", diagnostics: [diag("invalid-run", "Run Journal path is not a regular file.", path)] };
-		} catch (error: unknown) {
-			if (missing(error)) return { kind: "missing" };
-			throw error;
-		}
+function diagnosticsForJournalRead(result: Extract<JournalFileRead, { kind: "unsafe" | "invalid" | "newer" | "older" }>): RunDiagnostic[] {
+	return result.diagnostics;
+}
+
+async function readJournalFile(path: string): Promise<JournalFileRead> {
+	const raw = await readStableRawSnapshot(path);
+	if (raw.kind !== "read") return raw;
+	const envelope = classifyRunJournalEnvelope(raw.snapshot.text, path);
+	if (envelope.kind === "malformed") return { kind: "invalid", diagnostics: envelope.diagnostics, snapshot: raw.snapshot };
+	if (envelope.kind === "newer") {
+		return {
+			kind: "newer",
+			schemaVersion: envelope.schemaVersion,
+			diagnostics: [diag("invalid-run", `Run Journal schemaVersion ${envelope.schemaVersion} is newer than the supported schemaVersion ${RUN_JOURNAL_SCHEMA_VERSION}; update Steward before changing snapshots.`, path)],
+			snapshot: raw.snapshot,
+		};
 	}
-	let bytes: string;
-	try {
-		bytes = await readFile(path, "utf8");
-	} catch (error: unknown) {
-		return { kind: "invalid", diagnostics: storageDiagnostics(path, error) };
+	if (envelope.kind === "older") {
+		return {
+			kind: "older",
+			schemaVersion: envelope.schemaVersion,
+			value: envelope.value,
+			diagnostics: [diag("invalid-run", `Run Journal schemaVersion ${envelope.schemaVersion} is older than the supported schemaVersion ${RUN_JOURNAL_SCHEMA_VERSION}.`, path)],
+			snapshot: raw.snapshot,
+		};
 	}
-	const decoded = deserializeRunJournal(bytes, path);
-	return decoded.value ? { kind: "loaded", journal: decoded.value, bytes } : { kind: "invalid", diagnostics: decoded.diagnostics };
+	const decoded = deserializeRunJournal(raw.snapshot.text, path);
+	return decoded.value ? { kind: "loaded", journal: decoded.value, bytes: raw.snapshot.text, snapshot: raw.snapshot } : { kind: "invalid", diagnostics: decoded.diagnostics, snapshot: raw.snapshot };
 }
 
 async function writePreparedTemporary(directory: string, prefix: string, bytes: string, validate: (content: string) => boolean): Promise<string> {
@@ -183,6 +279,79 @@ async function validateCandidate(journal: RunJournal, path: string): Promise<{ b
 
 function validateFileBytes(bytes: string, path: string): boolean {
 	return Boolean(deserializeRunJournal(bytes, path).value);
+}
+
+function sha256(bytes: string | Buffer): string {
+	return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function migrationFromRegistry(registry: RunJournalMigrationRegistry | undefined, version: number): RunJournalMigration | undefined {
+	if (!registry) return undefined;
+	const candidate = registry.get(version);
+	if (!candidate || candidate.fromVersion !== version || candidate.fromVersion >= RUN_JOURNAL_SCHEMA_VERSION || candidate.targetVersion !== RUN_JOURNAL_SCHEMA_VERSION || typeof candidate.id !== "string" || candidate.id.trim().length === 0 || candidate.id !== candidate.id.trim() || candidate.id.includes("\u0000") || typeof candidate.migrate !== "function") return undefined;
+	return candidate;
+}
+
+function prepareMigration(input: { value: unknown; schemaVersion: number; snapshot: StableRawSnapshot }, migration: RunJournalMigration, path: string): { kind: "prepared"; journal: RunJournal; bytes: string; migration: JournalMigrationBasis } | { kind: "failed"; diagnostics: RunDiagnostic[] } {
+	let migrated: unknown;
+	try {
+		migrated = migration.migrate(input.value);
+	} catch (error: unknown) {
+		return { kind: "failed", diagnostics: [diag("invalid-run", `Run Journal migration ${migration.id} failed: ${filesystemErrorText(error).slice(0, 2_000)}`, path)] };
+	}
+	const validation = validateRunJournal(migrated, path);
+	if (!validation.value || validation.diagnostics.length > 0) return { kind: "failed", diagnostics: validation.diagnostics.length > 0 ? validation.diagnostics : [diag("invalid-run", `Run Journal migration ${migration.id} did not produce a valid schemaVersion ${RUN_JOURNAL_SCHEMA_VERSION} snapshot.`, path)] };
+	const bytes = serializeRunJournalAtPath(validation.value, path);
+	return {
+		kind: "prepared",
+		journal: validation.value,
+		bytes,
+		migration: {
+			id: migration.id,
+			fromVersion: input.schemaVersion,
+			targetVersion: RUN_JOURNAL_SCHEMA_VERSION,
+			rawActiveSha256: input.snapshot.provenance.sha256,
+			migratedSha256: sha256(bytes),
+		},
+	};
+}
+
+interface PublishedExclusiveSnapshot {
+	dev: number;
+	ino: number;
+	provenance: JournalSnapshotProvenance;
+}
+
+async function publishExclusiveSnapshot(path: string, bytes: string): Promise<"exists" | PublishedExclusiveSnapshot> {
+	let handle: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		handle = await open(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+		await handle.writeFile(bytes, "utf8");
+		await handle.sync();
+		const info = await handle.stat();
+		await handle.close();
+		handle = undefined;
+		const reread = await readStableRawSnapshot(path);
+		if (reread.kind !== "read" || reread.snapshot.text !== bytes) throw new Error("Exclusive Run Journal snapshot changed before it was published.");
+		await syncDirectory(dirname(path));
+		return { dev: info.dev, ino: info.ino, provenance: reread.snapshot.provenance };
+	} catch (error: unknown) {
+		await handle?.close().catch(() => undefined);
+		if (existsError(error)) return "exists";
+		await unlink(path).catch(() => undefined);
+		throw error;
+	}
+}
+
+async function removePublishedSnapshot(path: string, published: PublishedExclusiveSnapshot): Promise<void> {
+	try {
+		const info = await lstat(path);
+		if (info.dev !== published.dev || info.ino !== published.ino) return;
+		await unlink(path);
+		await syncDirectory(dirname(path));
+	} catch (error: unknown) {
+		if (!missing(error)) throw error;
+	}
 }
 
 async function ensureNoUnexpectedPrevious(path: string): Promise<void> {
@@ -337,8 +506,9 @@ export function resolveRunJournalPaths(repositoryRoot: string, configDirName = C
 	return pathsFor(repositoryRoot, configDirName);
 }
 
-export function createRunJournalStore(options: { configDirName?: string } = {}): RunJournalStore {
+export function createRunJournalStore(options: { configDirName?: string; migrations?: RunJournalMigrationRegistry } = {}): RunJournalStore {
 	const configDirName = options.configDirName ?? CONFIG_DIR_NAME;
+	const migrations = options.migrations;
 	const assignmentStore = createAssignmentStore({ configDirName });
 	const evidenceStore = createAttemptEvidenceStore();
 
@@ -359,12 +529,76 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 	async function loadActive(repositoryRoot: string): Promise<ActiveRunLoadResult> {
 		const paths = resolvePaths(repositoryRoot);
 		try {
-			const result = await readJournalFile(paths.activePath);
-			if (result.kind === "missing") return { kind: "missing", paths };
-			if (result.kind === "invalid") return { kind: "invalid", paths, diagnostics: result.diagnostics };
-			return { kind: "loaded", journal: result.journal, paths };
+			const active = await readJournalFile(paths.activePath);
+			if (active.kind === "missing") return { kind: "missing", paths };
+			if (active.kind === "unsafe") return { kind: "invalid", mode: "read-only", reason: "unsafe-snapshot", paths, diagnostics: active.diagnostics };
+			if (active.kind === "newer") return { kind: "invalid", mode: "read-only", reason: "newer-schema", paths, diagnostics: active.diagnostics, active: active.snapshot.provenance };
+			if (active.kind === "older") {
+				const migration = migrationFromRegistry(migrations, active.schemaVersion);
+				if (!migration) return { kind: "invalid", mode: "read-only", reason: "older-schema", paths, diagnostics: [...active.diagnostics, diag("invalid-run", `No exact Run Journal migration is registered for schemaVersion ${active.schemaVersion}; the active and previous snapshots remain unchanged.`, paths.activePath)], active: active.snapshot.provenance };
+				const prepared = prepareMigration({ value: active.value, schemaVersion: active.schemaVersion, snapshot: active.snapshot }, migration, paths.activePath);
+				if (prepared.kind === "failed") return { kind: "invalid", mode: "read-only", reason: "migration-failed", paths, diagnostics: prepared.diagnostics, active: active.snapshot.provenance };
+				return { kind: "migration-ready", mode: "recovered", journal: prepared.journal, paths, active: active.snapshot.provenance, migration: prepared.migration };
+			}
+			if (active.kind === "invalid") {
+				const previous = await readJournalFile(paths.previousPath);
+				if (previous.kind === "loaded") return { kind: "recovered", mode: "recovered", journal: previous.journal, paths, active: active.snapshot.provenance, previous: previous.snapshot.provenance, diagnostics: active.diagnostics };
+				const previousDiagnostics = previous.kind === "missing" ? [diag("invalid-run", "Previous Run Journal snapshot is missing; a corrupt active snapshot cannot be revived without it.", paths.previousPath)] : diagnosticsForJournalRead(previous);
+				return {
+					kind: "invalid",
+					mode: "read-only",
+					reason: previous.kind === "unsafe" ? "unsafe-snapshot" : "invalid-snapshots",
+					paths,
+					diagnostics: [...active.diagnostics, ...previousDiagnostics],
+					active: active.snapshot.provenance,
+					...(previous.kind === "invalid" || previous.kind === "newer" || previous.kind === "older" ? { previous: previous.snapshot.provenance } : {}),
+				};
+			}
+			return { kind: "loaded", mode: "normal", journal: active.journal, paths, active: active.snapshot.provenance };
 		} catch (error: unknown) {
-			return { kind: "invalid", paths, diagnostics: storageDiagnostics(paths.activePath, error) };
+			return { kind: "invalid", mode: "read-only", reason: "unsafe-snapshot", paths, diagnostics: storageDiagnostics(paths.activePath, error) };
+		}
+	}
+
+	async function applyMigration(repositoryRoot: string, expected: Extract<ActiveRunLoadResult, { kind: "migration-ready" }>): Promise<ApplyRunJournalMigrationResult> {
+		const paths = resolvePaths(repositoryRoot);
+		if (expected.paths.activePath !== paths.activePath || expected.paths.previousPath !== paths.previousPath) return { kind: "stale", paths, diagnostics: [diag("invalid-run", "Migration basis belongs to a different Steward state directory.", paths.activePath)] };
+		let published: PublishedExclusiveSnapshot | undefined;
+		let activeRenamed = false;
+		let temporaryPath: string | undefined;
+		try {
+			const active = await readJournalFile(paths.activePath);
+			if (active.kind !== "older" || active.snapshot.provenance.sha256 !== expected.migration.rawActiveSha256 || active.schemaVersion !== expected.migration.fromVersion) return { kind: "stale", paths, diagnostics: [diag("invalid-run", "Active Run Journal changed before the registered migration could be applied; no snapshot was changed.", paths.activePath)] };
+			const migration = migrationFromRegistry(migrations, active.schemaVersion);
+			if (!migration || migration.id !== expected.migration.id) return { kind: "stale", paths, diagnostics: [diag("invalid-run", "The exact registered Run Journal migration is no longer available; no snapshot was changed.", paths.activePath)] };
+			const prepared = prepareMigration({ value: active.value, schemaVersion: active.schemaVersion, snapshot: active.snapshot }, migration, paths.activePath);
+			if (prepared.kind === "failed" || prepared.migration.migratedSha256 !== expected.migration.migratedSha256) return { kind: "stale", paths, diagnostics: prepared.kind === "failed" ? prepared.diagnostics : [diag("invalid-run", "Run Journal migration output was not deterministic; no snapshot was changed.", paths.activePath)] };
+			try {
+				await lstat(paths.previousPath);
+				return { kind: "refused", paths, diagnostics: [diag("invalid-run", "Schema-only migration refuses to overwrite any existing previous snapshot.", paths.previousPath)] };
+			} catch (error: unknown) {
+				if (!missing(error)) return { kind: "storage-error", paths, diagnostics: storageDiagnostics(paths.previousPath, error) };
+			}
+			const activeBeforePublish = await readJournalFile(paths.activePath);
+			if (activeBeforePublish.kind !== "older" || activeBeforePublish.snapshot.provenance.sha256 !== expected.migration.rawActiveSha256) return { kind: "stale", paths, diagnostics: [diag("invalid-run", "Active Run Journal changed before migration publication; no snapshot was changed.", paths.activePath)] };
+			const publishedResult = await publishExclusiveSnapshot(paths.previousPath, activeBeforePublish.snapshot.text);
+			if (publishedResult === "exists") return { kind: "refused", paths, diagnostics: [diag("invalid-run", "A previous snapshot appeared before schema-only migration publication; no snapshot was overwritten.", paths.previousPath)] };
+			published = publishedResult;
+			const activeAfterPublish = await readJournalFile(paths.activePath);
+			if (activeAfterPublish.kind !== "older" || activeAfterPublish.snapshot.provenance.sha256 !== expected.migration.rawActiveSha256) return { kind: "stale", paths, diagnostics: [diag("invalid-run", "Active Run Journal changed during schema-only migration publication; snapshots were preserved.", paths.activePath)] };
+			temporaryPath = await writePreparedTemporary(paths.stewardDirectory, ACTIVE_NAME, prepared.bytes, (bytes) => validateFileBytes(bytes, paths.activePath));
+			const activeBeforeRename = await readJournalFile(paths.activePath);
+			if (activeBeforeRename.kind !== "older" || activeBeforeRename.snapshot.provenance.sha256 !== expected.migration.rawActiveSha256) return { kind: "stale", paths, diagnostics: [diag("invalid-run", "Active Run Journal changed before schema-only migration commit; snapshots were preserved.", paths.activePath)] };
+			await rename(temporaryPath, paths.activePath);
+			temporaryPath = undefined;
+			activeRenamed = true;
+			await syncDirectory(paths.stewardDirectory);
+			return { kind: "applied", journal: prepared.journal, paths, migration: prepared.migration };
+		} catch (error: unknown) {
+			return { kind: "storage-error", paths, diagnostics: storageDiagnostics(paths.activePath, error) };
+		} finally {
+			if (temporaryPath) await removeKnownTemporaryFile(temporaryPath).catch(() => undefined);
+			if (published && !activeRenamed) await removePublishedSnapshot(paths.previousPath, published).catch(() => undefined);
 		}
 	}
 
@@ -376,7 +610,7 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		try {
 			await ensureProjectStateDirectory(repositoryRoot, configDirName);
 			const current = await readJournalFile(paths.activePath);
-			if (current.kind === "loaded" || current.kind === "invalid") return { kind: "active-exists", paths };
+			if (current.kind !== "missing") return { kind: "active-exists", paths };
 			const previous = await readJournalFile(paths.previousPath);
 			if (previous.kind !== "missing") return { kind: "storage-error", paths, diagnostics: [diag("invalid-run", "Initial Run Journal creation requires an absent previous snapshot.", paths.previousPath)] };
 			const temporaryPath = await writePreparedTemporary(paths.stewardDirectory, ACTIVE_NAME, validation.bytes, (bytes) => Boolean(deserializeRunJournal(bytes, paths.activePath).value));
@@ -412,7 +646,7 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 			const created = await createActive(repositoryRoot, journal);
 			return created.kind === "created" ? { kind: "replaced", journal, paths } : created.kind === "active-exists" ? { kind: "storage-error", paths, diagnostics: [diag("invalid-run", "Active Run appeared during creation.", paths.activePath)] } : { kind: "storage-error", paths, diagnostics: created.diagnostics };
 		}
-		if (current.kind === "invalid") return { kind: "invalid-current", paths, diagnostics: current.diagnostics };
+		if (current.kind !== "loaded") return { kind: "invalid-current", paths, diagnostics: current.diagnostics };
 		if (journal.run.id !== current.journal.run.id || journal.journalRevision !== current.journal.journalRevision + 1) return { kind: "invalid-candidate", paths, diagnostics: [diag("invalid-run", "Replacement must keep the Run id and increment journalRevision exactly once.", paths.activePath)] };
 		if (journal.run.createdAt !== current.journal.run.createdAt || journal.run.updatedAt <= current.journal.run.updatedAt) return { kind: "invalid-candidate", paths, diagnostics: [diag("invalid-run", "Replacement must preserve createdAt and advance updatedAt.", paths.activePath)] };
 		try {
@@ -521,6 +755,7 @@ export function createRunJournalStore(options: { configDirName?: string } = {}):
 		resolvePaths,
 		probeActive,
 		loadActive,
+		applyMigration,
 		createActive,
 		replaceActive,
 		appendActivity,

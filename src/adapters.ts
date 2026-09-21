@@ -20,7 +20,7 @@ import {
 	type ThinkingLevel,
 } from "./config.ts";
 import { createConfigStore, type ConfigStoreOptions } from "./config-store.ts";
-import { createRunJournalStore } from "./run-journal-store.ts";
+import { createRunJournalStore, type RunJournalMigrationRegistry } from "./run-journal-store.ts";
 import type { ExpectedArtifact, RunDraft, RunDraftInput, RunDraftResult, RunRevisionDraft, RunRevisionDraftInput, RunRevisionDraftResult, Verification } from "./run.ts";
 import type {
 	ConfigurationEditResult,
@@ -93,13 +93,18 @@ export async function compactWithStewardContinuity(event: SessionBeforeCompactEv
 }
 
 /** Probe only the Steward-owned active journal path, without creating its parents. */
-export function createRunJournalAdapter(options?: ConfigStoreOptions): RunJournalAdapter {
+export interface RunJournalAdapterOptions extends ConfigStoreOptions {
+	migrations?: RunJournalMigrationRegistry;
+}
+
+export function createRunJournalAdapter(options?: RunJournalAdapterOptions): RunJournalAdapter {
 	const configStore = createConfigStore(options);
-	const runStore = createRunJournalStore({ configDirName: options?.configDirName });
+	const runStore = createRunJournalStore({ configDirName: options?.configDirName, migrations: options?.migrations });
 
 	return {
 		probeActive: (repositoryRoot) => runStore.probeActive(repositoryRoot),
 		loadActive: runStore.loadActive,
+		applyMigration: runStore.applyMigration,
 		createActive: runStore.createActive,
 		replaceActive: runStore.replaceActive,
 		appendActivity: runStore.appendActivity,
@@ -1597,7 +1602,7 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 
 	function presentResumeResult(result: import("./steward.ts").ResumeResult): void {
 		const message = result.kind === "reconciled" ? result.result.note : result.message;
-		ui.notify(message, result.kind === "reconciled" && result.result.condition === "ordinary" ? "info" : "warning");
+		ui.notify(message, result.kind === "migration-applied" || result.kind === "reconciled" && result.result.condition === "ordinary" ? "info" : "warning");
 	}
 
 	function presentRevisionResult(result: import("./steward.ts").RevisionResult): void {
@@ -1641,7 +1646,7 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 }
 
 /** Assemble production adapters for one request without growing the seven-slot seam. */
-export function createProductionAdapters(request: StewardHostRequest, options?: ConfigStoreOptions): StewardDependencies {
+export function createProductionAdapters(request: StewardHostRequest, options?: RunJournalAdapterOptions): StewardDependencies {
 	return {
 		runJournal: createRunJournalAdapter(options),
 		herdr: createHerdrAdapter(request.exec),
