@@ -36,9 +36,10 @@ describe("ticket-20 install and documentation contract", () => {
 		expect(scripts["smoke:herdr-real"]).toBe("node --experimental-strip-types scripts/smoke-real-herdr.mjs");
 
 		expect(extension.match(/registerCommand\("steward"/g) ?? []).toHaveLength(1);
-		for (const command of ["status", "config", "start", "revise", "resume", "resume --takeover", "cancel", "cleanup"]) {
-			expect(extension).toContain(`"${command}"`);
+		for (const command of ["status", "config", "start", "revise", "resume", "doctor", "cancel", "cleanup"]) {
+			expect(extension).toContain(`name: "${command}"`);
 		}
+		for (const flag of ["--takeover", "--probe"]) expect(extension).toContain(`value: "${flag}"`);
 
 		for (const heading of ["## Prerequisites", "## Installation", "## Command surface", "## Authority and Model Plan", "## Evidence and recovery", "## Safety limits"]) {
 			expect(readme).toContain(heading);
@@ -53,6 +54,8 @@ describe("ticket-20 install and documentation contract", () => {
 			"/steward revise",
 			"/steward resume",
 			"/steward resume --takeover",
+			"/steward doctor",
+			"/steward doctor --probe",
 			"/steward cancel",
 			"/steward cleanup",
 		]) {

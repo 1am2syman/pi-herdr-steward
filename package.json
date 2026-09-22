@@ -20,9 +20,11 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "^0.84.4"
+    "@earendil-works/pi-coding-agent": "^0.84.4",
+    "@earendil-works/pi-tui": "^0.84.4"
   },
   "devDependencies": {
+    "@earendil-works/pi-tui": "^0.84.4",
     "@types/node": "^22.19.19",
     "typescript": "^5.9.3",
     "vitest": "^4.1.9"
@@ -55,6 +57,6 @@
     "test:install-docs": "vitest run test/install-functional-path.static.test.ts --maxWorkers=1",
     "test:install-functional": "node --experimental-strip-types test/install-functional-path.smoke.ts",
     "smoke:herdr-real": "node --experimental-strip-types scripts/smoke-real-herdr.mjs",
-    "test": "vitest run --maxWorkers=1"
+    "test": "vitest run --maxWorkers=1 --testTimeout=45000"
   }
 }

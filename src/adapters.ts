@@ -5,6 +5,9 @@ import { spawn } from "node:child_process";
 import { isAbsolute, join, resolve } from "node:path";
 import { compact, type CompactionResult, type ExecResult, type ExtensionContext, type ExtensionUIContext, type SessionBeforeCompactEvent } from "@earendil-works/pi-coding-agent";
 
+import { classifyModelProbe, formatDoctorReport, type DoctorReport } from "./doctor.ts";
+import { openSearchableModelPicker, type SearchableModelPickerItem } from "./model-picker.ts";
+
 import {
 	formatModelChoice,
 	formatModelPlans,
@@ -61,10 +64,10 @@ import { parseTaskFactRequest, type TaskFactRequestResult } from "./reconciliati
 const STATUS_KEY = "pi-herdr-steward";
 
 type HostModel = NonNullable<ExtensionContext["model"]>;
-type HostModelRegistry = Pick<ExtensionContext["modelRegistry"], "find" | "getAvailable" | "getApiKeyAndHeaders">;
+type HostModelRegistry = Pick<ExtensionContext["modelRegistry"], "find" | "getAvailable" | "getApiKeyAndHeaders" | "complete">;
 type HostScopedModel = ExtensionContext["scopedModels"][number];
 type PiStatusUi = Pick<ExtensionUIContext, "notify" | "setStatus">;
-type PiConfigUi = Pick<ExtensionUIContext, "select" | "confirm" | "input">;
+type PiConfigUi = Pick<ExtensionUIContext, "select" | "confirm" | "input"> & Partial<Pick<ExtensionUIContext, "custom">>;
 
 export type StewardCompactionContext = Pick<ExtensionContext, "model" | "modelRegistry" | "thinkingLevel" | "sessionManager">;
 
@@ -77,6 +80,10 @@ export interface StewardHostRequest {
 
 function safeErrorText(error: unknown): string {
 	return error instanceof Error && error.message.length > 0 ? error.message : "Authentication resolution failed.";
+}
+
+function safeProbeErrorText(error: unknown): string {
+	return error instanceof Error && error.message.length > 0 ? error.message : "Model probe failed.";
 }
 
 /** Call Pi's native compactor at the host edge while preserving the exact durable continuity pointer. */
@@ -187,6 +194,32 @@ export function createPiModelAdapter(
 		return { choice: { ...choice }, available: true, diagnostics: [] };
 	}
 
+	async function probeModelChoice(choice: ModelChoice): Promise<import("./doctor.ts").ModelProbeResult> {
+		const parsed = parseCanonicalModelReference(choice.model);
+		if (!parsed) return { status: "incompatible-request", diagnostic: "Model reference is not an exact provider/model-id value." };
+		const model = modelRegistry.find(parsed.provider, parsed.modelId);
+		if (!model) return { status: "incompatible-request", diagnostic: "Exact model reference was not found in the host registry." };
+		let httpStatus: number | undefined;
+		let retryAfter: string | undefined;
+		try {
+			const message = await modelRegistry.complete(model, {
+				systemPrompt: "You are a provider health probe. Reply with OK.",
+				messages: [{ role: "user", content: "OK", timestamp: Date.now() }],
+			}, {
+				maxTokens: 1,
+				maxRetries: 0,
+				timeoutMs: 10_000,
+				onResponse(response) {
+					httpStatus = response.status;
+					retryAfter = response.headers["retry-after"] ?? response.headers["Retry-After"];
+				},
+			});
+			return classifyModelProbe({ httpStatus, retryAfter, stopReason: message.stopReason, errorMessage: message.errorMessage });
+		} catch (error: unknown) {
+			return classifyModelProbe({ httpStatus, retryAfter, thrownMessage: safeProbeErrorText(error) });
+		}
+	}
+
 	async function validateModelPlans(modelPlans: ProjectModelPlans): Promise<ConfigDiagnostic[]> {
 		const diagnostics: ConfigDiagnostic[] = [];
 		for (const role of ["builder", "reviewer"] as const) {
@@ -199,7 +232,7 @@ export function createPiModelAdapter(
 		return diagnostics;
 	}
 
-	return { listModelChoices, validateModelPlans, inspectModelChoice };
+	return { listModelChoices, validateModelPlans, inspectModelChoice, probeModelChoice };
 }
 
 function getDialogSurface(ui: PiStatusUi & Partial<PiConfigUi>): PiConfigUi {
@@ -210,6 +243,7 @@ function getDialogSurface(ui: PiStatusUi & Partial<PiConfigUi>): PiConfigUi {
 		select: (title, options) => ui.select!(title, options),
 		confirm: (title, message) => ui.confirm!(title, message),
 		input: (title, placeholder) => ui.input!(title, placeholder),
+		...(ui.custom ? { custom: ui.custom.bind(ui) } : {}),
 	};
 }
 
@@ -229,16 +263,28 @@ function roleLabel(role: ModelRole): string {
 	return role[0].toUpperCase() + role.slice(1);
 }
 
-function exactOptions(input: ConfigurationEditorInput): string[] {
-	return input.modelChoices.map((option) => `${option.reference}${option.name ? ` (${option.name})` : ""}`);
-}
-
-function referenceFromOption(selected: string, input: ConfigurationEditorInput): string | undefined {
-	return input.modelChoices.find((option) => selected === `${option.reference}${option.name ? ` (${option.name})` : ""}`)?.reference;
+async function selectModelReference(
+	ui: PiConfigUi,
+	title: string,
+	input: ConfigurationEditorInput,
+	actions: SearchableModelPickerItem[],
+): Promise<string | undefined> {
+	const models: SearchableModelPickerItem[] = input.modelChoices.map((option) => ({
+		kind: "model",
+		value: `model:${option.reference}`,
+		label: option.reference,
+		...(option.name ? { description: option.name } : {}),
+		searchText: `${option.reference} ${option.name ?? ""}`,
+	}));
+	if (ui.custom) return openSearchableModelPicker(ui as Pick<ExtensionUIContext, "custom">, { title, items: [...actions, ...models], maxVisible: 12 });
+	const labels = [...actions, ...models].map((item) => `${item.label}${item.description ? ` (${item.description})` : ""}`);
+	const selected = await ui.select(title, labels);
+	return [...actions, ...models].find((item) => selected === `${item.label}${item.description ? ` (${item.description})` : ""}`)?.value;
 }
 
 async function selectThinking(ui: PiConfigUi, title: string, current?: ThinkingLevel): Promise<ThinkingLevel | undefined> {
-	const selected = await ui.select(title, [...THINKING_LEVELS]);
+	const levels = current ? [current, ...THINKING_LEVELS.filter((level) => level !== current)] : [...THINKING_LEVELS];
+	const selected = await ui.select(title, levels);
 	if (!selected || !(THINKING_LEVELS as readonly string[]).includes(selected)) return undefined;
 	return selected as ThinkingLevel;
 }
@@ -250,19 +296,16 @@ async function chooseModelChoice(
 	current: ModelChoice | undefined,
 	allowProposal: boolean,
 ): Promise<ModelChoice | undefined> {
-	const title = `${roleLabel(role)} primary model`;
-	const options: string[] = [];
-	if (allowProposal && input.proposal?.thinkingLevel) options.push("Use proposed Controller choice");
-	options.push("Enter exact model choice");
-	if (current) options.push(`Keep current: ${choiceLabel(current)}`);
-	for (const option of exactOptions(input)) {
-		if (!options.includes(option)) options.push(option);
-	}
-	options.push("Cancel");
+	const title = `${roleLabel(role)} model`;
+	const actions: SearchableModelPickerItem[] = [];
+	if (allowProposal && input.proposal?.thinkingLevel) actions.push({ kind: "action", value: "action:proposal", label: "Use proposed Controller choice", description: `${input.proposal.reference} [thinking=${input.proposal.thinkingLevel}]` });
+	actions.push({ kind: "action", value: "action:exact", label: "Enter exact model choice" });
+	if (current) actions.push({ kind: "action", value: "action:current", label: "Keep current", description: choiceLabel(current) });
+	actions.push({ kind: "action", value: "action:cancel", label: "Cancel" });
 
-	const selected = await ui.select(title, options);
-	if (!selected || selected === "Cancel") return undefined;
-	if (selected === "Use proposed Controller choice" && input.proposal?.thinkingLevel) {
+	const selected = await selectModelReference(ui, title, input, actions);
+	if (!selected || selected === "action:cancel") return undefined;
+	if (selected === "action:proposal" && input.proposal?.thinkingLevel) {
 		const confirmed = await ui.confirm(
 			"Confirm proposed Builder choice",
 			`Use ${input.proposal.reference} with thinking level ${input.proposal.thinkingLevel} as the Builder primary?`,
@@ -271,9 +314,9 @@ async function chooseModelChoice(
 			? { model: input.proposal.reference, thinkingLevel: input.proposal.thinkingLevel }
 			: chooseModelChoice(ui, input, role, current, false);
 	}
-	if (selected.startsWith("Keep current:") && current) return { ...current };
+	if (selected === "action:current" && current) return { ...current };
 
-	const reference = selected === "Enter exact model choice" ? await ui.input(`Exact ${roleLabel(role)} model reference`, "provider/exact-model-id") : referenceFromOption(selected, input);
+	const reference = selected === "action:exact" ? await ui.input(`Exact ${roleLabel(role)} model reference`, "provider/exact-model-id") : selected.startsWith("model:") ? selected.slice("model:".length) : undefined;
 	if (reference === undefined) return undefined;
 	const thinkingLevel = await selectThinking(ui, `${roleLabel(role)} thinking level`, current?.thinkingLevel);
 	if (!thinkingLevel) return undefined;
@@ -1618,6 +1661,10 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		if (input.notification) ui.notify(input.notification.message, input.notification.type);
 	}
 
+	function presentDoctorResult(report: DoctorReport): void {
+		ui.notify(formatDoctorReport(report), report.summary === "healthy" ? "info" : "warning");
+	}
+
 	async function confirmSameFamilyReview(input: { builderModel: ModelChoice; reviewerModel: ModelChoice; subject: import("./review.ts").ReviewSubject; provider: string }): Promise<boolean> {
 		const dialogs = getDialogSurface(ui);
 		const subject = input.subject.kind === "git" ? `Git ${input.subject.baseRevision}..${input.subject.headRevision} (${input.subject.commits.length} commit(s))` : `non-Git artifacts: ${input.subject.artifacts.map((artifact) => artifact.identity).join(", ")}`;
@@ -1642,6 +1689,7 @@ export function createPiUiAdapter(ui: PiStatusUi & Partial<PiConfigUi>): Steward
 		presentResumeResult,
 		notifyCompletion,
 		presentMonitorCondition,
+		presentDoctorResult,
 	};
 }
 

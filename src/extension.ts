@@ -27,7 +27,7 @@ import {
 	type StewardDependencies,
 } from "./steward.ts";
 
-export type StewardUiSurface = Pick<ExtensionUIContext, "select" | "confirm" | "input" | "notify" | "setStatus">;
+export type StewardUiSurface = Pick<ExtensionUIContext, "select" | "confirm" | "input" | "notify" | "setStatus"> & Partial<Pick<ExtensionUIContext, "custom">>;
 export type StewardCommandContext = Pick<
 	ExtensionCommandContext,
 	"mode" | "hasUI" | "cwd" | "modelRegistry" | "model" | "thinkingLevel" | "scopedModels" | "sessionManager"
@@ -51,10 +51,86 @@ type SessionCompactFailedEvent = Extract<ExtensionEvent, { type: "session_compac
 
 export type StewardCompactionHost = (event: SessionBeforeCompactEvent, ctx: StewardSessionContext, continuity: string) => Promise<CompactionResult>;
 
+export interface StewardAutocompleteItem {
+	value: string;
+	label: string;
+	description?: string;
+}
+
 export interface StewardCommandOptions {
 	description?: string;
+	getArgumentCompletions?: (argumentPrefix: string) => StewardAutocompleteItem[] | null | Promise<StewardAutocompleteItem[] | null>;
 	handler: StewardCommandHandler;
 }
+
+export const STEWARD_SUBCOMMANDS = [
+	{ name: "status", description: "Show Steward Run status." },
+	{ name: "config", description: "Configure recovery defaults and controller models." },
+	{ name: "start", description: "Draft and start a Steward Run." },
+	{ name: "revise", description: "Revise the active Run contract or Model Plan." },
+	{ name: "resume", description: "Resume or take over an interrupted Run.", flags: [{ value: "--takeover", description: "Reconcile and claim a Run owned by another Controller Session." }] },
+	{ name: "doctor", description: "Diagnose configuration, journal, Herdr, and selected models.", flags: [{ value: "--probe", description: "Make one small sequential live request to each unique selected model." }] },
+	{ name: "cancel", description: "Cancel the active Run while preserving evidence." },
+	{ name: "cleanup", description: "Clean up Steward-owned resources after a terminal Run." },
+] as const;
+
+type StewardSubcommandName = typeof STEWARD_SUBCOMMANDS[number]["name"];
+type ParsedStewardCommand =
+	| { name: Exclude<StewardSubcommandName, "resume" | "doctor"> }
+	| { name: "resume"; takeover: boolean }
+	| { name: "doctor"; probe: boolean };
+
+export function getStewardArgumentCompletions(argumentPrefix: string): StewardAutocompleteItem[] | null {
+	const normalized = argumentPrefix.trimStart();
+	const [name, ...rest] = normalized.split(/\s+/);
+	if (normalized.includes(" ") && (name === "resume" || name === "doctor")) {
+		const command = STEWARD_SUBCOMMANDS.find((item) => item.name === name);
+		if (!command || !("flags" in command)) return null;
+		const flagPrefix = rest.join(" ");
+		const completions: StewardAutocompleteItem[] = [];
+		for (const flag of command.flags) {
+			if (flag.value.startsWith(flagPrefix)) {
+				completions.push({ value: `${name} ${flag.value}`, label: flag.value, description: flag.description });
+			}
+		}
+		return completions;
+	}
+	const prefix = normalized.toLowerCase();
+	return STEWARD_SUBCOMMANDS
+		.filter((item) => item.name.startsWith(prefix))
+		.map((item) => ({ value: item.name, label: item.name, description: item.description }));
+}
+
+function parseStewardCommand(value: string): ParsedStewardCommand | undefined {
+	const tokens = value.trim().split(/\s+/).filter(Boolean);
+	if (tokens.length === 0) return undefined;
+	const name = tokens[0] as StewardSubcommandName;
+	if (!STEWARD_SUBCOMMANDS.some((item) => item.name === name)) return undefined;
+	if (name === "resume") {
+		if (tokens.length === 1) return { name, takeover: false };
+		if (tokens.length === 2 && tokens[1] === "--takeover") return { name, takeover: true };
+		return undefined;
+	}
+	if (name === "doctor") {
+		if (tokens.length === 1) return { name, probe: false };
+		if (tokens.length === 2 && tokens[1] === "--probe") return { name, probe: true };
+		return undefined;
+	}
+	return tokens.length === 1 ? { name: name as Exclude<StewardSubcommandName, "resume" | "doctor"> } : undefined;
+}
+
+function interactiveTuiError(command: StewardSubcommandName): string {
+	if (command === "config") return "Steward configuration requires interactive TUI mode.";
+	return `Steward ${command} requires interactive TUI mode.`;
+}
+
+async function selectStewardCommand(ctx: StewardCommandContext): Promise<string | undefined> {
+	const choices = STEWARD_SUBCOMMANDS.map((item) => `${item.name} — ${item.description}`);
+	const selected = await ctx.ui.select("Steward command", choices);
+	return STEWARD_SUBCOMMANDS.find((item) => selected === `${item.name} — ${item.description}`)?.name;
+}
+
+const STEWARD_USAGE = "Usage: /steward status | config | start | revise | resume [--takeover] | doctor [--probe] | cancel | cleanup";
 
 /** The small Pi registration surface used by this extension and its functional test. */
 export interface StewardRegistrationSurface {
@@ -228,18 +304,19 @@ export function registerStewardExtension(
 	});
 
 	pi.registerCommand("steward", {
-		description: "Inspect, configure, start, revise, resume, cancel, or clean up Steward Runs.",
+		description: "Inspect, configure, diagnose, start, revise, resume, cancel, or clean up Steward Runs.",
+		getArgumentCompletions: getStewardArgumentCompletions,
 		handler: async (args, ctx) => {
-			const command = args.trim();
-			if (command === "start" && ctx.mode !== "tui") throw new Error("Steward start requires interactive TUI mode.");
-			if (command === "config" && ctx.mode !== "tui") throw new Error("Steward configuration requires interactive TUI mode.");
-			if (command === "revise" && ctx.mode !== "tui") throw new Error("Steward revise requires interactive TUI mode.");
-			if ((command === "resume" || command === "resume --takeover") && ctx.mode !== "tui") throw new Error("Steward resume requires interactive TUI mode.");
-			if ((command === "cancel" || command === "cleanup") && ctx.mode !== "tui") throw new Error(`Steward ${command} requires interactive TUI mode.`);
-			if (ctx.mode !== "tui") return;
-			if (!new Set(["status", "config", "start", "revise", "resume", "resume --takeover", "cancel", "cleanup"]).has(command)) {
-				ctx.ui.notify("Usage: /steward status | /steward config | /steward start | /steward revise | /steward resume [--takeover] | /steward cancel | /steward cleanup", "info");
+			let commandText = args.trim();
+			if (commandText.length === 0 && ctx.mode === "tui") commandText = await selectStewardCommand(ctx) ?? "";
+			const command = parseStewardCommand(commandText);
+			if (!command) {
+				if (ctx.mode === "tui") ctx.ui.notify(STEWARD_USAGE, "info");
 				return;
+			}
+			if (ctx.mode !== "tui") {
+				if (command.name === "status") return;
+				throw new Error(interactiveTuiError(command.name));
 			}
 			if (!runtimeBoundToSessionLifecycle || !sameRuntime(runtime, ctx)) {
 				if (runtime) await runtime.monitor.stop();
@@ -252,42 +329,46 @@ export function registerStewardExtension(
 			let keepMonitorDormant = false;
 			await current.monitor.runExclusive(async () => {
 				const controllerSessionId = ctx.sessionManager.getSessionId();
-				if (command === "status") {
+				if (command.name === "status") {
 					await commandSteward.status(ctx.cwd, "command", controllerSessionId);
 					return;
 				}
-				if (command === "config") {
+				if (command.name === "config") {
 					await commandSteward.configure(ctx.cwd, proposalFromContext(ctx));
 					return;
 				}
-				if (command === "start") {
+				if (command.name === "start") {
 					await commandSteward.start(ctx.cwd, controllerSessionId);
 					return;
 				}
-				if (command === "revise") {
+				if (command.name === "revise") {
 					await commandSteward.revise(ctx.cwd, controllerSessionId);
 					return;
 				}
-				if (command === "resume" || command === "resume --takeover") {
-					const result = await commandSteward.resume(ctx.cwd, controllerSessionId, command === "resume --takeover");
+				if (command.name === "resume") {
+					const result = await commandSteward.resume(ctx.cwd, controllerSessionId, command.takeover);
 					keepMonitorDormant = result.kind === "migration-applied";
 					return;
 				}
-				if (command === "cancel") {
+				if (command.name === "doctor") {
+					await commandSteward.doctor(ctx.cwd, command.probe);
+					return;
+				}
+				if (command.name === "cancel") {
 					await commandSteward.cancel(ctx.cwd, controllerSessionId);
 					return;
 				}
-				if (command === "cleanup") {
+				if (command.name === "cleanup") {
 					await commandSteward.cleanup(ctx.cwd, controllerSessionId);
 					return;
 				}
 			});
-			if (command === "cleanup" || command === "cancel") {
+			if (command.name === "cleanup" || command.name === "cancel") {
 				await current.monitor.stop();
 				current.monitorStarted = false;
 				runtimeBoundToSessionLifecycle = false;
 			}
-			if (command !== "cleanup" && command !== "cancel" && !keepMonitorDormant && !current.monitorStarted && runtimeBoundToSessionLifecycle) {
+			if (command.name !== "cleanup" && command.name !== "cancel" && !keepMonitorDormant && !current.monitorStarted && runtimeBoundToSessionLifecycle) {
 				const restored = await current.steward.restoreControllerSession(ctx.cwd, ctx.sessionManager.getSessionId());
 				if (restored.kind === "restored") {
 					current.monitor.start();
