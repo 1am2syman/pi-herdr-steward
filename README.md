@@ -88,17 +88,25 @@ npm run smoke:herdr-real
 
 Version one is fully supported in interactive TUI mode. It does not provide a
 separate CLI, daemon, dashboard, or automatic interception of ordinary agents.
+Type `/steward ` to see argument completions, or invoke bare `/steward` to open
+the subcommand menu instead of memorizing the command surface.
 
 - `/steward status` — read current or archived facts and advance deterministic
   Controller-owned work when the caller is authorized.
 - `/steward config` — edit the small operational defaults and project Model Plan
-  defaults.
+  defaults. Model choices use a fuzzy-searchable picker with keyboard scrolling;
+  the stored value remains the exact `provider/model-id` reference.
 - `/steward start` — draft, display, and explicitly confirm one Run before
   persistence and dispatch.
 - `/steward revise` — draft and confirm an explicit delta while retaining
   unaffected work.
 - `/steward resume` and `/steward resume --takeover` — reconcile before
   continuing, with explicit ownership transfer for another Controller Session.
+- `/steward doctor` — inspect configuration, the active Journal, Herdr, and each
+  selected model without contacting providers. `/steward doctor --probe` adds
+  one small sequential point-in-time request per unique selected model and
+  classifies authentication, rate-limit, quota, availability, and request
+  compatibility failures. A healthy probe does not guarantee future capacity.
 - `/steward cancel` — persist cancellation before gracefully stopping
   Steward-owned agents and archive the cancelled Run.
 - `/steward cleanup` — show exact retained Steward-owned panes and worktrees,

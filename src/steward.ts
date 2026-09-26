@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { runStewardDoctor, type DoctorReport } from "./doctor.ts";
 import type { ConfigLoadResult, ConfigSaveResult } from "./config-store.ts";
 import {
 	formatModelPlans,
@@ -307,12 +308,14 @@ export interface StewardUiAdapter {
 	presentResumeResult?(result: ResumeResult): void;
 	notifyCompletion?(input: { runId: string; targetBranch: string; integratedHead: string; verificationResultPath: string; verificationLogPath: string; archivePath: string }): void;
 	presentMonitorCondition?(input: MonitorConditionInput): void;
+	presentDoctorResult?(report: DoctorReport): void;
 }
 
 export interface StewardModelAdapter {
 	listModelChoices(): readonly ModelChoiceOption[];
 	validateModelPlans(modelPlans: ProjectModelPlans): Promise<ConfigDiagnostic[]>;
 	inspectModelChoice?(choice: import("./config.ts").ModelChoice, role: "builder" | "reviewer", index: number): Promise<ReviewerChoiceInspection>;
+	probeModelChoice?(choice: import("./config.ts").ModelChoice): Promise<import("./doctor.ts").ModelProbeResult>;
 }
 
 /** The complete, deliberately fixed orchestration seam for this ticket. */
@@ -709,6 +712,7 @@ export interface Steward {
 	revise(repositoryRoot: string, controllerSessionId: string): Promise<RevisionResult>;
 	cancel(repositoryRoot: string, controllerSessionId: string): Promise<CancellationResult>;
 	cleanup(repositoryRoot: string, controllerSessionId: string): Promise<CleanupResult>;
+	doctor(repositoryRoot: string, probe?: boolean): Promise<DoctorReport>;
 	waitForMonitorSignal(repositoryRoot: string, controllerSessionId: string, signal: AbortSignal): Promise<MonitorWaitResult>;
 	observeMonitorProgress(repositoryRoot: string, controllerSessionId: string, trigger: MonitorTrigger): Promise<MonitorPassResult>;
 	advanceNext(repositoryRoot: string, controllerSessionId: string, options: MonitorAdvanceOptions): Promise<MonitorPassResult>;
@@ -5057,6 +5061,19 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return result;
 	}
 
+	async function doctor(repositoryRoot: string, probe = false): Promise<DoctorReport> {
+		const report = await runStewardDoctor({
+			repositoryRoot,
+			probe,
+			runJournal,
+			model,
+			herdr,
+			now: () => clock.now(),
+		});
+		ui.presentDoctorResult?.(report);
+		return report;
+	}
+
 	async function configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult> {
 		const [recoveryLoad, modelPlansLoad] = await Promise.all([
 			runJournal.loadRecoveryDefaults(),
@@ -6018,5 +6035,5 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		if (target === "command" && journal) ui.presentStatus(presentStatusForJournal(journal, result.note), "command");
 	}
 
-	return { status, resume, takeover, restoreControllerSession, prepareCompactionContinuity, recordCompactionFailure, configure, start, revise, cancel, cleanup, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
+	return { status, resume, takeover, restoreControllerSession, prepareCompactionContinuity, recordCompactionFailure, configure, start, revise, cancel, cleanup, doctor, waitForMonitorSignal, observeMonitorProgress, advanceNext, presentMonitor };
 }
