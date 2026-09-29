@@ -8,7 +8,7 @@ This document records the shared understanding reached during the design intervi
 
 - Keep the Steward small, direct, and functional.
 - Prefer Herdr's existing lifecycle features, ordinary files, and Git evidence.
-- Do not introduce a daemon, database, event-sourcing system, distributed lock, or generic workflow engine without a demonstrated need.
+- Do not introduce a daemon, database, event-sourcing system, distributed lock, generic workflow engine, or ticket-quality framework without a demonstrated need.
 
 ## Authority
 
@@ -27,7 +27,7 @@ This document records the shared understanding reached during the design intervi
 - Existing agents may continue while the controller is unavailable, but new orchestration decisions pause until the controller returns and reconciles.
 - Each code-changing Builder receives an isolated worktree.
 - Its Reviewer evaluates the same frozen revision without modifying it.
-- Every agent outcome is written to a durable Attempt Report.
+- Every agent outcome is written to a durable Attempt Report. Each Attempt has a separate evidence directory; after finalization its report, logs, and evidence are preserved unchanged, and further work uses a linked Attempt.
 - Review is configurable per Task and required by default for code-changing Tasks.
 
 ## Execution Policy
@@ -81,7 +81,7 @@ The initial command surface is `/steward start`, `/steward status`, `/steward re
 
 Observable progress includes a Herdr lifecycle change, new terminal output, a worktree file change, a Git diff or commit change, or an Attempt Report update.
 
-Attempt Reports use plain Markdown with small machine-readable frontmatter. All reports contain Run, Task, and Attempt IDs; status; a concise summary; and blockers. Builder reports additionally contain produced Artifacts, the produced commit SHA, and checks. Reviewer reports contain the reviewed SHA, verdict, actionable findings, and checks.
+Attempt Reports use plain Markdown with small machine-readable frontmatter. All reports contain Run, Task, and Attempt IDs; status; a concise summary; and blockers. Builder reports additionally contain produced Artifacts, the produced commit SHA, and checks. Reviewer reports contain the reviewed SHA, an explicit `approved` or `changes-required` verdict, actionable findings, and checks. Provider failure, process exit, silence, or Herdr lifecycle state is never a Review verdict.
 
 If an approved revision conflicts during integration, the Task returns to its Builder against the updated target and requires a fresh Review of the new SHA. This consumes one of the five rework cycles.
 
@@ -93,7 +93,7 @@ While the Controller Session is open, a session-scoped monitor waits for Herdr l
 
 ## Journal and Repository Safety
 
-The Journal is one atomically replaced `.pi/steward/active-run.json`, archived as a final snapshot after completion or cancellation. Assignments and Attempt Reports are separate durable files. The design does not use an append-only event store.
+The Journal is one atomically replaced `.pi/steward/active-run.json`, archived as a final snapshot after completion or cancellation. Assignments and Attempt Reports are separate durable files. A concise append-only activity log records significant observations and decisions for human inspection, but it is not replayed and cannot advance the Run. The design does not use an append-only event store.
 
 A code-changing Run requires a selected base commit and clean integration checkout. The Steward never stashes or incorporates existing uncommitted work automatically.
 
@@ -131,7 +131,7 @@ The confirmed Model Plan is frozen into the Run Journal. The user may also save 
 
 ## Parallelism and Integration
 
-Only Tasks with clearly disjoint allowed scopes run concurrently. Tasks with overlapping scopes are serialized in the user-approved order rather than being represented through a general dependency graph. Approved Tasks integrate in that same order, never in completion order.
+Only Tasks with clearly disjoint allowed scopes run concurrently, and the Run's confirmed maximum active Task count is never exceeded. Tasks with overlapping scopes are serialized in the user-approved order rather than being represented through a general dependency graph. Approved Tasks integrate in that same order, never in completion order.
 
 If the integration target advances, the Steward compares it with each Task's base revision. A revision that requires modification returns to its Builder against the new target and requires a new SHA and fresh Review. Non-Git Artifacts are identified by path, size, and SHA-256 hash.
 
@@ -139,7 +139,7 @@ Full test and verification output is written to durable log files under the Run 
 
 ## Verification and Cleanup
 
-The Steward directly executes approved deterministic final-verification commands and records logs and exit codes. A code-changing Task without deterministic verification requires an explicit, durable user waiver.
+The Steward directly executes approved deterministic final-verification commands and records logs and exit codes. A code-changing Task without deterministic verification requires an explicit, durable user waiver. Verification exists only to support safe orchestration; version one does not require or recreate Unlazy, a `GATES.md` workflow, or another ticket-quality manager.
 
 Before Review, the Steward compares changed paths with the Task's allowed scope. Out-of-scope changes are preserved and shown to the user, and the Task returns to its Builder for correction rather than proceeding to Review.
 
@@ -165,7 +165,7 @@ Planned Herdr names that collide with existing resources are replaced with uniqu
 
 ## Configuration and Stored Data
 
-User-global defaults contain the five-minute passive inspection interval, five-minute second inspection and nudge interval, two-minute nudge grace period, external-command warning threshold, two-attempt transient retry limit, and five-cycle review/rework limit. Project-local defaults contain Builder and Reviewer Model Plans and optional project verification defaults. Every Run freezes its effective configuration into the Run Journal, so later configuration changes do not alter active work.
+User-global defaults contain the five-minute passive inspection interval, five-minute second inspection and nudge interval, two-minute nudge grace period, external-command warning threshold, maximum active Task count, two-attempt transient retry limit, and five-cycle review/rework limit. Project-local defaults contain Builder and Reviewer Model Plans and optional project verification defaults. Every Run freezes its effective configuration into the Run Journal, so later configuration changes do not alter active work.
 
 Version one provides full behavior only in interactive Pi TUI mode. `/steward status` may provide plain output in other modes when possible, but Run approval, takeover, revision, cancellation, configuration, and cleanup require interactive confirmation.
 

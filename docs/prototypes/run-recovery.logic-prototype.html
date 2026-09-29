@@ -1,0 +1,696 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <title>Pi Herdr Steward — Complete Flow Atlas</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --paper: #eef2f3;
+      --sheet: #ffffff;
+      --ink: #13242d;
+      --muted: #5e7078;
+      --line: #b9c5ca;
+      --task: #164f6b;
+      --task-soft: #dceaf0;
+      --attempt: #177565;
+      --attempt-soft: #dceee9;
+      --attention: #a66213;
+      --attention-soft: #f4e6c9;
+      --danger: #a43e45;
+      --danger-soft: #f4dfe1;
+      --violet: #65509b;
+      --violet-soft: #e9e4f4;
+      --font: Inter, "Segoe UI", system-ui, sans-serif;
+      --mono: "IBM Plex Mono", "Cascadia Mono", Consolas, monospace;
+    }
+
+    * { box-sizing: border-box; }
+    html { background: var(--paper); }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(rgba(19, 36, 45, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(19, 36, 45, 0.03) 1px, transparent 1px),
+        var(--paper);
+      background-size: 24px 24px;
+      font-family: var(--font);
+      line-height: 1.35;
+    }
+
+    .atlas {
+      width: min(1500px, calc(100% - 28px));
+      margin: 20px auto 52px;
+      padding: 30px;
+      border: 1px solid #aebbc0;
+      background: rgba(255, 255, 255, 0.97);
+      box-shadow: 0 18px 60px rgba(19, 36, 45, 0.12);
+    }
+
+    header {
+      display: grid;
+      grid-template-columns: 1fr 390px;
+      gap: 28px;
+      align-items: end;
+      padding-bottom: 22px;
+      border-bottom: 3px solid var(--ink);
+    }
+
+    .kicker {
+      margin: 0 0 8px;
+      color: var(--task);
+      font: 800 12px/1 var(--mono);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(2.2rem, 4.8vw, 4.8rem);
+      line-height: 0.95;
+      letter-spacing: -0.055em;
+    }
+
+    .lede {
+      max-width: 900px;
+      margin: 15px 0 0;
+      color: var(--muted);
+      font-size: 1rem;
+    }
+
+    .invariant {
+      padding: 17px 19px;
+      border: 2px solid var(--ink);
+      background: var(--ink);
+      color: white;
+      font: 750 14px/1.5 var(--mono);
+    }
+
+    .invariant strong { color: #efb15f; }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px 26px;
+      padding: 16px 0;
+      border-bottom: 1px solid var(--line);
+      font-size: 0.8rem;
+    }
+
+    .legend span { display: inline-flex; align-items: center; gap: 8px; }
+    .dot { width: 24px; height: 8px; border-radius: 99px; }
+    .task { background: var(--task); }
+    .attempt { background: var(--attempt); }
+    .attention { background: var(--attention); }
+    .danger { background: var(--danger); }
+    .violet { background: var(--violet); }
+
+    .master {
+      padding: 24px 0 8px;
+      overflow-x: auto;
+    }
+
+    .master-flow,
+    .flowline {
+      display: flex;
+      align-items: stretch;
+      min-width: 1000px;
+    }
+
+    .master-node {
+      flex: 1;
+      min-width: 125px;
+      padding: 14px 12px;
+      border: 2px solid var(--task);
+      background: var(--task-soft);
+      text-align: center;
+    }
+
+    .master-node strong { display: block; margin-bottom: 4px; }
+    .master-node small { color: var(--muted); }
+    .master-node.final { background: var(--task); color: white; }
+    .master-node.final small { color: white; }
+
+    .master-arrow,
+    .arrow {
+      display: grid;
+      min-width: 28px;
+      place-items: center;
+      color: var(--task);
+      font: 900 22px/1 var(--mono);
+    }
+
+    .state-strip {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 12px;
+      margin: 20px 0 8px;
+    }
+
+    .state-group {
+      padding: 14px;
+      border: 2px solid;
+      background: white;
+    }
+
+    .state-group.task-state { border-color: var(--task); background: var(--task-soft); }
+    .state-group.attempt-state { border-color: var(--attempt); background: var(--attempt-soft); }
+    .state-group.attention-state { border-color: var(--attention); background: var(--attention-soft); }
+    .state-group h2 { margin: 0 0 8px; font: 800 13px/1 var(--mono); letter-spacing: 0.06em; }
+    .state-group p { margin: 0; font: 650 12px/1.6 var(--mono); }
+
+    .plate {
+      margin-top: 26px;
+      padding: 22px;
+      border: 1px solid var(--line);
+      border-top: 7px solid var(--task);
+      background: var(--sheet);
+      break-inside: avoid;
+    }
+
+    .plate.green { border-top-color: var(--attempt); }
+    .plate.amber { border-top-color: var(--attention); }
+    .plate.red { border-top-color: var(--danger); }
+    .plate.violet { border-top-color: var(--violet); }
+
+    .plate-head {
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 14px;
+      align-items: baseline;
+      margin-bottom: 18px;
+    }
+
+    .plate-number {
+      color: var(--muted);
+      font: 800 12px var(--mono);
+    }
+
+    .plate h2 {
+      margin: 0;
+      font-size: 1.35rem;
+      letter-spacing: -0.02em;
+    }
+
+    .sources {
+      max-width: 430px;
+      color: var(--muted);
+      font: 650 10px/1.45 var(--mono);
+      text-align: right;
+    }
+
+    .node {
+      flex: 1;
+      min-width: 145px;
+      padding: 13px;
+      border: 2px solid var(--task);
+      background: var(--task-soft);
+    }
+
+    .node.green { border-color: var(--attempt); background: var(--attempt-soft); }
+    .node.amber { border-color: var(--attention); background: var(--attention-soft); }
+    .node.red { border-color: var(--danger); background: var(--danger-soft); }
+    .node.violet { border-color: var(--violet); background: var(--violet-soft); }
+    .node.dark { background: var(--ink); border-color: var(--ink); color: white; }
+    .node strong { display: block; margin-bottom: 5px; font-size: 0.88rem; }
+    .node small { display: block; color: var(--muted); font-size: 0.74rem; }
+    .node.dark small { color: #d7e0e4; }
+
+    .case-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 9px;
+      margin-top: 14px;
+    }
+
+    .case {
+      display: grid;
+      grid-template-columns: 46px minmax(0, 1fr);
+      gap: 10px;
+      align-items: start;
+      min-height: 58px;
+      padding: 10px;
+      border: 1px solid var(--line);
+      background: #f8fafb;
+    }
+
+    .case-id {
+      display: grid;
+      height: 26px;
+      place-items: center;
+      border-radius: 4px;
+      background: var(--ink);
+      color: white;
+      font: 800 10px/1 var(--mono);
+    }
+
+    .case strong { display: block; margin-bottom: 3px; font-size: 0.79rem; }
+    .case p { margin: 0; color: var(--muted); font-size: 0.72rem; }
+    .case.stop { border-left: 5px solid var(--danger); }
+    .case.observe { border-left: 5px solid var(--attention); }
+    .case.advance { border-left: 5px solid var(--attempt); }
+    .case.control { border-left: 5px solid var(--violet); }
+
+    .decision-grid {
+      display: grid;
+      grid-template-columns: 220px 42px 1fr;
+      gap: 0;
+      align-items: stretch;
+      margin-top: 12px;
+    }
+
+    .trigger,
+    .outcomes {
+      padding: 14px;
+      border: 2px solid var(--ink);
+      background: white;
+    }
+
+    .trigger strong,
+    .outcomes strong { display: block; margin-bottom: 7px; }
+    .trigger p,
+    .outcomes p { margin: 4px 0; color: var(--muted); font-size: 0.77rem; }
+    .decision-arrow { display: grid; place-items: center; color: var(--danger); font: 900 24px var(--mono); }
+
+    .priority-list {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 7px;
+      margin-top: 12px;
+      counter-reset: step;
+    }
+
+    .priority-list div {
+      counter-increment: step;
+      padding: 10px;
+      border: 1px solid var(--line);
+      background: #f8fafb;
+      font-size: 0.72rem;
+    }
+
+    .priority-list div::before {
+      content: counter(step);
+      display: grid;
+      width: 23px;
+      height: 23px;
+      margin-bottom: 7px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--ink);
+      color: white;
+      font: 800 10px var(--mono);
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    .branch {
+      padding: 14px;
+      border: 2px solid var(--line);
+      background: #f8fafb;
+    }
+
+    .branch h3 { margin: 0 0 8px; font-size: 0.9rem; }
+    .branch ul { margin: 0; padding-left: 18px; color: var(--muted); font-size: 0.76rem; }
+    .branch li + li { margin-top: 5px; }
+
+    .sequence {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 9px;
+      margin-top: 14px;
+    }
+
+    .sequence-step {
+      position: relative;
+      padding: 12px;
+      border: 2px solid var(--line);
+      background: #f8fafb;
+      font-size: 0.76rem;
+    }
+
+    .sequence-step::after {
+      content: "→";
+      position: absolute;
+      top: 50%;
+      right: -17px;
+      z-index: 2;
+      transform: translateY(-50%);
+      color: var(--danger);
+      font: 900 17px var(--mono);
+    }
+
+    .sequence-step:last-child::after { display: none; }
+    .sequence-step strong { display: block; margin-bottom: 4px; }
+    .sequence-step small { color: var(--muted); }
+
+    .guardrail-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .guardrail {
+      padding: 12px;
+      border-left: 5px solid var(--danger);
+      background: var(--danger-soft);
+    }
+
+    .guardrail strong { display: block; margin-bottom: 4px; font-size: 0.8rem; }
+    .guardrail p { margin: 0; color: var(--muted); font-size: 0.72rem; }
+
+    .section-map {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+      margin-top: 26px;
+      padding: 18px;
+      border: 2px solid var(--ink);
+      background: #edf2f4;
+    }
+
+    .section-map h2 { grid-column: 1 / -1; margin: 0 0 5px; font-size: 1rem; }
+    .section-map span { padding: 8px; background: white; font: 700 10px/1.3 var(--mono); }
+
+    footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 22px;
+      margin-top: 18px;
+      color: var(--muted);
+      font: 650 10px/1.5 var(--mono);
+    }
+
+    @media (max-width: 900px) {
+      .atlas { width: 100%; margin: 0; padding: 18px 14px 30px; border: 0; }
+      header { grid-template-columns: 1fr; }
+      .state-strip, .case-grid, .split, .guardrail-grid, .section-map { grid-template-columns: 1fr; }
+      .section-map h2 { grid-column: auto; }
+      .plate-head { grid-template-columns: auto 1fr; }
+      .sources { grid-column: 1 / -1; text-align: left; }
+      .decision-grid { grid-template-columns: 1fr; }
+      .decision-arrow { min-height: 38px; }
+      .priority-list, .sequence { grid-template-columns: 1fr; }
+      .sequence-step::after { top: auto; right: 50%; bottom: -19px; transform: translateX(50%) rotate(90deg); }
+      footer { flex-direction: column; }
+    }
+
+    @media print {
+      body { background: white; }
+      .atlas { width: 100%; margin: 0; border: 0; box-shadow: none; }
+      .plate { break-inside: avoid; }
+    }
+  </style>
+</head>
+<body>
+  <main class="atlas">
+    <header>
+      <div>
+        <p class="kicker">Pi Herdr Steward / complete version-one flow atlas</p>
+        <h1>The whole Run, including every stop and recovery path.</h1>
+        <p class="lede">This is not a product interface. It is a static process document mapped to the accepted design: start gates, durable dispatch, agent recovery, evidence, Review, integration, controller lifecycle, revision, cancellation, storage failure, and cleanup.</p>
+      </div>
+      <div class="invariant"><strong>Universal rule</strong><br />1. persist intended transition<br />2. perform external side effect<br />3. reconcile before the next action</div>
+    </header>
+
+    <div class="legend" aria-label="Flow legend">
+      <span><i class="dot task"></i><b>Task progress</b></span>
+      <span><i class="dot attempt"></i><b>Attempt / evidence</b></span>
+      <span><i class="dot attention"></i><b>Observe / recover</b></span>
+      <span><i class="dot danger"></i><b>Stop mutation / preserve</b></span>
+      <span><i class="dot violet"></i><b>User or controller authority</b></span>
+    </div>
+
+    <section class="master" aria-label="Master Run lifecycle">
+      <div class="master-flow">
+        <div class="master-node"><strong>Confirm Run</strong><small>Tasks · Model Plan · base · config</small></div><div class="master-arrow">→</div>
+        <div class="master-node"><strong>Dispatch Builder</strong><small>Assignment persisted first</small></div><div class="master-arrow">→</div>
+        <div class="master-node"><strong>Validate evidence</strong><small>scope · report · Artifact</small></div><div class="master-arrow">→</div>
+        <div class="master-node"><strong>Independent Review</strong><small>exact immutable revision</small></div><div class="master-arrow">→</div>
+        <div class="master-node"><strong>Integrate in order</strong><small>local, durable intention</small></div><div class="master-arrow">→</div>
+        <div class="master-node"><strong>Final verification</strong><small>durable logs and result</small></div><div class="master-arrow">→</div>
+        <div class="master-node final"><strong>Complete + archive</strong><small>retain evidence until cleanup</small></div>
+      </div>
+    </section>
+
+    <section class="state-strip" aria-label="Complete state vocabulary">
+      <div class="state-group task-state"><h2>Task phase</h2><p>pending · building · reviewing · reworking · approved · integrating · completed · cancelled</p></div>
+      <div class="state-group attempt-state"><h2>Attempt state</h2><p>prepared · active · awaiting-report · reported · ended-error · superseded · cancelled</p></div>
+      <div class="state-group attention-state"><h2>Attention</h2><p>none · blocked · waiting-external · suspected-stall · recovering · needs-user</p></div>
+    </section>
+
+    <section class="plate violet" aria-labelledby="plate-1">
+      <div class="plate-head">
+        <span class="plate-number">01</span><h2 id="plate-1">Start and approval gates</h2>
+        <div class="sources">Mapped from: <span data-source="Constraints">Constraints</span> · <span data-source="Initial Operating Model">Initial Operating Model</span> · <span data-source="Task Contract">Task Contract</span> · <span data-source="Model Plan">Model Plan</span> · <span data-source="Configuration and Stored Data">Configuration and Stored Data</span></div>
+      </div>
+      <div class="flowline">
+        <div class="node violet"><strong>/steward start</strong><small>draft small Task list</small></div><div class="arrow">→</div>
+        <div class="node violet"><strong>User confirms</strong><small>Tasks + Model Plan + verification</small></div><div class="arrow">→</div>
+        <div class="node"><strong>Freeze Run</strong><small>base, config, exact models, fallbacks</small></div><div class="arrow">→</div>
+        <div class="node green"><strong>Write Journal</strong><small>one active Run, atomic snapshot</small></div>
+      </div>
+      <div class="case-grid">
+        <article class="case stop" data-case="C01"><span class="case-id">C01</span><div><strong>Existing active Run</strong><p>Refuse replacement; direct the user to status, resume, cancel, or cleanup.</p></div></article>
+        <article class="case stop" data-case="C02"><span class="case-id">C02</span><div><strong>Herdr unavailable</strong><p>Refuse to start and explain restoration; never fall back to another subagent system.</p></div></article>
+        <article class="case stop" data-case="C03"><span class="case-id">C03</span><div><strong>Unclean integration checkout</strong><p>Code-changing Run requires selected base commit and clean checkout; never stash or absorb existing work.</p></div></article>
+        <article class="case control" data-case="C04"><span class="case-id">C04</span><div><strong>Explicit Task approval</strong><p>Start only after the Steward drafts the small Task list and the user confirms it.</p></div></article>
+        <article class="case control" data-case="C05"><span class="case-id">C05</span><div><strong>Explicit Model Plan</strong><p>Confirm exact provider/model IDs, thinking, and ordered fallbacks; current controller model is only a suggestion.</p></div></article>
+        <article class="case stop" data-case="C06"><span class="case-id">C06</span><div><strong>Model unavailable</strong><p>Check auth and availability at approval and dispatch; absent approved fallback pauses for user input.</p></div></article>
+        <article class="case advance" data-case="C07"><span class="case-id">C07</span><div><strong>Freeze effective configuration</strong><p>Later global/project config changes cannot alter the active Run.</p></div></article>
+        <article class="case observe" data-case="C08"><span class="case-id">C08</span><div><strong>Herdr name collision</strong><p>Choose a unique Steward-owned name; persist actual name and pane ID; never adopt existing resources.</p></div></article>
+        <article class="case control" data-case="C69"><span class="case-id">C69</span><div><strong>Minimal Task contract</strong><p>ID, outcome, allowed scope, expected Artifacts, verification, and whether Review is required.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate green" aria-labelledby="plate-2">
+      <div class="plate-head">
+        <span class="plate-number">02</span><h2 id="plate-2">Durable Assignment and dispatch</h2>
+        <div class="sources">Mapped from: <span data-source="Recovery Invariant">Recovery Invariant</span> · <span data-source="Durable Dispatch">Durable Dispatch</span> · <span data-source="Artifact Integrity and Interrupted Side Effects">Artifact Integrity and Interrupted Side Effects</span></div>
+      </div>
+      <div class="sequence">
+        <div class="sequence-step"><strong>Build Assignment</strong><small>Run/Task/Attempt IDs, outcome, scope, report path, Artifacts, verification</small></div>
+        <div class="sequence-step"><strong>Hash specification</strong><small>Store hash in the Run Journal</small></div>
+        <div class="sequence-step"><strong>Persist prepared + dispatching</strong><small>Atomic Journal update before Herdr</small></div>
+        <div class="sequence-step"><strong>Prompt named agent</strong><small>Continue the persisted Assignment</small></div>
+      </div>
+      <div class="case-grid">
+        <article class="case advance" data-case="C09"><span class="case-id">C09</span><div><strong>Assignment is durable and bounded</strong><p>Agents receive only required Assignment data; every accepted Assignment has a specification hash.</p></div></article>
+        <article class="case advance" data-case="C10"><span class="case-id">C10</span><div><strong>Dispatch is persisted first</strong><p>Attempt and intended named dispatch exist before the prompt side effect.</p></div></article>
+        <article class="case control" data-case="C70"><span class="case-id">C70</span><div><strong>Attempt Report contract</strong><p>All reports identify Run/Task/Attempt, status, summary, blockers; role-specific evidence is mandatory.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate amber" aria-labelledby="plate-3">
+      <div class="plate-head">
+        <span class="plate-number">03</span><h2 id="plate-3">Reconciliation after interruption</h2>
+        <div class="sources">Mapped from: <span data-source="Authority">Authority</span> · <span data-source="Recovery Invariant">Recovery Invariant</span> · <span data-source="Durable Dispatch">Durable Dispatch</span></div>
+      </div>
+      <div class="decision-grid">
+        <div class="trigger"><strong>Controller returns</strong><p>Read Run Journal</p><p>Inspect Herdr</p><p>Validate Git + Artifacts</p></div>
+        <div class="decision-arrow">→</div>
+        <div class="outcomes"><strong>Never continue from conversational memory</strong><div class="priority-list"><div>valid report</div><div>working / blocked agent</div><div>settled, no report</div><div>unclear live state</div><div>missing agent</div></div></div>
+      </div>
+      <div class="case-grid">
+        <article class="case observe" data-case="C11"><span class="case-id">C11</span><div><strong>Fixed reconciliation precedence</strong><p>Check report, working/blocked, settled/no-report, unclear, then missing—in that order.</p></div></article>
+        <article class="case advance" data-case="C12"><span class="case-id">C12</span><div><strong>Valid report found</strong><p>Accept only after validating spec hash, commits/Artifacts, referenced logs, and report fields.</p></div></article>
+        <article class="case observe" data-case="C13"><span class="case-id">C13</span><div><strong>Agent working or blocked</strong><p>Continue observing; answer a block only when the approved Task already determines the answer.</p></div></article>
+        <article class="case stop" data-case="C14"><span class="case-id">C14</span><div><strong>Settled without report</strong><p>Ask the same agent once for the report; if still absent, block rather than infer success.</p></div></article>
+        <article class="case stop" data-case="C15"><span class="case-id">C15</span><div><strong>Malformed report</strong><p>Return once to the same agent for correction; if still malformed, block.</p></div></article>
+        <article class="case observe" data-case="C16"><span class="case-id">C16</span><div><strong>Missing agent</strong><p>Inspect preserved work first; never blindly repeat, reset changes, or delete partial progress.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate amber" aria-labelledby="plate-4">
+      <div class="plate-head">
+        <span class="plate-number">04</span><h2 id="plate-4">Agent health, silence, and recovery ladder</h2>
+        <div class="sources">Mapped from: <span data-source="Agent Health and Recovery">Agent Health and Recovery</span> · <span data-source="Failure Boundaries">Failure Boundaries</span> · <span data-source="Long-Running External Commands">Long-Running External Commands</span></div>
+      </div>
+      <div class="flowline">
+        <div class="node amber"><strong>Suspected silence</strong><small>never fail automatically</small></div><div class="arrow">→</div>
+        <div class="node amber"><strong>Inspect evidence</strong><small>Herdr · terminal · worktree · Git · report</small></div><div class="arrow">→</div>
+        <div class="node amber"><strong>Nudge same agent</strong><small>no retry consumed</small></div><div class="arrow">→</div>
+        <div class="node amber"><strong>Soft interrupt + resume</strong><small>same agent, durable state</small></div><div class="arrow">→</div>
+        <div class="node red"><strong>Linked replacement</strong><small>preserved worktree, retry consumed</small></div>
+      </div>
+      <div class="case-grid">
+        <article class="case observe" data-case="C17"><span class="case-id">C17</span><div><strong>Transient failures</strong><p>Provider/network interruption, startup failure, Herdr command failure, and unexpected exit consume the two-retry budget.</p></div></article>
+        <article class="case advance" data-case="C18"><span class="case-id">C18</span><div><strong>Correctness failures are rework</strong><p>Tests, findings, incorrect work, scope violations, and missing Artifacts do not consume transient retries.</p></div></article>
+        <article class="case stop" data-case="C19"><span class="case-id">C19</span><div><strong>Recovery budget exhausted</strong><p>After at most two replacement Attempts, mark needs-user and retain all partial work.</p></div></article>
+        <article class="case control" data-case="C20"><span class="case-id">C20</span><div><strong>Model retry discipline</strong><p>Retry same model first; replacements use only next approved fallback; never change model inside an Attempt.</p></div></article>
+        <article class="case observe" data-case="C21"><span class="case-id">C21</span><div><strong>Silence recovery ladder</strong><p>Inspect → nudge → soft-interrupt stuck generation → resume same agent → replacement.</p></div></article>
+        <article class="case observe" data-case="C22"><span class="case-id">C22</span><div><strong>Known external process alive</strong><p>Set waiting-external; warning threshold only notifies; do not nudge, interrupt, replace, or demand output.</p></div></article>
+        <article class="case observe" data-case="C23"><span class="case-id">C23</span><div><strong>External liveness unclear</strong><p>Perform passive inspection and avoid destructive recovery; after exit, allow grace before the silence ladder.</p></div></article>
+        <article class="case observe" data-case="C24"><span class="case-id">C24</span><div><strong>Herdr temporarily unavailable</strong><p>Monitoring degrades, Attempts do not fail, and reconciliation resumes when Herdr returns.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate green" aria-labelledby="plate-5">
+      <div class="plate-head">
+        <span class="plate-number">05</span><h2 id="plate-5">Builder evidence and independent Review</h2>
+        <div class="sources">Mapped from: <span data-source="Task Contract">Task Contract</span> · <span data-source="User Surface">User Surface</span> · <span data-source="Journal and Repository Safety">Journal and Repository Safety</span> · <span data-source="Verification and Cleanup">Verification and Cleanup</span> · <span data-source="Artifact Integrity and Interrupted Side Effects">Artifact Integrity and Interrupted Side Effects</span></div>
+      </div>
+      <div class="flowline">
+        <div class="node green"><strong>Builder report</strong><small>commit + checks + logs + blockers</small></div><div class="arrow">→</div>
+        <div class="node green"><strong>Integrity gate</strong><small>scope · spec hash · exact range · clean worktree</small></div><div class="arrow">→</div>
+        <div class="node green"><strong>Frozen revision</strong><small>record HEAD + dirty fingerprint</small></div><div class="arrow">→</div>
+        <div class="node violet"><strong>Independent Reviewer</strong><small>read-only evaluation</small></div><div class="arrow">→</div>
+        <div class="node"><strong>Approval or rework</strong><small>Approval binds only to reviewed SHA</small></div>
+      </div>
+      <div class="case-grid">
+        <article class="case advance" data-case="C25"><span class="case-id">C25</span><div><strong>Produced evidence</strong><p>Code Builder supplies local commit SHA; non-Git Artifacts use path, size, and SHA-256.</p></div></article>
+        <article class="case stop" data-case="C26"><span class="case-id">C26</span><div><strong>Out-of-scope changes</strong><p>Preserve and show them; return to Builder for correction before Review.</p></div></article>
+        <article class="case advance" data-case="C27"><span class="case-id">C27</span><div><strong>Artifact integrity</strong><p>Verify base SHA, head SHA, exact commit range, clean Builder worktree, commands, exit results, and durable logs.</p></div></article>
+        <article class="case control" data-case="C28"><span class="case-id">C28</span><div><strong>Independent Reviewer model</strong><p>Use a separate agent and first available approved different-family model; same-family needs explicit user authorization.</p></div></article>
+        <article class="case advance" data-case="C29"><span class="case-id">C29</span><div><strong>Frozen Review target</strong><p>Reviewer evaluates the recorded revision; capture HEAD and dirty fingerprint before and verify both after.</p></div></article>
+        <article class="case stop" data-case="C30"><span class="case-id">C30</span><div><strong>Reviewer modified worktree</strong><p>Preserve changes, invalidate Review, mark needs-user, and never reset unexplained work.</p></div></article>
+        <article class="case observe" data-case="C31"><span class="case-id">C31</span><div><strong>Review requests rework</strong><p>Findings, conflict, failed check: Builder produces a new SHA and fresh Review; initial cycle plus at most five repetitions.</p></div></article>
+        <article class="case stop" data-case="C32"><span class="case-id">C32</span><div><strong>Assignment changed unexpectedly</strong><p>Preserve the changed specification and require user confirmation; do not accept the report against a different contract.</p></div></article>
+        <article class="case stop" data-case="C33"><span class="case-id">C33</span><div><strong>Referenced evidence invalid</strong><p>Missing commit, log, Artifact, or invalid report gets one repair chance, then blocks.</p></div></article>
+        <article class="case advance" data-case="C34"><span class="case-id">C34</span><div><strong>Plain Markdown reports</strong><p>Small machine-readable frontmatter plus concise role-specific evidence; full logs stay in durable files.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate" aria-labelledby="plate-6">
+      <div class="plate-head">
+        <span class="plate-number">06</span><h2 id="plate-6">Parallel work and sequential integration</h2>
+        <div class="sources">Mapped from: <span data-source="Initial Operating Model">Initial Operating Model</span> · <span data-source="Execution Policy">Execution Policy</span> · <span data-source="Parallelism and Integration">Parallelism and Integration</span> · <span data-source="Artifact Integrity and Interrupted Side Effects">Artifact Integrity and Interrupted Side Effects</span></div>
+      </div>
+      <div class="split">
+        <div class="branch"><h3>Clearly disjoint allowed scopes</h3><ul><li>Builder/Reviewer pairs may run concurrently.</li><li>Each code Builder owns an isolated worktree.</li><li>No arbitrary dependency graph is introduced.</li></ul></div>
+        <div class="branch"><h3>Overlapping allowed scopes</h3><ul><li>Serialize in user-approved order.</li><li>Integrate in that same order.</li><li>Never integrate in completion order.</li></ul></div>
+      </div>
+      <div class="case-grid">
+        <article class="case advance" data-case="C35"><span class="case-id">C35</span><div><strong>Parallel only when scopes are disjoint</strong><p>Overlap means serialization, not a general task dependency engine.</p></div></article>
+        <article class="case advance" data-case="C36"><span class="case-id">C36</span><div><strong>Approved-order integration</strong><p>Completed Tasks wait when needed; integration order never follows finishing time.</p></div></article>
+        <article class="case advance" data-case="C37"><span class="case-id">C37</span><div><strong>Persist integration intention</strong><p>Record target branch, target SHA, approved base/head range, and intended action before Git mutation.</p></div></article>
+        <article class="case advance" data-case="C38"><span class="case-id">C38</span><div><strong>Exact range already integrated</strong><p>Record success and do not apply the range twice.</p></div></article>
+        <article class="case observe" data-case="C39"><span class="case-id">C39</span><div><strong>Target unchanged, range absent</strong><p>The exact recorded integration side effect can be retried.</p></div></article>
+        <article class="case stop" data-case="C40"><span class="case-id">C40</span><div><strong>Partial or conflicted Git operation</strong><p>Preserve and show it; never blindly repeat, abort, reset, or revert.</p></div></article>
+        <article class="case observe" data-case="C41"><span class="case-id">C41</span><div><strong>Integration target advanced</strong><p>Compare with Task base; if revision needs modification, return to Builder for new SHA and Review.</p></div></article>
+        <article class="case observe" data-case="C42"><span class="case-id">C42</span><div><strong>Approved revision conflicts</strong><p>Builder updates against target, fresh Review is mandatory, and one rework cycle is consumed.</p></div></article>
+        <article class="case stop" data-case="C43"><span class="case-id">C43</span><div><strong>Managed worktree changed externally</strong><p>Preserve difference, invalidate evidence, stop mutating the Task, and require user confirmation.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate red" aria-labelledby="plate-7">
+      <div class="plate-head">
+        <span class="plate-number">07</span><h2 id="plate-7">Final verification and Completion Gate</h2>
+        <div class="sources">Mapped from: <span data-source="Execution Policy">Execution Policy</span> · <span data-source="Failure Boundaries">Failure Boundaries</span> · <span data-source="Compatibility and User Experience">Compatibility and User Experience</span> · <span data-source="Verification and Cleanup">Verification and Cleanup</span> · <span data-source="Artifact Integrity and Interrupted Side Effects">Artifact Integrity and Interrupted Side Effects</span></div>
+      </div>
+      <div class="flowline">
+        <div class="node"><strong>All approved revisions integrated</strong><small>local sequential target</small></div><div class="arrow">→</div>
+        <div class="node green"><strong>Run deterministic checks</strong><small>Steward executes and logs</small></div><div class="arrow">→</div>
+        <div class="node amber"><strong>Interpret durable result</strong><small>pass · fail · interrupted · dirty</small></div><div class="arrow">→</div>
+        <div class="node dark"><strong>Completion Gate</strong><small>only verified evidence closes Run</small></div>
+      </div>
+      <div class="case-grid">
+        <article class="case advance" data-case="C44"><span class="case-id">C44</span><div><strong>Deterministic final verification</strong><p>Steward runs approved commands and records logs/exit codes; no deterministic check requires durable user waiver.</p></div></article>
+        <article class="case observe" data-case="C45"><span class="case-id">C45</span><div><strong>Controller interrupted during verification</strong><p>Wait on identifiable live process, consume complete durable result, or rerun only when no conclusive result exists; record rerun.</p></div></article>
+        <article class="case observe" data-case="C46"><span class="case-id">C46</span><div><strong>Failure owner is clear</strong><p>Responsible Task returns to Builder for new SHA and fresh Review; consumes a rework cycle.</p></div></article>
+        <article class="case stop" data-case="C47"><span class="case-id">C47</span><div><strong>Failure ownership unclear</strong><p>Preserve integrated state and ask user; never automatically reset or revert several interacting Tasks.</p></div></article>
+        <article class="case stop" data-case="C48"><span class="case-id">C48</span><div><strong>Verification dirties checkout</strong><p>Preserve generated/unexplained changes, block completion, and show exact difference.</p></div></article>
+        <article class="case advance" data-case="C49"><span class="case-id">C49</span><div><strong>Completion succeeds</strong><p>Mark completed, archive Journal/reports, notify, and retain worktrees until confirmed cleanup.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate violet" aria-labelledby="plate-8">
+      <div class="plate-head">
+        <span class="plate-number">08</span><h2 id="plate-8">Controller Session, monitor, takeover, and compaction</h2>
+        <div class="sources">Mapped from: <span data-source="Controller and Monitoring">Controller and Monitoring</span> · <span data-source="Recovery Invariant">Recovery Invariant</span></div>
+      </div>
+      <div class="flowline">
+        <div class="node violet"><strong>One Controller Session</strong><small>only session allowed to advance</small></div><div class="arrow">→</div>
+        <div class="node amber"><strong>Monitor observes</strong><small>Herdr waits, reports, notifications</small></div><div class="arrow">→</div>
+        <div class="node amber"><strong>Safe idle point</strong><small>not user turn or compaction</small></div><div class="arrow">→</div>
+        <div class="node green"><strong>Reconcile</strong><small>then deterministic next action</small></div>
+      </div>
+      <div class="case-grid">
+        <article class="case control" data-case="C50"><span class="case-id">C50</span><div><strong>Single controller authority</strong><p>Other Pi sessions may inspect status but cannot advance the active Run.</p></div></article>
+        <article class="case control" data-case="C51"><span class="case-id">C51</span><div><strong>Explicit takeover</strong><p>/steward resume --takeover reconciles first, then replaces controller identity.</p></div></article>
+        <article class="case observe" data-case="C52"><span class="case-id">C52</span><div><strong>Monitor safe windows</strong><p>During a user turn or compaction it only observes; when idle it reconciles and may act.</p></div></article>
+        <article class="case observe" data-case="C53"><span class="case-id">C53</span><div><strong>Monitor lifecycle</strong><p>Stop on session_shutdown, reconstruct on session_start, and prefer Herdr waits over polling.</p></div></article>
+        <article class="case observe" data-case="C54"><span class="case-id">C54</span><div><strong>Compaction continuity</strong><p>Verify Journal and add Run ID/pending action to summary; hook failure is diagnostic, never correctness-critical.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate violet" aria-labelledby="plate-9">
+      <div class="plate-head">
+        <span class="plate-number">09</span><h2 id="plate-9">Revision, cancellation, completion, and cleanup</h2>
+        <div class="sources">Mapped from: <span data-source="User Surface">User Surface</span> · <span data-source="Execution Policy">Execution Policy</span> · <span data-source="Verification and Cleanup">Verification and Cleanup</span></div>
+      </div>
+      <div class="split">
+        <div class="branch"><h3>/steward revise</h3><ul><li>Draft and confirm explicit delta.</li><li>Identify affected Tasks and evidence.</li><li>Version changed specifications.</li><li>Cancel obsolete Attempts and invalidate affected Reviews.</li><li>Retain unaffected completed work.</li></ul></div>
+        <div class="branch"><h3>/steward cancel → /steward cleanup</h3><ul><li>Persist cancellation before interrupt.</li><li>Stop new dispatch and integration.</li><li>Preserve reports, sessions, panes, worktrees, logs.</li><li>Show exact owned cleanup set and ask confirmation.</li></ul></div>
+      </div>
+      <div class="case-grid">
+        <article class="case control" data-case="C55"><span class="case-id">C55</span><div><strong>Explicit Run revision</strong><p>Ordinary conversation never mutates scope; only confirmed delta changes specs and invalidates affected evidence.</p></div></article>
+        <article class="case stop" data-case="C56"><span class="case-id">C56</span><div><strong>Cancellation is durable first</strong><p>Mark Run cancelled before interrupting; prevent further dispatch/integration and preserve all evidence.</p></div></article>
+        <article class="case advance" data-case="C57"><span class="case-id">C57</span><div><strong>Graceful terminal shutdown</strong><p>After complete or cancel, stop Steward-created agents but retain Pi sessions, panes, worktrees, reports, and evidence.</p></div></article>
+        <article class="case control" data-case="C58"><span class="case-id">C58</span><div><strong>Confirmed owned-resource cleanup</strong><p>Close retained Steward panes and remove managed worktrees only; retain archived Journal, Assignments, reports, and logs.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate red" aria-labelledby="plate-10">
+      <div class="plate-head">
+        <span class="plate-number">10</span><h2 id="plate-10">Journal, schema, repository, and authority safety</h2>
+        <div class="sources">Mapped from: <span data-source="Journal and Repository Safety">Journal and Repository Safety</span> · <span data-source="Failure Boundaries">Failure Boundaries</span> · <span data-source="Configuration and Stored Data">Configuration and Stored Data</span> · <span data-source="Verification and Cleanup">Verification and Cleanup</span></div>
+      </div>
+      <div class="sequence">
+        <div class="sequence-step"><strong>Write validated temp snapshot</strong><small>complete schema-valid state</small></div>
+        <div class="sequence-step"><strong>Preserve previous valid snapshot</strong><small>active-run.previous.json</small></div>
+        <div class="sequence-step"><strong>Atomic replace</strong><small>active-run.json</small></div>
+        <div class="sequence-step"><strong>Recover conservatively</strong><small>read-only if truth is unfamiliar</small></div>
+      </div>
+      <div class="case-grid">
+        <article class="case stop" data-case="C59"><span class="case-id">C59</span><div><strong>Both Journal snapshots invalid</strong><p>Enter read-only recovery and ask the user; never invent mutable state.</p></div></article>
+        <article class="case stop" data-case="C60"><span class="case-id">C60</span><div><strong>Unsupported schemaVersion</strong><p>Newer or unmigrated older Journal opens in read-only status mode; never guess a migration.</p></div></article>
+        <article class="case stop" data-case="C61"><span class="case-id">C61</span><div><strong>Project-local sensitive data</strong><p>.pi/steward is ignored, user-only where supported, least-data Assignments, and full logs require warning before display/export.</p></div></article>
+        <article class="case advance" data-case="C62"><span class="case-id">C62</span><div><strong>Historical evidence retention</strong><p>Archive final snapshots; ordinary cleanup keeps history until the user explicitly deletes an archive.</p></div></article>
+        <article class="case control" data-case="C63"><span class="case-id">C63</span><div><strong>Separate authorization boundary</strong><p>Push, deploy, force reset, discard, delete unrecognized resources, and account/security changes always need explicit authorization.</p></div></article>
+        <article class="case control" data-case="C64"><span class="case-id">C64</span><div><strong>Interactive-mode boundary</strong><p>Full behavior is Pi TUI only; plain status may work elsewhere, but approval/takeover/revision/cancel/config/cleanup require interaction.</p></div></article>
+      </div>
+    </section>
+
+    <section class="plate" aria-labelledby="plate-11">
+      <div class="plate-head">
+        <span class="plate-number">11</span><h2 id="plate-11">Product boundary, commands, and observable progress</h2>
+        <div class="sources">Mapped from: <span data-source="Compatibility and User Experience">Compatibility and User Experience</span> · <span data-source="Product Form">Product Form</span> · <span data-source="User Surface">User Surface</span></div>
+      </div>
+      <div class="guardrail-grid">
+        <div class="guardrail"><strong>Small product</strong><p>Pi extension + ordinary TypeScript orchestration + Run Journal storage + Herdr adapter. No daemon.</p></div>
+        <div class="guardrail"><strong>Explicit command surface</strong><p>start · status · resume · revise · cancel · cleanup · config. Ordinary subagent work is not intercepted.</p></div>
+        <div class="guardrail"><strong>Compact presentation</strong><p>Markdown status, footer phase/attention count, and notifications. No version-one dashboard.</p></div>
+      </div>
+      <div class="case-grid">
+        <article class="case control" data-case="C65"><span class="case-id">C65</span><div><strong>Bounded command surface</strong><p>Only the accepted /steward commands; ordinary subagent activity remains outside Steward control.</p></div></article>
+        <article class="case observe" data-case="C66"><span class="case-id">C66</span><div><strong>Version-one UX</strong><p>Compact Markdown status, Pi footer, and blocked/degraded/approval/completed notifications; no custom dashboard.</p></div></article>
+        <article class="case control" data-case="C67"><span class="case-id">C67</span><div><strong>Pi package, Pi agents, no daemon</strong><p>Use Pi lifecycle hooks and Herdr CLI; keep reusable orchestration TypeScript for a future demonstrated CLI need.</p></div></article>
+        <article class="case observe" data-case="C68"><span class="case-id">C68</span><div><strong>Observable progress</strong><p>Herdr lifecycle, terminal output, worktree file change, Git diff/commit, or Attempt Report update.</p></div></article>
+      </div>
+    </section>
+
+    <section class="section-map" aria-label="Accepted design section coverage">
+      <h2>Accepted design coverage map</h2>
+      <span>Constraints</span><span>Authority</span><span>Initial Operating Model</span><span>Execution Policy</span>
+      <span>Task Contract</span><span>Recovery Invariant</span><span>Agent Health and Recovery</span><span>Durable Dispatch</span>
+      <span>User Surface</span><span>Controller and Monitoring</span><span>Journal and Repository Safety</span><span>Failure Boundaries</span>
+      <span>Compatibility and User Experience</span><span>Model Plan</span><span>Parallelism and Integration</span><span>Verification and Cleanup</span>
+      <span>Artifact Integrity and Interrupted Side Effects</span><span>Configuration and Stored Data</span><span>Product Form</span><span>Long-Running External Commands</span>
+    </section>
+
+    <footer>
+      <span>70 explicitly indexed cases · every accepted design section mapped · static diagram document</span>
+      <span>Authority: Run Journal + Herdr + Git/Artifacts · never conversation alone</span>
+    </footer>
+  </main>
+</body>
+</html>
