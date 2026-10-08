@@ -31,7 +31,10 @@ export class SearchableModelPickerState {
 	private visible: SearchableModelPickerItem[];
 	readonly maxVisible: number;
 
-	constructor(private readonly items: readonly SearchableModelPickerItem[], maxVisible = 12) {
+	private readonly items: readonly SearchableModelPickerItem[];
+
+	constructor(items: readonly SearchableModelPickerItem[], maxVisible = 12) {
+		this.items = items;
 		this.maxVisible = Math.max(1, maxVisible);
 		this.visible = this.filteredItems();
 	}
