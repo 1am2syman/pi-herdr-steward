@@ -129,7 +129,8 @@ the manual wizard. Ordinary conversation can also ask Pi to use Steward, without
 a slash command.
 
 The model-callable tools are `steward_context` (read defaults, model choices, and
-active task contracts), `steward_start` (submit a proposal), `steward_revise`
+active task contracts), `steward_github_issues` (read GitHub issue snapshots),
+`steward_start` (submit a proposal), `steward_revise`
 (submit revised contracts), and `steward_control` (existing operations). They
 share the existing validation, ownership, confirmation, journal, and monitor
 boundaries. Tools require an interactive TUI; they are callable from codemode
@@ -139,7 +140,36 @@ Omitted Model Plans and operational settings inherit project/default settings.
 If a required plan is missing, the agent must ask or open configuration rather
 than invent model identifiers. Missing discovery tools, credentials, ambiguous
 scope, and unsupported policies require clarification or an explanation. Enable
-repository/issue discovery tools alongside Steward for requests requiring them.
+repository file tools alongside Steward for local Markdown issue requests.
+GitHub issue discovery is built in; no separate issue-tool extension is needed.
+
+### GitHub issues
+
+Install GitHub CLI (`gh`) and authenticate separately with `gh auth login`. Steward
+uses your existing credentials; it never logs in or changes accounts for you.
+
+```text
+/steward start resolve all open GitHub issues sequentially
+/steward start fix GitHub issues #8 and #3 in that order
+/steward start resolve open issues labelled bug in acme/project
+```
+
+The built-in `steward_github_issues` tool detects the checkout repository via
+`gh repo view`, or accepts an explicit `owner/repo`. It reads every matching page
+with `gh api`, excludes pull requests, and returns full titles/bodies, URLs,
+state, labels, assignees, update times, and a fetch timestamp. Listing defaults
+to open issues in ascending issue-number order; optional state, all-of-labels,
+and assignee filters are available. Exact issue numbers preserve supplied order
+and include closed issues; they cannot be combined with listing filters.
+
+Only github.com is supported. Issue comments, project boards, and live
+subscriptions are not fetched. A paginated read is not an atomic GitHub snapshot;
+issues can change during discovery. Failed or malformed reads produce an error,
+not a partial result. An empty result creates no work. The agent copies issue
+identifiers, URLs, and acceptance criteria into the proposal; those confirmed
+contracts, not subsequent GitHub edits, govern the Run. This is read-only GitHub
+integration: Steward does not post comments, change labels, or close issues.
+Local Markdown issue workflows remain available through file tools.
 
 For issue requests, the agent is instructed to fetch the complete requested issue
 set and freeze a snapshot with identifiers, URLs, and acceptance criteria; new
