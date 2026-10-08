@@ -29,6 +29,7 @@ export type TaskAdmissionDecision =
 	| { kind: "none"; reason: "no-pending-code-task" | "all-tasks-non-code" }
 	| { kind: "at-cap"; activeCount: number; maximumActiveTasks: number }
 	| { kind: "blocked-by-overlap"; taskId: string; blockedBy: string[] }
+	| { kind: "blocked-by-predecessor"; taskId: string; blockedBy: string[] }
 	| { kind: "admit"; taskId: string; index: number; baseRevision: string };
 
 function latestRevisionDelta(run: Pick<RunRecord, "tasks" | "revisions">, taskId: string) {
@@ -85,6 +86,11 @@ export function selectTaskAdmission(run: Pick<RunRecord, "tasks" | "integrationB
 	for (let index = 0; index < run.tasks.length; index += 1) {
 		const task = run.tasks[index];
 		if (!task || task.phase !== "pending" || !isCodeTask(task)) continue;
+		// A cap of one is strict sequential execution through integration, not just building.
+		if (maximumActiveTasks === 1) {
+			const predecessors = run.tasks.slice(0, index).filter((other) => isCodeTask(other) && other.integration?.phase !== "integrated");
+			if (predecessors.length > 0) return { kind: "blocked-by-predecessor", taskId: task.contract.id, blockedBy: predecessors.map((other) => other.contract.id) };
+		}
 		const occupied = run.tasks.filter((other) => other !== task && occupiesActiveSlot(other));
 		const occupiedOverlap = occupied.filter((other) => taskScopesOverlap(task, other));
 		if (occupiedOverlap.length > 0) {

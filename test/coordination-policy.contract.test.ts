@@ -49,6 +49,16 @@ describe("ticket-13 pure coordination policy", () => {
 		expect(selectTaskAdmission(run(noSlot.tasks, 3))).toMatchObject({ kind: "blocked-by-overlap", taskId: "task-03", blockedBy: ["task-01"] });
 	});
 
+	it("keeps sequential successors blocked until earlier tasks integrate, including blocked or approved predecessors", () => {
+		for (const phase of ["building", "reviewing", "approved", "integrating"] as const) {
+			const first = task("task-01", "src/a", phase);
+			const second = task("task-02", "src/b");
+			const decision = selectTaskAdmission(run([first, second], 1));
+			expect(["at-cap", "blocked-by-predecessor"]).toContain(decision.kind);
+		}
+		expect(selectTaskAdmission(run([task("task-01", "src/a", "approved", { attention: "needs-user" }), task("task-02", "src/b")], 1))).toMatchObject({ kind: "blocked-by-predecessor", taskId: "task-02" });
+	});
+
 	it("accepts zero only at the config boundary and accepts the maximum safe cap policy input", () => {
 		const pending = task("task-01", "src/a");
 		expect(selectTaskAdmission(run([pending], 0)).kind).toBe("at-cap");
