@@ -1,5 +1,6 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -23,7 +24,7 @@ const recovery: RecoveryDefaults = { passiveInspectionIntervalSeconds: 301, seco
 const modelPlan: ProjectModelPlans = { builder: { primary: { model: "builder/model", thinkingLevel: "high" }, fallbacks: [] }, reviewer: { primary: { model: "reviewer/model", thinkingLevel: "high" }, fallbacks: [] } };
 
 afterEach(async () => {
-	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+	for (const root of roots.splice(0)) await removeFixture(root);
 });
 
 function sha(bytes: Buffer): string { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
@@ -381,6 +382,7 @@ describe("ticket-08 registered completion flow", () => {
 		const attempt = approved.run.tasks[0]!.attempts.find((candidate) => candidate.role === role)!;
 		if (attempt.evidence?.phase !== "finalized") throw new Error(`${role} evidence was not finalized`);
 		const originalManifest = await readFile(attempt.evidence.manifestPath);
+		await chmod(attempt.evidence.manifestPath, 0o600); // Deliberately simulate protected-evidence corruption.
 		await writeFile(attempt.evidence.manifestPath, Buffer.concat([originalManifest, Buffer.from("tampered\n")]));
 		await invoke(root, deps, "status");
 		const after = await deps.runJournal.loadActive(root);

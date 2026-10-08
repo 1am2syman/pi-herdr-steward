@@ -1,5 +1,6 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, it } from "vitest";
@@ -32,7 +33,7 @@ const recovery: RecoveryDefaults = {
 
 afterEach(async () => {
 	for (const root of roots.splice(0)) {
-		await rm(root, { recursive: true, force: true });
+		await removeFixture(root);
 	}
 });
 

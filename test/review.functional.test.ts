@@ -1,5 +1,6 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { deepStrictEqual, equal, match, ok } from "node:assert/strict";
@@ -21,7 +22,7 @@ const commits = ["1111111111111111111111111111111111111111", headRevision];
 const fingerprint = "sha256:" + "a".repeat(64);
 const recovery: RecoveryDefaults = { passiveInspectionIntervalSeconds: 301, secondInspectionAndNudgeIntervalSeconds: 302, nudgeGracePeriodSeconds: 121, externalCommandWarningThresholdSeconds: 1801, maximumActiveTasks: 1, transientRetryLimit: 1, reworkCycleLimit: 4 };
 
-afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { for (const root of roots.splice(0)) await removeFixture(root); });
 
 function digest(bytes: Buffer): string { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
 

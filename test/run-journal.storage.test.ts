@@ -1,5 +1,6 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { existsSync } from "node:fs";
-import { lstat, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deepStrictEqual, equal, match, ok, throws } from "node:assert/strict";
@@ -30,7 +31,7 @@ const settings: RecoveryDefaults = {
 };
 
 afterEach(async () => {
-	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+	for (const root of roots.splice(0)) await removeFixture(root);
 });
 
 function journal(runId: string, revision = 1, updatedAt = "2026-09-17T18:00:00.000Z"): RunJournal {

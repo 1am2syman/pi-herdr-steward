@@ -1,5 +1,6 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -111,7 +112,7 @@ function hashBytes(value: Buffer): string {
 }
 
 afterEach(async () => {
-	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+	for (const root of roots.splice(0)) await removeFixture(root);
 });
 
 describe("ticket-08 completion evidence storage", () => {
@@ -209,6 +210,7 @@ describe("ticket-08 completed archive storage", () => {
 		const fixture = await captureArchiveFixture(root);
 		const source = fixture.request.reports[0]!;
 		const originalSource = await readFile(source.sourcePath);
+		await chmod(source.sourcePath, 0o600); // Deliberate corruption must work without root.
 		await writeFile(source.sourcePath, Buffer.from("changed protected report\n"));
 		const sourceChanged = await archiveCompletedRun({ ...fixture.request, activeRunBytes: fixture.activeBytes, previousRunBytes: fixture.previousBytes });
 		expect(sourceChanged.kind).toBe("storage-error");
@@ -291,6 +293,7 @@ describe("ticket-18 cancelled archive storage", () => {
 		const published = await archiveCancelledRun({ ...fixture.input, activeRunBytes: fixture.pointers.activeBytes, previousRunBytes: fixture.pointers.previousBytes });
 		expect(published.kind).toBe("published");
 		const paths = resolveCompletionPaths(root, fixture.input.runId);
+		await chmod(paths.archiveDirectory, 0o700); // Simulate an adversary with write access.
 		await writeFile(join(paths.archiveDirectory, "unexpected"), "unsafe\n");
 		expect((await listTerminalArchives(root)).kind).toBe("unavailable");
 		await rm(join(paths.archiveDirectory, "unexpected"), { force: true });
@@ -299,6 +302,7 @@ describe("ticket-18 cancelled archive storage", () => {
 		await rm(join(paths.archiveDirectory, "run-link"), { force: true });
 		const manifest = JSON.parse((await readFile(paths.archiveManifestPath)).toString("utf8")) as Record<string, unknown>;
 		manifest.unknown = true;
+		await chmod(paths.archiveManifestPath, 0o600);
 		await writeFile(paths.archiveManifestPath, `${JSON.stringify(manifest)}\n`);
 		expect((await listTerminalArchives(root)).kind).toBe("unavailable");
 	});
