@@ -87,7 +87,7 @@ it("persists confirmed agent proposals with inherited defaults through the exist
 it("registers sequential callable tools, enforces TUI mode, and supports cancel then another proposal", async () => {
  const f = await fixture(); const tools = new Map<string, { executionMode: ToolDefinition["executionMode"]; execute(id: string, params: unknown, signal: AbortSignal, update: undefined, ctx: ExtensionContext): Promise<{ details: unknown }> }>();
  registerStewardExtension({ on() {}, registerCommand() {}, registerTool(tool) { tools.set(tool.name, { executionMode: tool.executionMode, execute: (id, params, signal, update, ctx) => tool.execute(id, params as Parameters<typeof tool.execute>[1], signal, update, ctx) }); } }, () => f.deps);
- expect([...tools.keys()]).toEqual(["steward_context", "steward_start", "steward_revise", "steward_control"]);
+ expect([...tools.keys()]).toEqual(["steward_context", "steward_github_issues", "steward_start", "steward_revise", "steward_control"]);
  expect([...tools.values()].every((tool) => tool.executionMode === "sequential")).toBe(true);
  const ctx = f.ctx as ExtensionContext; const signal = new AbortController().signal;
  const start = tools.get("steward_start")!;
@@ -112,7 +112,24 @@ it("agent revisions use existing validation and confirmation without manual fiel
  expect(active.kind === "loaded" && active.journal.journalRevision).toBe(1);
 });
 
+it("built-in GitHub tool uses the host runner without creating a Run or adapters", async () => {
+ const f = await fixture(); let execute: ((params: unknown, ctx: ExtensionContext) => Promise<{ details: unknown; content: unknown }>) | undefined; let calls = 0;
+ const signal = new AbortController().signal;
+ registerStewardExtension({ on() {}, registerCommand() {}, registerTool(tool) { if (tool.name === "steward_github_issues") execute = (params, ctx) => tool.execute("gh", params as Parameters<typeof tool.execute>[1], signal, undefined, ctx); } }, () => { throw new Error("discovery must not construct adapters"); }, async (command, args, options) => {
+  calls++; expect(command).toBe("gh"); expect(args).toContain("GET"); expect(options?.cwd).toBe(f.root);
+  return { code: 0, killed: false, stdout: "[[]]", stderr: "" };
+ });
+ if (!execute) throw new Error("GitHub tool missing");
+ const result = await execute({ repository: "acme/project" }, f.ctx as ExtensionContext);
+ expect(result.details).toMatchObject({ repository: "acme/project", issues: [] });
+ expect(result.content).toEqual(expect.arrayContaining([expect.objectContaining({ text: expect.stringContaining("untrusted data") })]));
+ expect(calls).toBe(1); expect(f.observations().confirmations).toBe(0);
+ expect(existsSync(join(f.root, ".pi/steward/active-run.json"))).toBe(false);
+ await expect(execute({}, { ...f.ctx, mode: "rpc" } as ExtensionContext)).rejects.toThrow("interactive TUI");
+ expect(calls).toBe(1);
+});
+
 it("intake explains unsupported policies and snapshot semantics", () => {
  const prompt = buildStewardIntakePrompt("do anything");
- expect(prompt).toContain("all pages"); expect(prompt).toContain("freeze a snapshot"); expect(prompt).toContain("Unsupported capabilities"); expect(prompt).toContain("Never retry after cancellation");
+ expect(prompt).toContain("steward_github_issues"); expect(prompt).toContain("local Markdown"); expect(prompt).toContain("all pages"); expect(prompt).toContain("Freeze a snapshot"); expect(prompt).toContain("Unsupported capabilities"); expect(prompt).toContain("Never retry after cancellation");
 });
