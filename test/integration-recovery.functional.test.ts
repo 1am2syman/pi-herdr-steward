@@ -1,6 +1,7 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -312,7 +313,7 @@ function forbiddenGitCall(call: string[]): boolean {
 }
 
 afterEach(async () => {
-	for (const root of roots.splice(0).reverse()) await rm(root, { recursive: true, force: true });
+	for (const root of roots.splice(0).reverse()) await removeFixture(root);
 });
 
 describe("ticket-15 registered integration recovery", () => {
@@ -370,7 +371,8 @@ describe("ticket-15 registered integration recovery", () => {
 		for (let pass = 0; pass < 6; pass += 1) {
 			current = await load(harness);
 			for (let taskIndex = 0; taskIndex < current.run.tasks.length; taskIndex += 1) {
-				if (current.run.tasks[taskIndex]?.attempts.at(-1)?.role === "reviewer") await writeReviewerReport(harness, current, taskIndex);
+				const latest = current.run.tasks[taskIndex]?.attempts.at(-1);
+				if (latest?.role === "reviewer" && latest.evidence?.phase !== "finalized") await writeReviewerReport(harness, current, taskIndex);
 			}
 			if (current.run.tasks.every((task) => task.attempts.at(-1)?.role === "reviewer")) break;
 			await invoke(harness, "status");

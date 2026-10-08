@@ -1,5 +1,6 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -403,7 +404,7 @@ async function exactSilenceSnapshot(root: string, dependencies: StewardDependenc
 	return { attemptId: attempt.id, role: attempt.role, agent: identity, lifecycle: agent.lifecycle, stateChangeSequence: agent.stateChangeSequence, terminal, worktree: progress.worktree, git: { head: progress.git.head, digest: progress.git.digest.sha256 }, assignment: preserved.assignment, report: preserved.report, evidence: preserved.evidence, process };
 }
 
-afterEach(async () => { for (const root of roots.splice(0).reverse()) await rm(root, { recursive: true, force: true }); });
+afterEach(async () => { for (const root of roots.splice(0).reverse()) await removeFixture(root); });
 
 describe("registered multi-Task coordination", () => {
 	it("admits disjoint Tasks under the frozen cap, keeps the containing Task pending, and renders compact per-Task status", async () => {

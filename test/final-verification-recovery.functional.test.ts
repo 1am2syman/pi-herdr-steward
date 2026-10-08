@@ -1,6 +1,7 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { execFile as execFileCallback } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -25,7 +26,7 @@ const recovery: RecoveryDefaults = { passiveInspectionIntervalSeconds: 301, seco
 const modelPlan: ProjectModelPlans = { builder: { primary: { model: "builder/model", thinkingLevel: "high" }, fallbacks: [] }, reviewer: { primary: { model: "reviewer/model", thinkingLevel: "high" }, fallbacks: [] } };
 
 afterEach(async () => {
-	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+	for (const root of roots.splice(0)) await removeFixture(root);
 });
 
 function sha(bytes: Buffer): string { return `sha256:${createHash("sha256").update(bytes).digest("hex")}`; }
@@ -223,7 +224,10 @@ async function launch(root: string, dependencies: StewardDependencies): Promise<
 }
 
 async function runUntilActivePhase(root: string, dependencies: StewardDependencies, phases: readonly string[]): Promise<RunJournal> {
-	for (let pass = 0; pass < 80; pass += 1) {
+	// Managed commands can sleep for two seconds; use a wall-clock budget rather than
+	// a loop count whose effective deadline varies with filesystem speed.
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline) {
 		const current = await loadCurrentOrArchive(root);
 		if (!current) throw new Error("final-verification journal disappeared");
 		if (current.run.finalVerificationExecution && phases.includes(current.run.finalVerificationExecution.phase)) return current;

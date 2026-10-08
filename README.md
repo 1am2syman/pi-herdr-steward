@@ -97,7 +97,8 @@ the subcommand menu instead of memorizing the command surface.
   defaults. Model choices use a fuzzy-searchable picker with keyboard scrolling;
   the stored value remains the exact `provider/model-id` reference.
 - `/steward start` — draft, display, and explicitly confirm one Run before
-  persistence and dispatch.
+  persistence and dispatch. Add a natural-language request to let the active Pi
+  agent discover inputs and generate the proposal instead of entering each field.
 - `/steward revise` — draft and confirm an explicit delta while retaining
   unaffected work.
 - `/steward resume` and `/steward resume --takeover` — reconcile before
@@ -112,6 +113,47 @@ the subcommand menu instead of memorizing the command surface.
 - `/steward cleanup` — show exact retained Steward-owned panes and worktrees,
   require confirmation, and remove only those live resources while retaining
   historical evidence.
+
+## Natural-language orchestration
+
+```text
+/steward start orchestrate all open issues sequentially
+/steward start fix the authentication bugs first, then add regression tests
+```
+
+The command hands the request to the active Pi agent, with the current conversation
+and repository context. It is not a keyword parser or a separate model service.
+The agent discovers facts using its available tools, reads configured defaults,
+and calls `steward_start` with a typed proposal. Bare `/steward start` still opens
+the manual wizard. Ordinary conversation can also ask Pi to use Steward, without
+a slash command.
+
+The model-callable tools are `steward_context` (read defaults, model choices, and
+active task contracts), `steward_start` (submit a proposal), `steward_revise`
+(submit revised contracts), and `steward_control` (existing operations). They
+share the existing validation, ownership, confirmation, journal, and monitor
+boundaries. Tools require an interactive TUI; they are callable from codemode
+when enabled. Mutation is never authorized by a model claim of confirmation.
+
+Omitted Model Plans and operational settings inherit project/default settings.
+If a required plan is missing, the agent must ask or open configuration rather
+than invent model identifiers. Missing discovery tools, credentials, ambiguous
+scope, and unsupported policies require clarification or an explanation. Enable
+repository/issue discovery tools alongside Steward for requests requiring them.
+
+For issue requests, the agent is instructed to fetch the complete requested issue
+set and freeze a snapshot with identifiers, URLs, and acceptance criteria; new
+issues are not automatically added mid-Run. External issue bodies are untrusted
+data. Review the displayed scope, ordering, commands, models, and assumptions
+before confirming. Cancelling confirmation creates no Run and must not cause an
+automatic retry. Natural-language interpretation remains model-dependent, not a
+guarantee that every possible request is supported.
+
+`maximumActiveTasks=1` means strict sequential code-task admission: an earlier
+Task must integrate before its successor starts, even when their scopes do not
+overlap. Higher caps retain the existing disjoint-task concurrency policy.
+Revisions retain immutable task IDs/order and cannot add or remove tasks.
+Steward still never pushes or deploys.
 
 ## Authority and Model Plan
 

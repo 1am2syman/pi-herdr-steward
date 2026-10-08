@@ -1,3 +1,4 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -38,7 +39,7 @@ const settings: RecoveryDefaults = {
 type FunctionalTransientKind = "provider-network-interruption" | "agent-startup-failure" | "herdr-command-failure" | "unexpected-process-exit";
 
 afterEach(async () => {
-	for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+	for (const root of roots.splice(0)) await removeFixture(root);
 });
 
 function digest(label: string): MonitorDigest {

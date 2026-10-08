@@ -708,8 +708,8 @@ export interface Steward {
 	prepareCompactionContinuity(repositoryRoot: string, controllerSessionId: string): Promise<CompactionContinuityResult>;
 	recordCompactionFailure(repositoryRoot: string, controllerSessionId: string, details: CompactionFailureDetails): Promise<{ kind: "recorded" | "ignored" | "degraded"; message: string }>;
 	configure(repositoryRoot: string, proposal?: ControllerSessionProposal): Promise<ConfigureResult>;
-	start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult>;
-	revise(repositoryRoot: string, controllerSessionId: string): Promise<RevisionResult>;
+	start(repositoryRoot: string, controllerSessionId: string, proposedDraft?: unknown): Promise<StartResult>;
+	revise(repositoryRoot: string, controllerSessionId: string, proposedDraft?: unknown): Promise<RevisionResult>;
 	cancel(repositoryRoot: string, controllerSessionId: string): Promise<CancellationResult>;
 	cleanup(repositoryRoot: string, controllerSessionId: string): Promise<CleanupResult>;
 	doctor(repositoryRoot: string, probe?: boolean): Promise<DoctorReport>;
@@ -5202,7 +5202,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return presentStart({ kind: "refused", message });
 	}
 
-	async function start(repositoryRoot: string, controllerSessionId: string): Promise<StartResult> {
+	async function start(repositoryRoot: string, controllerSessionId: string, proposedDraft?: unknown): Promise<StartResult> {
 		let initialActive: ActiveRunLoadResult;
 		try {
 			initialActive = await runJournal.loadActive(repositoryRoot);
@@ -5238,14 +5238,20 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			activeJournalPath: initialActive.paths.activePath,
 			activityLogDirectory: initialActive.paths.activityRoot,
 		};
-		let draftResult: RunDraftResult;
+		let draftValue: unknown = proposedDraft;
 		try {
-			draftResult = await ui.draftRun(draftInput);
+			if (proposedDraft === undefined) {
+				const result = await ui.draftRun(draftInput);
+				if (result.kind === "cancelled") return presentStart({ kind: "cancelled", message: "Cancelled; no Run was started." });
+				draftValue = result.draft;
+			} else if (typeof proposedDraft === "object" && proposedDraft !== null && !Array.isArray(proposedDraft)) {
+				// Apply project defaults before the shared strict validator.
+				draftValue = { modelPlan: draftInput.modelPlans, ...proposedDraft };
+			}
 		} catch (error: unknown) {
 			return refuse(`Run draft could not be collected; no changes were made. ${error instanceof Error ? error.message : "Interactive draft failed."}`);
 		}
-		if (draftResult.kind === "cancelled") return presentStart({ kind: "cancelled", message: "Cancelled; no Run was started." });
-		const draftValidation = validateRunDraft(draftResult.draft, recoveryLoad.value);
+		const draftValidation = validateRunDraft(draftValue, recoveryLoad.value);
 		if (!draftValidation.value || draftValidation.diagnostics.length > 0) return refuse(`The Run draft is invalid; no Run was started. ${draftValidation.diagnostics.map((item) => item.message).join(" ")}`);
 		const draft = draftValidation.value;
 		const identity = createRunIdentity(clock.now(), clock.randomUUID());
@@ -5447,7 +5453,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		return { journal: current, note: "All revision stop intents are durably acknowledged.", ambiguous: false };
 	}
 
-	async function revise(repositoryRoot: string, controllerSessionId: string): Promise<RevisionResult> {
+	async function revise(repositoryRoot: string, controllerSessionId: string, proposedDraft?: unknown): Promise<RevisionResult> {
 		let loaded: ActiveRunLoadResult;
 		try { loaded = await runJournal.loadActive(repositoryRoot); } catch (error: unknown) { return presentRevision({ kind: "invalid", message: `Revision could not inspect the active Run; no mutation occurred. ${error instanceof Error ? error.message : "Read-only inspection failed."}` }); }
 		if (loaded.kind === "missing") return presentRevision({ kind: "missing", message: "No active Steward Run exists; revision performed no mutation." });
@@ -5457,7 +5463,7 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 		const finalExecution = basis.run.finalVerificationExecution;
 		if (finalExecution && ((isRecoverableFinalVerificationExecution(finalExecution) && (finalExecution.phase === "executing" || finalExecution.phase === "ambiguous")) || (!isRecoverableFinalVerificationExecution(finalExecution) && finalExecution.phase === "intended"))) return presentRevision({ kind: "refused", message: "Revision is refused while final verification is intended, executing, or ambiguous; no mutation occurred." });
 		if (!controllerIdentityMatches(basis, controllerSessionId)) return presentRevision({ kind: "foreign-session", recordedSessionId: basis.run.controllerSessionId, currentSessionId: controllerSessionId, message: `The active Run belongs to Controller Session ${basis.run.controllerSessionId}; revision performed no mutation. Use /steward resume --takeover explicitly.` });
-		if (!ui.draftRunRevision || !ui.confirmRunRevision) return presentRevision({ kind: "refused", message: "Revision UI is unavailable; no mutation occurred." });
+		if ((proposedDraft === undefined && !ui.draftRunRevision) || !ui.confirmRunRevision) return presentRevision({ kind: "refused", message: "Revision UI is unavailable; no mutation occurred." });
 		const draftInput: RunRevisionDraftInput = {
 			runId: basis.run.id,
 			tasks: basis.run.tasks.map((task) => ({ id: task.contract.id, contract: JSON.parse(JSON.stringify(task.contract)) as TaskRecord["contract"] })),
@@ -5466,10 +5472,15 @@ export function createSteward({ runJournal, herdr, git, process, model, clock, u
 			activeJournalPath: loaded.paths.activePath,
 			activityLogPath: `${loaded.paths.activityRoot}/${basis.run.id}/activity.log`,
 		};
-		let draftResult: RunRevisionDraftResult;
-		try { draftResult = await ui.draftRunRevision(draftInput); } catch (error: unknown) { return presentRevision({ kind: "cancelled", message: `Revision draft was not collected; no mutation occurred. ${error instanceof Error ? error.message : "Interactive draft failed."}` }); }
-		if (draftResult.kind === "cancelled") return presentRevision({ kind: "cancelled", message: "Revision cancelled; the active Run and all evidence remain unchanged." });
-		const draftValidation = validateRunRevisionDraft(draftResult.draft, basis);
+		let draftValue: unknown = proposedDraft;
+		try {
+			if (proposedDraft === undefined) {
+				const result = await ui.draftRunRevision!(draftInput);
+				if (result.kind === "cancelled") return presentRevision({ kind: "cancelled", message: "Revision cancelled; the active Run and all evidence remain unchanged." });
+				draftValue = result.draft;
+			}
+		} catch (error: unknown) { return presentRevision({ kind: "cancelled", message: `Revision draft was not collected; no mutation occurred. ${error instanceof Error ? error.message : "Interactive draft failed."}` }); }
+		const draftValidation = validateRunRevisionDraft(draftValue, basis);
 		if (!draftValidation.value || draftValidation.diagnostics.length > 0) return presentRevision({ kind: "refused", message: `Revision draft is invalid; no mutation occurred. ${draftValidation.diagnostics.map((item) => item.message).join(" ")}` });
 		const draft = draftValidation.value;
 		const preview = revisionPreview(basis, draft);

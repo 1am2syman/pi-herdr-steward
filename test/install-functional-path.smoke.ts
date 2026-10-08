@@ -1,3 +1,4 @@
+import { removeFixture } from "./remove-fixture.ts";
 import { strict as assert } from "node:assert";
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink } from "node:fs/promises";
@@ -271,7 +272,7 @@ async function smoke(): Promise<void> {
 			assert.equal(relative(root, packageDirectory).startsWith(".."), false);
 			assert.equal(relative(root, agentDirectory).startsWith(".."), false);
 		} finally {
-			await rm(root, { recursive: true, force: true });
+			await removeFixture(root);
 		}
 }
 
